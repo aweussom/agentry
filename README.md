@@ -2,6 +2,14 @@
 
 **Agentry removes the `-p` overhead of using CLI coding-tools for automation.**
 
+[![A manic developer in a Norwegian sweater smashing an acoustic guitar into a laptop, keyboard keys flying out of the soundhole. The whiteboard reads "DAGENS PLAN: 1. Fikse litt på søk ✓ 2. Legge til AI ✓ 3. En liten proxy ✓ 4. ??? 5. Profit (kanskje)"](./images/dev-to-article-header.png)](https://dev.to/tommy_leonhardsen_81d1f4e/i-built-an-openai-compatible-proxy-for-github-copilot-because-search-was-too-stupid-to-understand-31de)
+
+If you'd rather read the unhinged origin story than boring sysadmin-grade
+docs, the [dev.to version is here](https://dev.to/tommy_leonhardsen_81d1f4e/i-built-an-openai-compatible-proxy-for-github-copilot-because-search-was-too-stupid-to-understand-31de) —
+it covers why this proxy exists in the first place (short answer:
+Norwegian guitar tabs and questionable life choices). The rest of this
+README is the boring documentation, which sysadmins know to love.
+
 It holds one coding-agent CLI subprocess persistent across requests, drives it
 over the Agent Client Protocol (JSON-RPC over stdio), and exposes the result
 as an OpenAI-compatible HTTP API on localhost. Per-turn latency drops from
@@ -11,6 +19,8 @@ replies with `gpt-5-mini` at `low` reasoning effort).
 A minimal chat **web UI** ships with the proxy. It is not the point of the
 project — just a quick way to confirm the API works end-to-end. The launcher
 prints a clickable URL (`http://localhost:8765` by default) on startup.
+
+![Bundled chat UI talking to the proxy as a regular OpenAI endpoint; footer shows the active backend and per-turn latency](./images/web-ui.png)
 
 Currently wraps **GitHub Copilot CLI** (`copilot --acp`); built to be extended
 to other agent CLIs (`claude-code`, `qwen3-code`, `antigravity-cli`, `codex`).
@@ -37,11 +47,13 @@ The launcher must be run from the same logon session as your interactive
 `copilot login` so the cred-store token is reachable to child processes.
 
 ```powershell
-cd C:\devel\aweussom\python\copilot-proxy
+cd C:\devel\aweussom\python\agentry
 .\start.ps1                                          # gpt-5-mini, reasoning=low, port 8765
 .\start.ps1 -Model claude-haiku-4.5 -ReasoningEffort medium
 .\start.ps1 -Port 9000
 ```
+
+![Launcher console: Flask boots, the copilot --acp subprocess is spawned, and the ACP handshake / auth / session / reasoning override all complete in well under a second — then every subsequent chat request lands on the same warm process](./images/startup-console.png)
 
 ### Linux / WSL2 Ubuntu
 
@@ -157,8 +169,26 @@ See `TODO.md`. The big next item is evaluating alternative backends
 persistent-wrapper treatment, and choosing whether to make Agentry
 multi-backend or fork per-CLI.
 
+## Related work
+
+[`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) is a more
+mature project that also exposes GitHub Copilot through an OpenAI-shaped
+API. The two solve overlapping problems with different framings:
+
+- *copilot-api* reverse-engineers Copilot's HTTP/WebSocket endpoints
+  directly and is built to be a general-purpose API gateway for any client.
+- *Agentry* drives the official `copilot --acp` JSON-RPC interface and is
+  built for one specific use case: killing the per-call startup cost when
+  a single developer uses Copilot CLI as an automation backend for their
+  own scripts.
+
+If you want a polished, broadly-applicable Copilot-as-an-API, copilot-api
+is the more capable project. If you specifically want a thin local
+persistent wrapper around the official agent CLI with no
+reverse-engineering and a narrower scope, that is agentry.
+
 ## Acknowledgments
 
 - [Agent Client Protocol](https://agentclientprotocol.com) by Zed Industries.
-- Web UI based on the NoLlama project (an OpenVINO-based LLM server for
-  Intel NPU/GPU).
+- Web UI based on the [NoLlama](https://github.com/aweussom/NoLlama)
+  project (an OpenVINO-based LLM server for Intel NPU/GPU).
