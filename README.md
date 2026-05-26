@@ -8,6 +8,10 @@ as an OpenAI-compatible HTTP API on localhost. Per-turn latency drops from
 ~8 s in `-p` mode to roughly the model's own `api_ms` floor (~2–3 s for short
 replies with `gpt-5-mini` at `low` reasoning effort).
 
+A minimal chat **web UI** ships with the proxy. It is not the point of the
+project — just a quick way to confirm the API works end-to-end. The launcher
+prints a clickable URL (`http://localhost:8765` by default) on startup.
+
 Currently wraps **GitHub Copilot CLI** (`copilot --acp`); built to be extended
 to other agent CLIs (`claude-code`, `qwen3-code`, `antigravity-cli`, `codex`).
 
