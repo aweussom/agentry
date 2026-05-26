@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Copilot Proxy</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<div class="header">
+    <h1>Copilot Proxy</h1>
+    <div class="header-controls">
+        <select id="model-select"></select>
+        <div class="status-dot" id="status-dot" title="checking..."></div>
+    </div>
+</div>
+
+<div class="chat" id="chat"></div>
+
+<div class="input-area">
+    <div class="input-wrap">
+        <div class="input-row">
+            <textarea id="message-input" rows="1" placeholder="Type a message... (Copilot CLI backend)"></textarea>
+            <button class="btn" id="send-btn">Send</button>
+            <button class="btn icon" id="new-chat-btn" title="New chat">&#10227;</button>
+        </div>
+    </div>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
