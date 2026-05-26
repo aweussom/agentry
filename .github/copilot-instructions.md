@@ -34,7 +34,8 @@ requests to read, edit, or analyze code in this repository.
 
 ## What this repository contains (for context only)
 
-A Flask proxy (`copilot_proxy.py`), a minimal web UI (`templates/`, `static/`),
-PowerShell launcher (`start.ps1`), and standard scaffolding. None of this is
-relevant to user chat prompts — do not reference it unless the user explicitly
-asks about the proxy itself.
+A Flask proxy (`agentry.py`) that wraps coding-agent CLIs over the Agent
+Client Protocol, a minimal web UI (`templates/`, `static/`), a PowerShell
+launcher (`start.ps1`), and standard scaffolding. None of this is relevant
+to user chat prompts — do not reference it unless the user explicitly asks
+about the proxy itself.

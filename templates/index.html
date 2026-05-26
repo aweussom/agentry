@@ -3,15 +3,23 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Copilot Proxy</title>
+<title>Agentry</title>
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
 
 <div class="header">
-    <h1>Copilot Proxy</h1>
+    <h1>Agentry</h1>
     <div class="header-controls">
         <select id="model-select"></select>
+        <label class="setting" title="Reasoning effort: higher = slower, more thorough thinking">
+            <span class="setting-label">Reasoning</span>
+            <select id="reasoning-select">
+                <option value="low" selected>low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+            </select>
+        </label>
         <div class="status-dot" id="status-dot" title="checking..."></div>
     </div>
 </div>

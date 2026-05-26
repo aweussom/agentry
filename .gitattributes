@@ -1,0 +1,4 @@
+# Keep shell scripts LF-only; CRLF will break shebangs and `set -euo pipefail`
+# on Linux. PowerShell scripts get CRLF as Windows expects.
+*.sh   text eol=lf
+*.ps1  text eol=crlf

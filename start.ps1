@@ -24,7 +24,7 @@ if (-not (Get-Command copilot -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-$pyArgs = @('copilot_proxy.py', '--port', $Port)
+$pyArgs = @('agentry.py', '--port', $Port)
 if ($Model)            { $pyArgs += @('--model', $Model) }
 if ($ReasoningEffort)  { $pyArgs += @('--reasoning-effort', $ReasoningEffort) }
 .\venv\Scripts\python.exe @pyArgs

@@ -1,4 +1,4 @@
-// Copilot Proxy Web UI — minimal chat over OpenAI-shape SSE.
+// Agentry Web UI — minimal chat over OpenAI-shape SSE.
 // Pared down from the NoLlama UI: temp slider, no-think toggle, and image
 // attach were removed because Copilot CLI's -p mode doesn't expose them.
 // Think-block rendering is kept (inert when no <think> tags appear) so a
@@ -8,6 +8,7 @@ const chat = document.getElementById('chat');
 const input = document.getElementById('message-input');
 const sendBtn = document.getElementById('send-btn');
 const modelSelect = document.getElementById('model-select');
+const reasoningSelect = document.getElementById('reasoning-select');
 const statusDot = document.getElementById('status-dot');
 const newChatBtn = document.getElementById('new-chat-btn');
 
@@ -70,6 +71,7 @@ function buildRequestBody() {
         messages: [...chatHistory],
         stream: true,
         max_tokens: 16384,
+        reasoning_effort: reasoningSelect.value,
     };
 }
 

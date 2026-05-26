@@ -19,9 +19,13 @@ Spec:        https://agentclientprotocol.com/protocol/overview
 Schema:      https://github.com/zed-industries/agent-client-protocol/blob/main/schema/schema.json
 Copilot doc: https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server
 
-Auth: copilot.exe must already be logged in. Token is read from the Windows
-credential store in the launcher's logon session; child processes inherit
-the same session, so the subprocess sees the token.
+Auth: `copilot` must already be logged in (`copilot login`).
+- On Windows the token is stored in the credential store and is bound to
+  the interactive logon session — child processes inherit it, but a
+  different shell or service account may not see it.
+- On Linux / WSL2 the token lives under `~/.copilot/` and is reachable to
+  any process the user owns. Install via `npm install -g @github/copilot`
+  and authenticate the same way.
 """
 
 import argparse
@@ -98,6 +102,7 @@ class ACPClient:
         self.active_turn_queue = None     # Queue for active session/prompt; tagged ("update"|"result", payload)
         self.active_prompt_id = None
         self.session_id = None
+        self.session_fresh = False        # True between new_session() and the first prompt()
         self.turn_lock = threading.Lock()
         self.log_path = log_path
         self._logf = None
@@ -198,7 +203,7 @@ class ACPClient:
                 "fs": {"readTextFile": False, "writeTextFile": False},
                 "terminal": False,
             },
-            "clientInfo": {"name": "copilot-proxy", "version": "0.2.0"},
+            "clientInfo": {"name": "agentry", "version": "0.2.0"},
         })
         agent_info = result.get("agentInfo") or {}
         _log(f"ACP initialized; agent={agent_info.get('name')!r} version={agent_info.get('version')!r}")
@@ -226,6 +231,7 @@ class ACPClient:
         cwd = cwd or os.path.dirname(os.path.abspath(__file__))
         result = self._request("session/new", {"cwd": cwd, "mcpServers": []})
         self.session_id = result["sessionId"]
+        self.session_fresh = True
         _log(f"ACP session: {self.session_id}")
         # Apply per-session config overrides via the standard ACP method.
         # Schema: session/set_config_option {sessionId, configId, value}.
@@ -244,6 +250,21 @@ class ACPClient:
             "value": value,
         })
 
+    def update_reasoning_effort(self, value):
+        """Idempotent: applies via set_config_option only on change. Updates
+        the stored intent so future sessions also start at this value."""
+        if value == self.reasoning_effort:
+            return False
+        self.reasoning_effort = value
+        if self.session_id:
+            try:
+                self.set_config_option("reasoning_effort", value)
+                _log(f"ACP reasoning_effort -> {value}")
+                return True
+            except Exception as e:
+                _log(f"WARN: update reasoning_effort failed: {e}")
+        return False
+
     def prompt(self, text, timeout=180):
         """Generator yielding text deltas for one turn. Requires an active session."""
         if not self.session_id:
@@ -261,6 +282,7 @@ class ACPClient:
                         "prompt": [{"type": "text", "text": text}],
                     },
                 })
+                self.session_fresh = False
                 while True:
                     try:
                         kind, payload = q.get(timeout=timeout)
@@ -389,7 +411,7 @@ def _sse(delta, model, done=False):
 
 
 def _model_label():
-    return COPILOT_MODEL or "copilot-default"
+    return COPILOT_MODEL or "agentry-default"
 
 
 # --- Routes -------------------------------------------------------------
@@ -433,6 +455,7 @@ def chat_completions():
     body = request.get_json(force=True) or {}
     messages = body.get("messages") or []
     stream = bool(body.get("stream"))
+    req_reasoning = body.get("reasoning_effort")  # optional per-request override
 
     prompt_text = _latest_user_text(messages)
     if not prompt_text:
@@ -445,12 +468,29 @@ def chat_completions():
         _REQ_T0.pop(tid, None)
         return jsonify({"error": {"message": f"ACP init failed: {e}"}}), 500
 
-    if _is_new_chat(messages) or acp.session_id is None:
+    # New chat from UI -> need a fresh ACP session, unless the eager startup
+    # session has not been used yet (in which case reuse it and avoid waste).
+    if acp.session_id is None:
         try:
             acp.new_session()
         except Exception as e:
             _REQ_T0.pop(tid, None)
             return jsonify({"error": {"message": f"session/new failed: {e}"}}), 500
+    elif _is_new_chat(messages) and not acp.session_fresh:
+        try:
+            acp.new_session()
+        except Exception as e:
+            _REQ_T0.pop(tid, None)
+            return jsonify({"error": {"message": f"session/new failed: {e}"}}), 500
+
+    # Guard: ACP advertises "none" as an option but the underlying model
+    # API rejects it for gpt-5-mini ("Supported values are: minimal, low,
+    # medium, high"). xhigh/max are CLI-only too. Only forward values
+    # known to round-trip cleanly.
+    if req_reasoning in ("low", "medium", "high"):
+        acp.update_reasoning_effort(req_reasoning)
+    elif req_reasoning:
+        _log(f"WARN: ignoring unsupported reasoning_effort={req_reasoning!r}")
 
     _log(f"prompt: session={acp.session_id} text={prompt_text[:60]!r}")
 
@@ -505,7 +545,7 @@ def main():
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     LOG_DIR.mkdir(exist_ok=True)
 
-    print(f"  copilot-proxy on http://localhost:{args.port}  (backend=ACP)", flush=True)
+    print(f"  agentry on http://localhost:{args.port}  (backend=ACP)", flush=True)
     print(f"  model={COPILOT_MODEL or '(copilot default)'}  reasoning={REASONING_EFFORT or '(copilot default)'}", flush=True)
     print(f"  wire log -> {LOG_DIR / 'acp_wire.log'}", flush=True)
 
