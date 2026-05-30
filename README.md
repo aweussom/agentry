@@ -191,6 +191,11 @@ custom-instructions file in `~/.copilot/` that would otherwise leak hints
 - **Single user, single session.** Concurrent UI tabs share one ACP
   session and serialize through one turn lock. Fine for personal use; not
   a multi-tenant design.
+- **Codex carries a fixed ~24.8k-token core harness per turn.** codex
+  app-server sends its agent system prompt + built-in tool schemas on every
+  turn. It does not leak into responses, is not reducible by disabling
+  plugins/MCP/skills (tested), and is cached server-side so it costs almost
+  no latency. On a flat ChatGPT subscription it isn't separately billed.
 
 ## Roadmap
 

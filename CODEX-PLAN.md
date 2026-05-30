@@ -42,6 +42,18 @@ Two-tier product story:
 - **Paid-cheap** → codex backend, ChatGPT Go ($8) or Plus ($20). Very cheap
   per-token given app-server throughput.
 
+Base-context note (2026-05-30): a trivial codex turn reports ~24,789
+inputTokens — codex app-server ships its core agent harness (system prompt +
+built-in tool schemas) every turn. This is **not reducible** by disabling
+marketplace plugins / MCP / skills: `plugins={}`, `mcp_servers={}`,
+`experimental_use_skills=false` all leave the count at exactly 24,789, and no
+MCP child process spawns either way (`_bench/codex_min_context.py`; `-c`
+plumbing verified via a working `model` override). The desktop plugins aren't
+loaded into the app-server turn path. The harness is cached server-side
+(proven via `cachedInputTokens`, `_bench/codex_cache_proof.py`), so it's
+latency-cheap and — on a flat ChatGPT subscription — not separately billed.
+Don't add plugin-disable flags to the backend; they're a no-op here.
+
 Protocol confirmations (from `codex app-server generate-json-schema`, dumped
 to `_bench/codex_schema/`): wire methods are exactly `initialize`,
 `thread/start`, `turn/start`, `turn/interrupt`, `turn/steer`, `thread/resume`;
