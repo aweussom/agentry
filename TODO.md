@@ -12,6 +12,18 @@
       for terse, chat-only replies.
 - [x] Rename `copilot-proxy` → `agentry`; repo published to
       `github.com/aweussom/agentry`.
+- [x] Backend protocol refactor (2026-05-30, `feat/codex-backend`):
+      extracted a `Backend` ABC into `backends.py`; `CopilotACPBackend` is
+      the original ACPClient moved verbatim (zero behavior change),
+      `CodexAppServerBackend` is new. Select via `--backend {copilot,codex}`
+      (default `copilot`). Shared logging in `logutil.py`. Both backends
+      verified end-to-end through the Flask layer.
+- [x] Codex backend (`codex app-server`, JSON-RPC 2.0 over stdio).
+      Validated 2026-05-30: default `gpt-5.4-mini` @ `low` effort, median
+      TTFB ~6.5s — beats the Copilot SHORT baseline (7.56s). Auth is the
+      ChatGPT account login (no API key). Streams reasoning traces
+      (`item/reasoning/textDelta`), which Copilot does not. Paid-cheap tier
+      (ChatGPT Go $8 / Plus $20). See `CODEX-PLAN.md`, `_bench/codex_probe.py`.
 - [x] Linux / WSL2 launcher (`start.sh`) + `.gitattributes` for LF.
 - [x] README with persistent-wrapper pitch, Windows + Linux quick start,
       architecture overview, and known limits.
@@ -52,18 +64,21 @@
 
 ## Research / evaluation
 
-- [ ] Evaluate competing CLI tools as backend candidates:
-    - `claude-code` (Anthropic) — designed for `-p` automation, exposes
-      `--output-format stream-json` for stdin/stdout JSON I/O. Check
-      whether it speaks ACP yet. Likely the strongest persistent-wrapper
-      target.
+**Updated 2026-05-30** — codex landed as backend #2 (see "Done"). The
+backend interface now exists, so adding further backends is incremental
+rather than a refactor. Remaining candidates are still deferred (see
+`TODONT.md` "Multi-backend support" — now narrowed): the audience that
+would prefer them already has paid tooling.
+
+- [ ] Evaluate remaining CLI tools as backend candidates (low priority):
+    - `claude-code` (Anthropic) — `--output-format stream-json` exists but
+      it's `-p`-per-turn, NOT a persistent stdio protocol; no speed win
+      from wrapping. Deferred.
     - `qwen3-code` — Qwen's coding-agent CLI. Unknown automation surface.
-    - ~~`antigravity-cli`~~ — done; see entry below.
-    - `codex` (OpenAI) — official CLI; check whether it has a
-      programmatic / streaming mode beyond the interactive TUI.
-  For each: spawn cost, persistent mode availability, output format,
-  model selection, auth model. Pick strongest fit and either pivot the
-  proxy or run multiple backends side-by-side.
+    - ~~`antigravity-cli`~~ — evaluated, shelved (see "Done").
+    - ~~`codex` (OpenAI)~~ — DONE, landed as a backend.
+  For any new candidate: implement the `Backend` ABC in `backends.py`,
+  wire it into `make_backend`, add to the `--backend` choices.
 
 ## Polish (lower priority)
 
@@ -78,12 +93,12 @@
       deny. Currently every agent->client request is rejected, so any
       prompt that genuinely needs a tool fails rather than degrading.
 
-## Architecture (only if multi-backend pans out)
+## Architecture
 
-- [ ] Factor backend out of `agentry.py` into a plugin interface so a
-      second CLI (claude-code etc.) can live as a sibling to the
-      copilot backend. Premature until at least one second backend is
-      validated end-to-end.
+- [x] Factor backend out of `agentry.py` into a plugin interface so a
+      second CLI can live as a sibling to the copilot backend. Done
+      2026-05-30 — `Backend` ABC + `make_backend` factory in `backends.py`;
+      codex validated the design end-to-end.
 - [ ] README "Reverse MCP" section — frame the proxy as the inversion
       of MCP's consumer/provider roles (MCP turns tools into LLM
       services; agentry turns LLMs into HTTP services). Conceptual

@@ -11,10 +11,10 @@ Norwegian guitar tabs and questionable life choices). The rest of this
 README is the boring documentation, which sysadmins know to love.
 
 It holds one coding-agent CLI subprocess persistent across requests, drives it
-over the Agent Client Protocol (JSON-RPC over stdio), and exposes the result
-as an OpenAI-compatible HTTP API on localhost. Per-turn latency drops from
-~8 s in `-p` mode to roughly the model's own `api_ms` floor (~2–3 s for short
-replies with `gpt-5-mini` at `low` reasoning effort).
+over JSON-RPC 2.0 (stdio), and exposes the result as an OpenAI-compatible HTTP
+API on localhost. Per-turn latency drops from ~8 s in `-p` mode to roughly the
+model's own `api_ms` floor (~2–3 s for short replies with `gpt-5-mini` at
+`low` reasoning effort).
 
 A minimal chat **web UI** ships with the proxy. It is not the point of the
 project — just a quick way to confirm the API works end-to-end. The launcher
@@ -22,24 +22,37 @@ prints a clickable URL (`http://localhost:8765` by default) on startup.
 
 ![Bundled chat UI talking to the proxy as a regular OpenAI endpoint; footer shows the active backend and per-turn latency](./images/web-ui.png)
 
-Currently wraps **GitHub Copilot CLI** (`copilot --acp`); built to be extended
-to other agent CLIs (`claude-code`, `qwen3-code`, `antigravity-cli`, `codex`).
+Wraps two interchangeable backends, selected with `--backend`:
+
+- **`copilot`** (default) — GitHub Copilot CLI (`copilot --acp`). The free
+  tier; `gpt-5-mini` at `low`/`high` reasoning.
+- **`codex`** — OpenAI Codex (`codex app-server`). The paid-but-cheap tier
+  (ChatGPT Go $8 / Plus $20); default `gpt-5.4-mini` at `low` effort.
+
+Both speak persistent JSON-RPC 2.0 over stdio, so both get the no-spawn-cost
+win. Adding a third backend is implementing one `Backend` class in
+`backends.py`.
 
 ## Status
 
-Personal spike. Single-user. Not packaged or published. Auth uses your
-existing CLI logins via the local credential store. Operates in the same
-gray ToS zone as any project that wraps a vendor's interactive CLI as a
-programmatic backend — use a non-critical account, don't expose externally,
-keep volume modest.
+Working tool. Used by the author as the primary enricher across adjacent
+projects (`shiny-fiesta`, soon `geomap`). Two backends:
+`copilot` (free) and `codex` (paid-cheap) — see `TODONT.md` for which other
+CLIs were considered and declined, and why codex cleared the bar they didn't.
+Auth uses your existing CLI logins via the local credential store. Operates
+in the same gray ToS zone as any project that wraps a vendor's interactive
+CLI as a programmatic backend — use a non-critical account, don't expose
+externally, keep volume modest.
 
 ## Quick start
 
 Common prerequisites:
 
 - Python 3.10+
-- GitHub Copilot CLI on PATH and logged in (`copilot login`)
-- Node.js 18+ (the CLI is distributed as `@github/copilot` on npm)
+- For the `copilot` backend: GitHub Copilot CLI on PATH and logged in
+  (`copilot login`); Node.js 18+ (distributed as `@github/copilot` on npm).
+- For the `codex` backend: OpenAI Codex CLI on PATH and logged in
+  (`codex login`, ChatGPT account — no `OPENAI_API_KEY` needed).
 
 ### Windows (PowerShell 7+)
 
@@ -48,7 +61,8 @@ The launcher must be run from the same logon session as your interactive
 
 ```powershell
 cd C:\devel\aweussom\python\agentry
-.\start.ps1                                          # gpt-5-mini, reasoning=low, port 8765
+.\start.ps1                                          # copilot, gpt-5-mini, reasoning=low
+.\start.ps1 -Backend codex                           # codex, gpt-5.4-mini, effort=low
 .\start.ps1 -Model claude-haiku-4.5 -ReasoningEffort medium
 .\start.ps1 -Port 9000
 ```
@@ -66,7 +80,8 @@ copilot login
 
 cd ~/path/to/agentry
 chmod +x start.sh                                    # first checkout only
-./start.sh                                           # gpt-5-mini, reasoning=low, port 8765
+./start.sh                                           # copilot, gpt-5-mini, reasoning=low
+./start.sh --backend codex                           # codex, gpt-5.4-mini, effort=low
 ./start.sh --model claude-haiku-4.5 --reasoning-effort medium
 ./start.sh --port 9000
 ```
@@ -80,36 +95,45 @@ forwarding.
 Launcher params:
 
 - `-Port` — HTTP port (default `8765`).
-- `-Model` — passed to `copilot --model`. On the free tier: `gpt-5-mini`
-  (default), `gpt-4.1`, `claude-haiku-4.5`. On paid tiers more models
-  appear (Claude Sonnet 4.6, Opus 4.7, GPT-5.x family).
-- `-ReasoningEffort` — applied via the ACP `session/set_config_option`
-  method after `session/new`. Confirmed working: `low`, `medium`, `high`.
-  Edge values (`none`, `xhigh`, `max`, `minimal`) appear in either the CLI
-  or the API but never both, so they're not reliably reachable.
+- `-Backend` — `copilot` (default) or `codex`.
+- `-Model` — model override.
+    - `copilot`: passed to `copilot --model`. Free tier: `gpt-5-mini`
+      (default), `gpt-4.1`, `claude-haiku-4.5`. Paid tiers add more
+      (Claude Sonnet 4.6, Opus 4.7, GPT-5.x family).
+    - `codex`: passed on `turn/start`. Default `gpt-5.4-mini`.
+- `-ReasoningEffort` — `low`, `medium`, `high` are confirmed end-to-end on
+  both backends. On `copilot` it is applied via ACP `session/set_config_option`
+  after `session/new`; on `codex` it is a `turn/start` param. Edge values
+  (`none`, `xhigh`, `max`, `minimal`) are not reliably reachable on copilot.
 
 The web UI has a per-request reasoning-effort dropdown that overrides the
 launcher default at runtime.
 
 ## Architecture
 
-Single Flask file (`agentry.py`, ~400 lines) holds one persistent
-`copilot --acp` subprocess and drives it with a small JSON-RPC 2.0 client.
-ACP messages used:
+`agentry.py` is the Flask layer (routes, OpenAI shape, session reuse).
+`backends.py` holds a `Backend` ABC and the two implementations, each
+owning one persistent subprocess driven by a small JSON-RPC 2.0 client.
+The Flask layer talks only to the `Backend` interface
+(`new_session` / `prompt` / `cancel` / `update_reasoning_effort` /
+`is_alive` / `close`), so swapping backends is a `--backend` flag.
 
-| Direction | Method | Purpose |
+The two protocols map almost one-to-one:
+
+| Concept | `copilot` (ACP) | `codex` (app-server) |
 |---|---|---|
-| client → agent | `initialize` | handshake; declare capabilities |
-| client → agent | `authenticate` | follow-up when `authMethods` is non-empty |
-| client → agent | `session/new` | create chat session |
-| client → agent | `session/set_config_option` | per-session reasoning override |
-| client → agent | `session/prompt` | send user turn |
-| agent → client | `session/update` (notification) | streamed `agent_message_chunk` deltas |
-| client → agent | `session/cancel` (notification) | stop in-flight turn |
+| Handshake | `initialize` (+`authenticate`) | `initialize` |
+| New session | `session/new` | `thread/start` |
+| User turn | `session/prompt` | `turn/start` |
+| Reasoning override | `session/set_config_option` | `effort` on `turn/start` |
+| Streamed deltas | `session/update` → `agent_message_chunk` | `item/agentMessage/delta` |
+| Turn complete | `session/prompt` result `stopReason` | `turn/completed` notification |
+| Cancel | `session/cancel` | `turn/interrupt` |
 
-Agent→client requests for tools / permissions / filesystem are auto-denied
-with JSON-RPC `-32601` to keep the proxy a pure chat client (no agent
-capabilities — by design).
+In both, agent→client requests for tools / permissions / filesystem are
+auto-denied with JSON-RPC `-32601` to keep the proxy a pure chat client (no
+agent capabilities — by design). Codex additionally runs each thread with
+`approvalPolicy: never` + `sandbox: read-only`.
 
 OpenAI-compatible endpoints exposed:
 
@@ -120,7 +144,8 @@ OpenAI-compatible endpoints exposed:
 
 The web UI at `/` is a single-page chat copied and pared down from the
 NoLlama project. Markdown rendering, code-block copy, think-block support
-(currently inert — Copilot CLI does not surface reasoning traces).
+(inert on `copilot`, which does not surface reasoning traces; `codex` does
+emit `item/reasoning/textDelta` events, not yet wired into the UI).
 
 ## Per-project instructions
 
@@ -135,25 +160,30 @@ custom-instructions file in `~/.copilot/` that would otherwise leak hints
 
 | Path | Purpose |
 |---|---|
-| `agentry.py` | Flask server + ACP JSON-RPC client |
+| `agentry.py` | Flask server + OpenAI surface + backend selection |
+| `backends.py` | `Backend` ABC + `CopilotACPBackend` + `CodexAppServerBackend` |
+| `logutil.py` | Shared timestamped logging + idle keepalive |
 | `templates/index.html` | Web UI shell |
 | `static/css/style.css` | Web UI styles |
 | `static/js/app.js` | Web UI client logic |
 | `.github/copilot-instructions.md` | Per-project chat-only instructions |
-| `start.ps1` | PowerShell launcher (creates venv, runs agentry) |
+| `start.ps1` / `start.sh` | Launchers (create venv, run agentry) |
 | `requirements.txt` | Just `flask` |
 | `TODO.md` | Roadmap and known polish items |
-| `logs/` | Runtime traces (gitignored): `acp_wire.log` |
+| `TODONT.md` | Paths intentionally not taken, with reasons |
+| `CODEX-PLAN.md` | Codex backend design + validation record |
+| `logs/` | Runtime traces (gitignored): `acp_wire.log`, `codex_wire.log` |
 
 ## Known limits
 
 - **Tool requests are always denied.** If a prompt genuinely needs a tool
   (file read, shell command), the agent will either degrade gracefully or
   error out rather than working around it. By design.
-- **No visible reasoning trace.** Copilot CLI does not emit
+- **Reasoning trace depends on backend.** Copilot CLI does not emit
   `agent_thought_chunk` events for our session — only a typing indicator
-  appears during server-side reasoning. This is a CLI limitation, not a
-  proxy limitation.
+  appears during server-side reasoning. Codex *does* stream reasoning
+  (`item/reasoning/textDelta`), but agentry does not yet forward it to the
+  UI.
 - **Auth is session-bound.** The Windows credential store entry that
   `copilot login` writes is reachable only to processes in the same
   interactive logon session. Running the launcher from a different shell
@@ -164,10 +194,13 @@ custom-instructions file in `~/.copilot/` that would otherwise leak hints
 
 ## Roadmap
 
-See `TODO.md`. The big next item is evaluating alternative backends
-(`claude-code`, `qwen3-code`, `antigravity-cli`, `codex`) for the same
-persistent-wrapper treatment, and choosing whether to make Agentry
-multi-backend or fork per-CLI.
+See `TODO.md` for active polish items and `TODONT.md` for paths
+intentionally not taken. The backend layer is now pluggable and ships two
+backends (`copilot`, `codex`). Further backends (`claude-code`,
+`qwen3-code`, `antigravity`) remain deferred — `claude-code` is
+`-p`-per-turn with no persistent protocol, so wrapping it buys no
+spawn-cost win, and the others were shelved for the reasons in `TODONT.md`.
+A new backend now means implementing one `Backend` class, not a refactor.
 
 ## Related work
 
@@ -177,15 +210,18 @@ API. The two solve overlapping problems with different framings:
 
 - *copilot-api* reverse-engineers Copilot's HTTP/WebSocket endpoints
   directly and is built to be a general-purpose API gateway for any client.
-- *Agentry* drives the official `copilot --acp` JSON-RPC interface and is
-  built for one specific use case: killing the per-call startup cost when
-  a single developer uses Copilot CLI as an automation backend for their
-  own scripts.
+- *Agentry* drives the official agent CLIs through their published JSON-RPC
+  stdio protocols — `copilot --acp` (ACP) and `codex app-server` — and is
+  built for one specific use case: killing the per-call startup cost when a
+  single developer uses these CLIs as an automation backend for their own
+  scripts.
 
-If you want a polished, broadly-applicable Copilot-as-an-API, copilot-api
-is the more capable project. If you specifically want a thin local
-persistent wrapper around the official agent CLI with no
-reverse-engineering and a narrower scope, that is agentry.
+The two-backend design also means agentry isn't tied to one vendor: the same
+OpenAI-shaped endpoint fronts either Copilot (free tier) or Codex (cheap paid
+tier), swapped with a flag. If you want a polished, broadly-applicable
+Copilot-as-an-API, copilot-api is the more capable project. If you
+specifically want a thin local persistent wrapper around the official agent
+CLIs with no reverse-engineering and a narrower scope, that is agentry.
 
 ## Acknowledgments
 
