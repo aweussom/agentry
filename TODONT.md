@@ -28,9 +28,20 @@ agentry instance per "enrichment" type, hardcoded instructions per server.
   `.github/copilot-instructions.md` already covers it — just edit that
   file in the cwd agentry runs from.
 
-Re-evaluate if: a backend with real prompt caching becomes the target
-(direct OpenAI/Anthropic), at which point "static prefix" actually pays —
-but that loses Copilot's free-quota property.
+**Update 2026-05-30 (codex backend):** the *caching* objection above is
+Copilot-specific. A bench (`_bench/codex_cache_bench.py`) found codex pays
+NO TTFB penalty for a 28 KB instruction prefix (median 6.52s vs 8.69s for a
+101 B prefix) — the OpenAI Responses API caches the static prefix
+server-side. So "static prefix is dead weight" is false on codex. The entry
+still stands, but now on the *second* reason only: instruction pinning
+belongs client-side (the client orchestrating enrichment already knows which
+prompt to send and is the right place to version it). Latency is no longer a
+reason to avoid it on codex.
+
+Re-evaluate if: a use case genuinely needs server-side instruction pinning
+shared across multiple consumers AND runs on the codex backend — then the
+caching win makes it cheap, and only the client-side-ownership argument
+remains.
 
 ## Multi-backend support — NARROWED 2026-05-30 (codex landed)
 
