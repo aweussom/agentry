@@ -92,6 +92,13 @@ would prefer them already has paid tooling.
 - [ ] Consider selective tool permissions instead of blanket `-32601`
       deny. Currently every agent->client request is rejected, so any
       prompt that genuinely needs a tool fails rather than degrading.
+- [ ] (codex) Only if the ~24.8k base harness ever becomes a real
+      constraint: try `baseInstructions` on `thread/start` to REPLACE
+      codex's base system prompt (vs `developerInstructions`, which
+      appends). It's the one lever that shrinks the prefix, but it
+      discards codex's agent scaffolding — a behavior change, not a free
+      win. Untested. See CODEX-PLAN.md base-context note. Today the
+      harness is cached/free, so not worth it.
 
 ## Architecture
 

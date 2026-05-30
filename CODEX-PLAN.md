@@ -54,6 +54,16 @@ loaded into the app-server turn path. The harness is cached server-side
 latency-cheap and — on a flat ChatGPT subscription — not separately billed.
 Don't add plugin-disable flags to the backend; they're a no-op here.
 
+The ONLY lever that would actually shrink the 24.8k is `baseInstructions` on
+`thread/start` (ThreadStartParams), which **replaces** codex's base system
+prompt rather than appending to it (the way `developerInstructions` does).
+This is NOT a free optimization: discarding codex's agent scaffolding
+(tool-use protocol, safety, output conventions) turns codex into a plainer
+chat model and is a behavior change, not a tuning knob. Untested — we don't
+know how far it shrinks the prefix or what regresses. Only worth it if the
+24.8k ever becomes a real constraint (context-window pressure, or a future
+per-token-billed codex tier); today it's cached and free, so leave it alone.
+
 Protocol confirmations (from `codex app-server generate-json-schema`, dumped
 to `_bench/codex_schema/`): wire methods are exactly `initialize`,
 `thread/start`, `turn/start`, `turn/interrupt`, `turn/steer`, `thread/resume`;
