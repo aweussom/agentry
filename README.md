@@ -33,6 +33,32 @@ Both speak persistent JSON-RPC 2.0 over stdio, so both get the no-spawn-cost
 win. Adding a third backend is implementing one `Backend` class in
 `backends.py`.
 
+## The idea: reverse MCP
+
+The Model Context Protocol (MCP) standardizes one direction: how a model
+*consumes* external capabilities. A host app embeds an LLM and connects to MCP
+servers that expose tools and data — the arrow points `LLM ──▶ tools`.
+
+Agentry points the arrow the other way. A coding-agent CLI is, by design, an
+MCP *client*: it exists to call tools. Agentry wraps that agent and serves the
+model as a plain HTTP endpoint, so ordinary software consumes the model instead:
+
+```
+MCP       LLM  ───▶  tools / data      (the model consumes capabilities)
+agentry   code ───▶  LLM  (HTTP)       (your code consumes the model)
+```
+
+The agent built to call tools becomes the tool. And agentry *enforces* the flip
+rather than just narrating it: every tool, permission, or filesystem request the
+agent tries to make back to its host is denied (JSON-RPC `-32601`). Stripped of
+its ability to consume tools, the agent is left as a pure language service
+behind an OpenAI-shaped API.
+
+A lens, not a protocol: agentry speaks the OpenAI chat API, not MCP, and does
+not interoperate with MCP tooling. The point is the direction of the arrow —
+turning a tool-using agent into a tool other programs use — not a shared wire
+format.
+
 ## Status
 
 Working tool. Used by the author as the primary enricher across adjacent
@@ -132,7 +158,9 @@ The two protocols map almost one-to-one:
 
 In both, agent→client requests for tools / permissions / filesystem are
 auto-denied with JSON-RPC `-32601` to keep the proxy a pure chat client (no
-agent capabilities — by design). Codex additionally runs each thread with
+agent capabilities — by design). This denial is where the reverse-MCP inversion
+is enforced: the agent's tool-consuming half is switched off, leaving only the
+language model to be served. Codex additionally runs each thread with
 `approvalPolicy: never` + `sandbox: read-only`.
 
 OpenAI-compatible endpoints exposed:

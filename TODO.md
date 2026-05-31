@@ -106,7 +106,7 @@ would prefer them already has paid tooling.
       second CLI can live as a sibling to the copilot backend. Done
       2026-05-30 — `Backend` ABC + `make_backend` factory in `backends.py`;
       codex validated the design end-to-end.
-- [ ] README "Reverse MCP" section — frame the proxy as the inversion
-      of MCP's consumer/provider roles (MCP turns tools into LLM
-      services; agentry turns LLMs into HTTP services). Conceptual
-      hook, not a feature.
+- [x] README "Reverse MCP" section — frames the proxy as the inversion
+      of MCP's consumer/provider roles (MCP makes tools callable by
+      models; agentry makes a model callable by code, and enforces the
+      flip via the `-32601` tool-deny). Done 2026-05-31.
