@@ -37,6 +37,17 @@ if (-not (Get-Command $cli -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+# Optional: the claude backend shows real 5h/weekly quota if the claude-code-quota
+# tool's cache exists. Point the user at it if it's missing — agentry works fine
+# without it (falls back to a coarse per-turn signal).
+if ($Backend -eq "claude" -and -not (Test-Path (Join-Path $HOME ".claude\quota-data.json"))) {
+    Write-Host "  (i) claude quota display off: no ~/.claude/quota-data.json found."
+    Write-Host "      Optional — install https://github.com/aweussom/claude-code-quota for 5h/weekly %."
+    Write-Host "      Caveat: that cache is refreshed by an ACTIVE/interactive claude-code session's"
+    Write-Host "      status line, NOT by agentry's headless 'claude -p' — keep a claude session"
+    Write-Host "      running elsewhere to keep the numbers fresh."
+}
+
 $pyArgs = @('agentry.py', '--port', $Port, '--backend', $Backend)
 if ($Model)            { $pyArgs += @('--model', $Model) }
 if ($ReasoningEffort)  { $pyArgs += @('--reasoning-effort', $ReasoningEffort) }
