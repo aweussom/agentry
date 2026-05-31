@@ -245,10 +245,11 @@ def main():
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     LOG_DIR.mkdir(exist_ok=True)
 
-    # Idle heartbeat: an in-place "[keepalive] idle" line once a minute, with the
-    # backend's quota shown on every 10th tick (None backends just show idle).
+    # Idle heartbeat: pulses '...*...*...*' in place once a second, and drops a
+    # permanent quota snapshot into scrollback every 10 min (codex; copilot is
+    # unmetered so no snapshot, just the pulse).
     set_status_provider(lambda: _backend.quota_status() if _backend else None)
-    start_keepalive(60, every_n=10)
+    start_keepalive(pulse_interval=1.0, snapshot_interval=600.0)
 
     print(f"  agentry on http://localhost:{args.port}  (backend={BACKEND_KIND})", flush=True)
     print(f"  model={BACKEND_MODEL or '(backend default)'}  reasoning={REASONING_EFFORT or '(backend default)'}", flush=True)

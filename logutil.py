@@ -7,15 +7,15 @@ same console state without a circular import.
 Console behaviour:
 - Every real log line is timestamped and prefixed with elapsed time since the
   current request started (REQ_T0, stamped per thread by the HTTP handler).
-- When the server is idle, a single *transient* keepalive line is rewritten in
-  place once per interval (carriage-return, no ANSI — portable to conhost and
-  Windows Terminal), so idle ticks don't scroll the console.
-- Every Nth keepalive, a registered status provider (e.g. backend quota) is
-  printed as a *permanent* line above the transient ticker — ordinary idle
-  ticks update their own bottom line and never push these upward.
-- Real log lines clear the transient ticker, print above it, and the ticker
-  redraws on its next tick. On a non-TTY (redirected to a file) the transient
-  ticker is suppressed entirely; only permanent lines are written.
+- When the server is idle, a *transient* heartbeat line pulses '...*...*...*'
+  in place once a second (carriage-return, no ANSI — portable to conhost and
+  Windows Terminal), so the console shows liveness without scrolling.
+- Periodically (snapshot_interval) a registered status provider (e.g. backend
+  quota) is printed as a *permanent* line above the heartbeat — these stay in
+  scrollback; the pulsing line never pushes them up.
+- Real log lines clear the transient heartbeat, print above it, and the pulse
+  resumes on its next tick. On a non-TTY (redirected to a file) the heartbeat
+  is suppressed entirely; only permanent lines are written.
 """
 import datetime
 import sys
@@ -81,30 +81,46 @@ def log(msg):
         _write_permanent(line)
 
 
-def _keepalive_loop(interval, every_n):
-    tick = 0
+def _pulse(frame, width=11):
+    """A scrolling '...*...*...*' heartbeat field; the stars sweep as frame++."""
+    unit = "...*"
+    base = unit * (width // len(unit) + 2)
+    off = frame % len(unit)
+    return base[off:off + width]
+
+
+def _keepalive_loop(pulse_interval, snapshot_interval, idle_after):
+    frame = 0
+    last_snapshot = 0.0
     while True:
-        time.sleep(interval)
-        if now() - _last_activity < interval:
-            tick = 0            # activity happened; restart the idle cadence
+        time.sleep(pulse_interval)
+        if now() - _last_activity < idle_after:
+            frame = 0           # active again; pause the heartbeat
             continue
-        tick += 1
         status = None
-        if every_n and tick % every_n == 0 and _status_provider is not None:
+        if _status_provider is not None:
             try:
                 status = _status_provider()
             except Exception:
                 status = None
+        frame += 1
         with _print_lock:
-            if status:
+            # Drop a permanent quota "keepalive" line into scrollback when going
+            # idle and every snapshot_interval after — only when there's real
+            # status (don't litter logs with periodic "idle").
+            if status and (now() - last_snapshot) >= snapshot_interval:
                 _write_permanent(f"[{_stamp()}] [keepalive] {status}")
+                last_snapshot = now()
+            # Between snapshots, pulse a live heartbeat line in place (TTY only).
             if _isatty:
-                _write_transient(f"[{_stamp()}] [keepalive] idle")
-            # non-TTY + no status: stay silent (don't spam the redirected log).
+                _write_transient(f"[{_stamp()}] {_pulse(frame)}")
+            # non-TTY: no heartbeat; only the periodic permanent line above.
 
 
-def start_keepalive(interval=60, every_n=10):
-    """Start the idle-heartbeat thread. every_n keepalives show the status
-    provider (e.g. backend quota) as a permanent line."""
-    threading.Thread(target=_keepalive_loop, args=(interval, every_n),
-                     daemon=True, name="keepalive").start()
+def start_keepalive(pulse_interval=1.0, snapshot_interval=600.0, idle_after=3.0):
+    """Start the idle heartbeat thread. When idle it pulses a '...*...*...*'
+    line in place (TTY) once per pulse_interval, and drops a permanent status
+    snapshot (e.g. backend quota) into scrollback every snapshot_interval."""
+    threading.Thread(target=_keepalive_loop,
+                     args=(pulse_interval, snapshot_interval, idle_after),
+                     daemon=True, name="heartbeat").start()
