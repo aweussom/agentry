@@ -137,15 +137,35 @@ launcher default at runtime.
 
 ### Console
 
-When idle, the launcher console shows a single keepalive line that rewrites
-itself in place (no scroll). On the `codex` backend every ~10th tick prints a
-permanent line with remaining quota — e.g.
-`codex go quota | weekly 22% left (resets 06 Jun 10:51)` — read from the
-rate-limit snapshots codex pushes after each turn (no extra API calls). The
-`copilot` backend shows no quota: its metered resource is *premium requests*,
-which `gpt-5-mini` does not consume, so the default is effectively unmetered.
-(Output redirected to a file suppresses the in-place idle ticker; quota lines
-still appear.)
+When idle, the launcher console pulses a `...*...*...*` heartbeat that rewrites
+itself in place once a second (no scroll). On the `codex` backend it also drops
+a permanent quota line into scrollback when going idle and every ~10 min after —
+e.g. `codex go quota | weekly 22% left (resets 06 Jun 10:51)` — and appends the
+remaining quota to each turn's completion line. The figure is primed at startup
+(`account/rateLimits/read`) and kept fresh by the rate-limit snapshots codex
+pushes per turn, so there are no extra API calls during normal use. (Output
+redirected to a file suppresses the heartbeat; the permanent quota lines still
+appear.)
+
+#### copilot quota — known gap
+
+The `copilot` backend shows **no** quota, and this is a deliberate limitation,
+not an oversight:
+
+- copilot's metered resource is *premium requests*. The default model
+  `gpt-5-mini` does not consume them, so the default is effectively unmetered —
+  there is nothing useful to display.
+- Even on a premium model, agentry cannot surface a live remaining-% the way it
+  does for codex. The copilot CLI fetches that number from GitHub's API and
+  renders it to its own footer in memory; it is **not** persisted to any
+  readable file. A read-only sweep of `~/.copilot` (config, settings,
+  `session-store.db`, and `session-state/*/events.jsonl`) found only per-session
+  *consumption* (`totalPremiumRequests`, written at session shutdown) — never
+  the remaining-% itself. Surfacing it would require calling the GitHub usage
+  API directly with the copilot token, which is out of scope for a thin relay.
+
+So `copilot.quota_status()` returns `None` by design. If a future need arises,
+the GitHub usage API is the only viable source.
 
 ## Architecture
 
