@@ -23,7 +23,7 @@
       TTFB ~6.5s — beats the Copilot SHORT baseline (7.56s). Auth is the
       ChatGPT account login (no API key). Streams reasoning traces
       (`item/reasoning/textDelta`), which Copilot does not. Paid-cheap tier
-      (ChatGPT Go $8 / Plus $20). See `CODEX-PLAN.md`, `_bench/codex_probe.py`.
+      (ChatGPT Go $8 / Plus $20). See `archive/CODEX-PLAN.md`, `_bench/codex_probe.py`.
 - [x] Linux / WSL2 launcher (`start.sh`) + `.gitattributes` for LF.
 - [x] README with persistent-wrapper pitch, Windows + Linux quick start,
       architecture overview, and known limits.
@@ -97,7 +97,7 @@ would prefer them already has paid tooling.
       codex's base system prompt (vs `developerInstructions`, which
       appends). It's the one lever that shrinks the prefix, but it
       discards codex's agent scaffolding — a behavior change, not a free
-      win. Untested. See CODEX-PLAN.md base-context note. Today the
+      win. Untested. See archive/CODEX-PLAN.md base-context note. Today the
       harness is cached/free, so not worth it.
 
 ## Architecture

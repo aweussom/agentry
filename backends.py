@@ -15,7 +15,7 @@ Backends:
 The two transports are deliberately NOT merged into a shared base: the Copilot
 path is in production, so it is kept byte-for-byte to carry zero regression
 risk. The ~40 lines of duplicated JSON-RPC plumbing are the price of that
-isolation. See CODEX-PLAN.md.
+isolation. See archive/CODEX-PLAN.md.
 """
 
 import abc

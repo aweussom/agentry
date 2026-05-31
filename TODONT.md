@@ -50,7 +50,7 @@ was the right call when every candidate was either `-p`-per-turn
 (`claude-code`) or parser-fragile (`agy`). It changed when codex shipped
 `codex app-server`: a persistent stdio JSON-RPC protocol, a near-direct
 structural match for Copilot's ACP. **Codex is now a landed backend** (see
-TODO.md "Done"; `CODEX-PLAN.md`). The `Backend` ABC in `backends.py` is the
+TODO.md "Done"; `archive/CODEX-PLAN.md`). The `Backend` ABC in `backends.py` is the
 plugin interface this entry said wasn't worth building — it was, once a
 second backend justified it.
 
