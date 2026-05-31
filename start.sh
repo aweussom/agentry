@@ -3,10 +3,11 @@
 # authenticated (`copilot login` or `codex login`). Mirrors start.ps1 — same
 # flag names, same defaults.
 #
-# NOTE: default port is 8766 on this branch — prod agentry owns 8765.
+# Run a test instance on a different --port than a running prod instance to
+# avoid an "address already in use" collision (agentry-vs-agentry).
 set -euo pipefail
 
-PORT=8766
+PORT=8765
 BACKEND="copilot"
 MODEL=""
 REASONING_EFFORT="low"

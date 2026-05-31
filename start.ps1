@@ -4,10 +4,11 @@
 #   copilot backend -> `copilot login` (cred-store token reachable to children)
 #   codex backend   -> `codex login`   (ChatGPT account)
 #
-# NOTE: default port is 8766 on this branch — prod agentry owns 8765.
+# Run a test instance on a different -Port than a running prod instance to
+# avoid an "address already in use" collision (agentry-vs-agentry).
 
 param(
-    [int]$Port = 8766,
+    [int]$Port = 8765,
     [ValidateSet("copilot","codex")]
     [string]$Backend = "copilot",
     [string]$Model = "",

@@ -223,8 +223,7 @@ def chat_completions():
 def main():
     global BACKEND_KIND, BACKEND_MODEL, REASONING_EFFORT
     p = argparse.ArgumentParser()
-    # NOTE: default port is 8766 on this branch (prod agentry owns 8765).
-    p.add_argument("--port", type=int, default=8766)
+    p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--backend", choices=["copilot", "codex"], default="copilot",
                    help="Agent backend: copilot (free) or codex (paid-cheap).")
