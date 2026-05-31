@@ -147,25 +147,30 @@ pushes per turn, so there are no extra API calls during normal use. (Output
 redirected to a file suppresses the heartbeat; the permanent quota lines still
 appear.)
 
-#### copilot quota — known gap
+#### copilot quota — opt-in, with a caveat
 
-The `copilot` backend shows **no** quota, and this is a deliberate limitation,
-not an oversight:
+The `copilot` backend shows **no** quota by default, because copilot's metered
+resource is *premium requests* and the default model `gpt-5-mini` does not
+consume them — so the default is effectively unmetered.
 
-- copilot's metered resource is *premium requests*. The default model
-  `gpt-5-mini` does not consume them, so the default is effectively unmetered —
-  there is nothing useful to display.
-- Even on a premium model, agentry cannot surface a live remaining-% the way it
-  does for codex. The copilot CLI fetches that number from GitHub's API and
-  renders it to its own footer in memory; it is **not** persisted to any
-  readable file. A read-only sweep of `~/.copilot` (config, settings,
-  `session-store.db`, and `session-state/*/events.jsonl`) found only per-session
-  *consumption* (`totalPremiumRequests`, written at session shutdown) — never
-  the remaining-% itself. Surfacing it would require calling the GitHub usage
-  API directly with the copilot token, which is out of scope for a thin relay.
+If you do want the monthly premium-request figure (e.g. when running a premium
+model anywhere), agentry can read it from the documented GitHub billing API:
+`GET /users/{username}/settings/billing/premium_request/usage`. Enable it by
+copying `agentry.ini.template` to `agentry.ini` and filling in a fine-grained
+PAT (Account → **Plan: read-only**), your username, and plan tier. The console
+then shows e.g. `copilot pro | premium 142/300 (53% left, resets in 9d)`,
+cached for 10 minutes, with an optional PAT-expiry warning. Note this is a
+*global* monthly figure across all your Copilot usage, not agentry's own.
 
-So `copilot.quota_status()` returns `None` by design. If a future need arises,
-the GitHub usage API is the only viable source.
+**Caveat:** this only works for accounts that pay their own Copilot bill. If
+your license is **org/enterprise-managed** (e.g. an SSO / enterprise-managed
+user), per-user billing is not exposed by GitHub's user-level API (it returns
+HTTP 400/403), and agentry disables the display automatically with one log
+line. The plumbing is verified against a personally-billed account; there is no
+user-level path for enterprise-managed seats. The earlier idea of scraping
+copilot's own quota — fetched live from GitHub and rendered to its TUI footer in
+memory, never persisted to a readable file under `~/.copilot` — was rejected as
+too brittle.
 
 ## Architecture
 

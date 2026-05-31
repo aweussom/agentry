@@ -26,6 +26,9 @@ import queue
 import subprocess
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -106,8 +109,19 @@ class CopilotACPBackend(Backend):
     Auth: `copilot` must already be logged in (`copilot login`).
     """
 
+    # Monthly premium-request allotments per plan tier (GitHub Copilot).
+    PLAN_LIMITS = {"free": 50, "pro": 300, "pro_plus": 1500, "pro+": 1500,
+                   "business": 300, "enterprise": 1000}
+    _QUOTA_TTL = 600.0   # seconds between billing-API fetches
+
     def __init__(self, copilot_path="copilot", cwd=None, model=None,
-                 reasoning_effort=None, log_path=None):
+                 reasoning_effort=None, log_path=None, quota_config=None):
+        # quota_config: optional dict from agentry.ini [copilot_quota] enabling
+        # premium-request quota display via the GitHub billing API.
+        self._quota = quota_config
+        self._quota_cache = None
+        self._quota_cache_t = 0.0
+        self._quota_disabled = False
         # reasoning_effort is intentionally NOT passed to the CLI: in --acp
         # mode the flag is silently ignored and copilot uses its stored user
         # preference instead. We apply it via session/set_config_option once
@@ -379,6 +393,95 @@ class CopilotACPBackend(Backend):
                 self._logf.close()
             except Exception:
                 pass
+
+    # --- premium-request quota (opt-in via agentry.ini) ------------------
+
+    def _plan_limit(self):
+        ml = (self._quota.get("monthly_limit") or "").strip()
+        if ml.isdigit():
+            return int(ml)
+        return self.PLAN_LIMITS.get(self._quota.get("plan", "pro"), 300)
+
+    @staticmethod
+    def _days_to_month_reset():
+        now = datetime.datetime.now(datetime.timezone.utc)
+        nxt = (now.replace(year=now.year + 1, month=1, day=1)
+               if now.month == 12 else now.replace(month=now.month + 1, day=1))
+        # Calendar-day difference, so the last day of a month reads "1d", not "0d".
+        return (nxt.date() - now.date()).days
+
+    def _expiry_warning(self, threshold_days=14):
+        exp = self._quota.get("expiry")
+        if not exp:
+            return None
+        try:
+            e = datetime.datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            days = (e - datetime.datetime.now(datetime.timezone.utc)).days
+        except Exception:
+            return None
+        if days <= threshold_days:
+            name = self._quota.get("pat_name") or "PAT"
+            return f"(!) PAT '{name}' expires in {days}d"
+        return None
+
+    def _fetch_premium_used(self):
+        """Sum this month's Copilot premium requests via the GitHub billing API."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        url = (f"https://api.github.com/users/{self._quota['username']}"
+               f"/settings/billing/premium_request/usage"
+               f"?year={now.year}&month={now.month}")
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {self._quota['pat']}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "agentry",
+        })
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+        return sum(it.get("grossQuantity", 0) for it in data.get("usageItems", [])
+                   if it.get("product") == "Copilot")
+
+    def quota_status(self):
+        """premium-request usage from the GitHub billing API (10-min cached),
+        plus a PAT-expiry warning. None unless configured in agentry.ini, and
+        silently disabled if the account's billing isn't exposed to the
+        user-level API (e.g. an org/enterprise-managed / SSO license)."""
+        if not self._quota or self._quota_disabled:
+            return None
+        now = time.monotonic()
+        if self._quota_cache is not None and (now - self._quota_cache_t) < self._QUOTA_TTL:
+            return self._quota_cache
+        try:
+            used = self._fetch_premium_used()
+        except urllib.error.HTTPError as e:
+            # 400 "Unable to get billing usage data" / 403 "No access" mean this
+            # account's Copilot license is org/enterprise-managed (billing lives
+            # at the enterprise level, not the user API). Disable quietly — one
+            # log line, no per-tick console spam.
+            if e.code in (400, 403):
+                self._quota_disabled = True
+                _log(f"copilot quota disabled (HTTP {e.code}): Copilot billing is "
+                     f"org/enterprise-managed for this account, or the PAT lacks "
+                     f"'Plan: read-only'. Not retrying.")
+                return None
+            self._quota_cache = f"copilot quota: HTTP {e.code}"
+            self._quota_cache_t = now
+            return self._quota_cache
+        except Exception as e:
+            self._quota_cache = f"copilot quota: unavailable ({e.__class__.__name__})"
+            self._quota_cache_t = now
+            return self._quota_cache
+        limit = self._plan_limit()
+        left = max(0, limit - used)
+        pct = round(100 * left / limit) if limit else 0
+        s = (f"copilot {self._quota.get('plan', 'pro')} | premium {used:g}/{limit} "
+             f"({pct}% left, resets in {self._days_to_month_reset()}d)")
+        warn = self._expiry_warning()
+        if warn:
+            s += f" | {warn}"
+        self._quota_cache = s
+        self._quota_cache_t = now
+        return s
 
 
 # --- Codex app-server backend -------------------------------------------
@@ -755,10 +858,12 @@ def make_backend(kind, *, model=None, reasoning_effort=None, log_dir: Optional[P
     'use the backend's own default'."""
     log_dir = log_dir or (Path(__file__).parent / "logs")
     if kind == "copilot":
+        import config
         return CopilotACPBackend(
             model=model,
             reasoning_effort=reasoning_effort,
             log_path=log_dir / "acp_wire.log",
+            quota_config=config.copilot_quota(),
         )
     if kind == "codex":
         kw = {"log_path": log_dir / "codex_wire.log"}
