@@ -23,6 +23,7 @@ import json
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from typing import Iterator, Optional
@@ -397,15 +398,43 @@ class CodexAppServerBackend(Backend):
     # Reasoning levels codex accepts on turn/start (ReasoningEffort enum).
     EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
+    # codex is an AGENT: on a non-trivial prompt it will try to use its shell
+    # tool to explore the cwd for context (e.g. grepping for JSON field names
+    # it sees in an enrichment prompt). For agentry's pure-chat use that is
+    # wrong, wasteful, and a privacy risk. This developer instruction tells it
+    # to behave as a stateless answerer. (Necessary but not sufficient — see
+    # the empty-scratch cwd below; sandbox=read-only alone does NOT stop reads,
+    # because read-only commands are auto-approved regardless of approvalPolicy.)
+    CHAT_ONLY_INSTRUCTIONS = (
+        "You are a stateless question-answering assistant exposed over an HTTP "
+        "chat API. Answer each user message directly and completely using only "
+        "your own knowledge and the content of the message itself. "
+        "Do not use any tools. Do not run shell commands. Do not read, list, "
+        "search, or otherwise inspect files or directories. There is no relevant "
+        "codebase, repository, or workspace — ignore the working directory "
+        "entirely. If the message asks for a specific output format (e.g. a JSON "
+        "object), return exactly that and nothing else."
+    )
+
     def __init__(self, codex_path="codex", cwd=None, model="gpt-5.4-mini",
-                 reasoning_effort="low", log_path=None):
+                 reasoning_effort="low", developer_instructions=None, log_path=None):
         self.model = model
         # codex calls it "effort"; we keep agentry's "reasoning_effort" name on
         # the public interface for parity with the Copilot backend.
         self.reasoning_effort = reasoning_effort
-        self.cwd = os.path.abspath(cwd) if cwd else os.path.dirname(os.path.abspath(__file__))
+        self.developer_instructions = (
+            self.CHAT_ONLY_INSTRUCTIONS if developer_instructions is None
+            else developer_instructions)
+        # Run codex in a dedicated EMPTY scratch dir, NEVER the agentry repo:
+        # an empty cwd gives the agent nothing to find if it tries to explore,
+        # and keeps agentry's own source/logs/memory out of reach.
+        if cwd:
+            self.cwd = os.path.abspath(cwd)
+        else:
+            self.cwd = os.path.join(tempfile.gettempdir(), "agentry-codex-scratch")
+        os.makedirs(self.cwd, exist_ok=True)
         cmd = [codex_path, "app-server"]
-        _log(f"codex spawn: {' '.join(cmd)}")
+        _log(f"codex spawn: {' '.join(cmd)}  (cwd={self.cwd})")
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, encoding="utf-8", errors="replace",
@@ -524,11 +553,13 @@ class CodexAppServerBackend(Backend):
 
     def new_session(self, cwd=None):
         # model/effort are turn-level overrides (TurnStartParams), so thread/start
-        # only carries session-scoped policy. read-only sandbox + no approvals
-        # keeps this a pure chat client that never touches the filesystem.
-        params = {"approvalPolicy": "never", "sandbox": "read-only"}
-        if cwd:
-            params["cwd"] = os.path.abspath(cwd)
+        # only carries session-scoped policy. We pin an empty cwd and inject
+        # chat-only developer instructions so codex behaves as a plain answerer
+        # rather than an agent exploring the filesystem.
+        params = {"approvalPolicy": "never", "sandbox": "read-only",
+                  "cwd": os.path.abspath(cwd) if cwd else self.cwd}
+        if self.developer_instructions:
+            params["developerInstructions"] = self.developer_instructions
         result = self._request("thread/start", params)
         self.session_id = result["thread"]["id"]
         self.session_fresh = True
