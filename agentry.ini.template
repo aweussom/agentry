@@ -1,0 +1,28 @@
+# agentry configuration template.
+# Copy this file to `agentry.ini` (gitignored) and fill in the values.
+# `agentry.ini` holds a secret (a GitHub PAT) and is never committed.
+
+[copilot_quota]
+# Optional. Show remaining GitHub Copilot *premium-request* quota in the
+# console when running the `copilot` backend. Leave `pat` blank to disable
+# (the default — no quota shown for copilot).
+#
+# NOTE: gpt-5-mini does not consume premium requests, so this is a GLOBAL
+# monthly figure across ALL your Copilot usage (CLI, IDE, agentry), not
+# agentry's own consumption. It reads the documented GitHub billing API:
+#   GET /users/{username}/settings/billing/premium_request/usage
+#
+# Fine-grained PAT with Account permissions -> "Plan" : Read-only.
+# Create at: https://github.com/settings/personal-access-tokens/new
+pat =
+
+# Your GitHub username (the {username} in the billing API path).
+username =
+
+# Plan tier, used to derive the monthly premium-request limit:
+#   free = 50    pro = 300    pro_plus = 1500
+plan = pro
+
+# Optional: override the monthly premium-request limit directly (integer).
+# Takes precedence over `plan` — use if your org/plan has a custom allotment.
+monthly_limit =
