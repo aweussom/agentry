@@ -567,6 +567,17 @@ class CodexAppServerBackend(Backend):
             self._notify("initialized", {})
         except Exception:
             pass
+        # Prime the quota snapshot so the console shows it immediately, without
+        # waiting for the first turn's rateLimits notification.
+        try:
+            rl = (self._request("account/rateLimits/read", {}, timeout=10)
+                  or {}).get("rateLimits")
+            if rl:
+                with self._rl_lock:
+                    self._rate_limits = rl
+                _log(f"codex quota: {self.quota_brief()}")
+        except Exception as e:
+            _log(f"codex quota prime skipped: {e}")
 
     def new_session(self, cwd=None):
         # model/effort are turn-level overrides (TurnStartParams), so thread/start
