@@ -631,11 +631,12 @@ class CodexAppServerBackend(Backend):
                             yield t
                     elif method == "turn/completed":
                         turn = params.get("turn") or {}
-                        if turn.get("status") == "failed":
+                        status = turn.get("status")
+                        if status == "failed":
                             err = (turn.get("error") or {}).get("message", "unknown")
                             yield f"\n[codex error] {err}"
-                        else:
-                            _log(f"turn status={turn.get('status')}")
+                        brief = self.quota_brief()
+                        _log(f"turn status={status}" + (f"  quota: {brief}" if brief else ""))
                         return
             finally:
                 self.active_turn_queue = None
@@ -694,6 +695,23 @@ class CodexAppServerBackend(Backend):
             return None
         plan = rl.get("planType") or "codex"
         return f"codex {plan} quota | " + " | ".join(parts)
+
+    def quota_brief(self):
+        """Compact form for the per-turn log line: the most-constraining window,
+        e.g. 'weekly 22% left'. None until a snapshot arrives."""
+        with self._rl_lock:
+            rl = self._rate_limits
+        if not isinstance(rl, dict):
+            return None
+        best = None  # (left_percent, label)
+        for key in ("primary", "secondary"):
+            w = rl.get(key)
+            if not isinstance(w, dict) or w.get("usedPercent") is None:
+                continue
+            left = max(0, 100 - int(w["usedPercent"]))
+            if best is None or left < best[0]:
+                best = (left, self._window_label(w.get("windowDurationMins")))
+        return f"{best[1]} {best[0]}% left" if best else None
 
     def is_alive(self):
         return self.proc.poll() is None
