@@ -161,10 +161,21 @@ copilot pro | premium 142/300 (53% left, resets in 9d)
 ```
 
 cached for 10 minutes, with an optional PAT-expiry warning (`expiry`/`pat_name`
-in the ini). It's **off by default** (blank `pat`) — the default model
-`gpt-5-mini` doesn't consume premium requests, so for the default setup there's
-nothing to meter. Note the figure is a *global* monthly total across all your
-Copilot usage (CLI, IDE, agentry), not agentry's own.
+in the ini). It's **off by default** (blank `pat`).
+
+**What it tracks — and what it does *not*.** This endpoint reports *monthly
+premium-request* usage: the billed/metered requests (premium models like Claude
+Sonnet/Opus). In testing it returned **empty (0)** on a personal account whose
+copilot footer simultaneously showed ~24% consumed (`Remaining reqs 76%`). The
+likely explanation: base/included models such as `gpt-5-mini` and `haiku-4.5`
+aren't premium requests at all — they're throttled by a short **rolling-window
+rate limit** (the same primary/secondary-window shape codex exposes), and *that*
+is what the footer shows. The rolling figure is **not** in the billing API; it
+lives only in copilot's internal real-time endpoint, which isn't cleanly
+accessible. So agentry's number is a monthly *premium-billing* readout (0 unless
+you actually run premium models), **not** a mirror of the footer's live
+'Remaining reqs'. It's a global monthly total across all your Copilot usage.
+(Premium allowances: Pro = 300/month, Pro+ = 1500.)
 
 **Caveat — personal billing only.** This works only for accounts that pay their
 own Copilot bill (verified end-to-end against a personally-billed account). If
