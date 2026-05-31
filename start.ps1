@@ -3,13 +3,14 @@
 # is already authenticated:
 #   copilot backend -> `copilot login` (cred-store token reachable to children)
 #   codex backend   -> `codex login`   (ChatGPT account)
+#   claude backend  -> Claude Code CLI already logged in (its own OAuth/API key)
 #
 # Run a test instance on a different -Port than a running prod instance to
 # avoid an "address already in use" collision (agentry-vs-agentry).
 
 param(
     [int]$Port = 8765,
-    [ValidateSet("copilot","codex")]
+    [ValidateSet("copilot","codex","claude")]
     [string]$Backend = "copilot",
     [string]$Model = "",
     [ValidateSet("none","minimal","low","medium","high","xhigh","max","")]
@@ -30,7 +31,7 @@ if (-not (Test-Path .\venv\Scripts\python.exe)) {
     .\venv\Scripts\python.exe -m pip install --quiet -r requirements.txt
 }
 
-$cli = if ($Backend -eq "codex") { "codex" } else { "copilot" }
+$cli = switch ($Backend) { "codex" { "codex" } "claude" { "claude" } default { "copilot" } }
 if (-not (Get-Command $cli -ErrorAction SilentlyContinue)) {
     Write-Warning "$cli not found on PATH. Install and authenticate the $Backend backend first."
     exit 1

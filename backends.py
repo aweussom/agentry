@@ -11,11 +11,17 @@ Backends:
   CodexAppServerBackend  OpenAI Codex (`codex app-server`). The paid-cheap tier
                        (ChatGPT Go $8 / Plus $20). Validated 2026-05-30;
                        default model gpt-5.4-mini @ low effort.
+  ClaudeCodeBackend    Anthropic Claude Code (`claude -p`). The premium tier.
+                       Unlike the other two, claude-code has NO persistent
+                       stdio server mode, so this backend is COLD-START: one
+                       fresh `claude -p` process per turn. Measured ~2.5s
+                       startup overhead (Sonnet 4.6, lean config) — see
+                       archive/CLAUDE-PLAN.md and _bench/claude_probe.py.
 
-The two transports are deliberately NOT merged into a shared base: the Copilot
+The transports are deliberately NOT merged into a shared base: the Copilot
 path is in production, so it is kept byte-for-byte to carry zero regression
-risk. The ~40 lines of duplicated JSON-RPC plumbing are the price of that
-isolation. See archive/CODEX-PLAN.md.
+risk. The duplicated JSON-RPC / process plumbing is the price of that
+isolation. See archive/CODEX-PLAN.md and archive/CLAUDE-PLAN.md.
 """
 
 import abc
@@ -29,6 +35,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -851,6 +858,320 @@ class CodexAppServerBackend(Backend):
                 pass
 
 
+# --- Claude Code backend (cold-start) -----------------------------------
+
+class ClaudeCodeBackend(Backend):
+    """Cold-start client for Anthropic's Claude Code CLI (`claude -p`).
+
+    Unlike the Copilot (`--acp`) and Codex (`app-server`) backends, claude-code
+    exposes NO persistent JSON-RPC server over stdio. Its `-p` (print) mode runs
+    one request and exits. So this backend spawns a FRESH `claude -p` process for
+    every turn — there is no long-lived subprocess to reuse.
+
+    Why cold-start is acceptable here (measured 2026-05-31, _bench/claude_probe.py):
+    a trivial turn costs ~2.5s of startup overhead on Sonnet 4.6 with the lean
+    config below — small against the 40-90s enrichment turns this is built for,
+    and well inside the 5-10s budget. The win cold-start gives for free is
+    ISOLATION: every turn is a brand-new conversation with zero context bleed
+    from prior turns. A persistent mode would amortize startup to ~1.3s/turn but
+    share one conversation across turns, reintroducing the leakage problem.
+    See archive/CLAUDE-PLAN.md for the persistent-mode option.
+
+    "Session" here is a local bookkeeping id only (the HTTP layer reads
+    session_id/session_fresh); it does NOT map to any server-side claude session,
+    because each prompt() is independent. The conversation history the OpenAI
+    client sends is therefore NOT carried across turns — agentry already forwards
+    only the latest user message, which suits the single-shot enrichment use case.
+
+    Lean config: `claude` otherwise loads every configured MCP server (Atlassian,
+    chrome-devtools, ...) and the full tool set at startup — pure overhead and a
+    privacy risk for a chat-only relay. --strict-mcp-config (with no --mcp-config)
+    loads zero MCP servers; --disallowedTools forbids the agentic tools; and an
+    empty scratch cwd keeps agentry's own source/CLAUDE.md out of reach (the same
+    defense-in-depth the codex backend uses).
+
+    Auth: `claude` must already be logged in (the CLI's own OAuth / API key);
+    `-p` runs headless and will not prompt.
+    """
+
+    DEFAULT_MODEL = "claude-sonnet-4-6"
+
+    # Turn claude into a stateless chat answerer: no MCP servers, no agentic
+    # tools. --strict-mcp-config alone (no inline --mcp-config JSON, which a
+    # Windows shell would mangle) loads zero servers.
+    LEAN_FLAGS = ["--strict-mcp-config",
+                  "--disallowedTools",
+                  "Task,Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit"]
+
+    def __init__(self, claude_path="claude", cwd=None, model=None,
+                 reasoning_effort=None, log_path=None):
+        self.claude_path = claude_path
+        self.model = model or self.DEFAULT_MODEL
+        # claude-code (-p) has no reasoning-effort flag; we store the intent for
+        # parity with the other backends but it is a no-op on the wire.
+        self.reasoning_effort = reasoning_effort
+        # Run claude in a dedicated EMPTY scratch dir, NEVER the agentry repo, so
+        # there is nothing to find even if a tool slipped through, and agentry's
+        # own CLAUDE.md / settings are not auto-loaded. Mirrors the codex backend.
+        if cwd:
+            self.cwd = os.path.abspath(cwd)
+        else:
+            self.cwd = os.path.join(tempfile.gettempdir(), "agentry-claude-scratch")
+        os.makedirs(self.cwd, exist_ok=True)
+        self.session_id = None
+        self.session_fresh = False
+        self.turn_lock = threading.Lock()
+        self._proc = None                 # in-flight cold-start process, for cancel()
+        self._proc_lock = threading.Lock()
+        self._rate_limit = None           # latest rate_limit_event payload (quota)
+        self._rl_lock = threading.Lock()
+        self.log_path = log_path
+        self._logf = None
+        if self.log_path:
+            self.log_path.parent.mkdir(exist_ok=True)
+            self._logf = open(self.log_path, "w", encoding="utf-8")
+
+    def _log_wire(self, direction, msg):
+        if self._logf:
+            try:
+                self._logf.write(f"{direction} {json.dumps(msg)}\n")
+                self._logf.flush()
+            except Exception:
+                pass
+
+    def new_session(self, cwd=None):
+        # No server-side session exists for cold-start; mint a local id so the
+        # HTTP layer's session bookkeeping (session_id/session_fresh) works.
+        if cwd:
+            self.cwd = os.path.abspath(cwd)
+            os.makedirs(self.cwd, exist_ok=True)
+        self.session_id = uuid.uuid4().hex
+        self.session_fresh = True
+        _log(f"claude session (cold-start, local id): {self.session_id}")
+        return self.session_id
+
+    def update_reasoning_effort(self, value):
+        """claude-code (-p) exposes no reasoning-effort knob — thinking is model-
+        and prompt-driven, not a CLI flag. Store the intent for future use but
+        report no change, since nothing is applied on the wire."""
+        if value != self.reasoning_effort:
+            self.reasoning_effort = value
+            _log(f"claude: reasoning_effort={value!r} stored but not applied (no CLI knob)")
+        return False
+
+    def _drain_stderr(self, proc):
+        try:
+            for line in iter(proc.stderr.readline, ""):
+                if line and line.strip():
+                    _log(f"claude stderr: {line.rstrip()[:200]}")
+        except Exception:
+            pass
+
+    def prompt(self, text, timeout=180):
+        """Generator yielding text deltas for one turn. Spawns a fresh `claude -p`
+        process, feeds the prompt on stdin (robust for large enrichment prompts —
+        no cmdline-length limit), and streams stream-json output back."""
+        if not self.session_id:
+            raise BackendError("no active session (call new_session first)")
+        with self.turn_lock:
+            cmd = [self.claude_path, "-p",
+                   "--output-format", "stream-json",
+                   "--include-partial-messages",   # emit content_block_delta for streaming
+                   "--verbose",                     # required with stream-json output
+                   "--model", self.model, *self.LEAN_FLAGS]
+            _log(f"claude spawn: {' '.join(cmd)}  (cwd={self.cwd})")
+            # claude is a real claude.exe (not a .cmd shim), so NO shell wrapper:
+            # cmd.exe wrapping mangles the stdout pipe (verified). This differs
+            # from the bench scripts' shell=True, which is needed for copilot.
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, bufsize=1,
+                encoding="utf-8", errors="replace", cwd=self.cwd,
+            )
+            with self._proc_lock:
+                self._proc = proc
+            self.session_fresh = False
+
+            q = queue.Queue()
+            def _reader():
+                try:
+                    for line in iter(proc.stdout.readline, ""):
+                        q.put(line)
+                finally:
+                    q.put(None)   # EOF sentinel
+            threading.Thread(target=_reader, daemon=True).start()
+            threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True).start()
+
+            # Feed the prompt and close stdin so claude starts processing.
+            try:
+                proc.stdin.write(text)
+                proc.stdin.close()
+            except Exception as e:
+                _log(f"claude stdin write failed: {e}")
+
+            got_text = False
+            try:
+                while True:
+                    try:
+                        line = q.get(timeout=timeout)
+                    except queue.Empty:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        yield f"\n[claude timeout after {timeout}s]"
+                        return
+                    if line is None:          # stdout closed without a result event
+                        return
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        _log(f"claude non-JSON line: {line[:120]!r}")
+                        continue
+                    self._log_wire("<<", msg)
+                    t = msg.get("type")
+                    if t == "rate_limit_event":
+                        with self._rl_lock:
+                            self._rate_limit = msg.get("rate_limit_info")
+                    elif t == "stream_event":
+                        ev = msg.get("event") or {}
+                        if ev.get("type") == "content_block_delta":
+                            d = (ev.get("delta") or {}).get("text")
+                            if d:
+                                got_text = True
+                                yield d
+                    elif t == "assistant" and not got_text:
+                        # Fallback when partial deltas weren't emitted: the whole
+                        # assistant message. Guarded so we never double-emit text
+                        # already streamed via stream_event.
+                        for blk in (msg.get("message") or {}).get("content", []):
+                            if blk.get("type") == "text" and blk.get("text"):
+                                got_text = True
+                                yield blk["text"]
+                    elif t == "result":
+                        if msg.get("is_error") or msg.get("subtype") not in (None, "success"):
+                            err = msg.get("result") or msg.get("subtype") or "unknown"
+                            if not got_text:
+                                yield f"\n[claude error] {err}"
+                        _log(f"turn result subtype={msg.get('subtype')!r} "
+                             f"dur={msg.get('duration_ms')}ms")
+                        return
+            finally:
+                with self._proc_lock:
+                    if self._proc is proc:
+                        self._proc = None
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                except Exception:
+                    pass
+
+    def cancel(self):
+        with self._proc_lock:
+            p = self._proc
+        if p is not None and p.poll() is None:
+            try:
+                p.kill()
+                return True
+            except Exception:
+                return False
+        return False
+
+    # The claude-code-quota tool (github.com/aweussom/claude-code-quota) keeps
+    # this cache fresh with the real OAuth usage %, refreshed off claude's own
+    # status-line ticks — no daemon. We read it passively (no network, no dep);
+    # if it's absent we fall back to the coarse per-turn rate_limit_event.
+    QUOTA_CACHE = Path.home() / ".claude" / "quota-data.json"
+
+    @staticmethod
+    def _fmt_reset(ts):
+        if not ts:
+            return None
+        try:
+            return datetime.datetime.fromtimestamp(int(ts)).strftime("%d %b %H:%M")
+        except Exception:
+            return None
+
+    def _quota_from_cache(self):
+        """Render ~/.claude/quota-data.json (the claude-code-quota tool's output)
+        as e.g. 'claude quota | 5h 54% left (resets in 32m) | weekly 74% left
+        (resets in 1d15h)'. None if the cache is missing/invalid."""
+        try:
+            with open(self.QUOTA_CACHE, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            return None
+        if not d.get("valid"):
+            return None
+        sess = d.get("quota_used_pct")
+        wk = d.get("weekly_used_pct")
+        parts = []
+        if isinstance(sess, (int, float)):
+            seg = f"5h {max(0, 100 - int(sess))}% left"
+            if d.get("resets_in"):
+                seg += f" (resets in {d['resets_in']})"
+            parts.append(seg)
+        if isinstance(wk, (int, float)):
+            seg = f"weekly {max(0, 100 - int(wk))}% left"
+            if d.get("weekly_resets"):
+                seg += f" (resets in {d['weekly_resets']})"
+            parts.append(seg)
+        if not parts:
+            return None
+        s = "claude quota | " + " | ".join(parts)
+        if d.get("stale"):
+            s += " (stale)"
+        return s
+
+    def quota_status(self):
+        """Prefer the claude-code-quota cache (real 5h/weekly usage %). Fall back
+        to the coarse rate_limit_event claude streams each turn (status + reset
+        window, no %) when the tool isn't installed. None if neither is available."""
+        cached = self._quota_from_cache()
+        if cached:
+            return cached
+        with self._rl_lock:
+            rl = self._rate_limit
+        if not isinstance(rl, dict):
+            return None
+        status = rl.get("status") or "?"
+        rtype = rl.get("rateLimitType") or "window"
+        s = f"claude {rtype}: {status}"
+        resets = self._fmt_reset(rl.get("resetsAt"))
+        if resets:
+            s += f" (resets {resets})"
+        if rl.get("isUsingOverage"):
+            s += " | on overage"
+        return s
+
+    def is_alive(self):
+        # Cold-start has no persistent process to outlive; the backend can always
+        # spawn a fresh `claude -p`. Always alive so _get_backend never recreates it.
+        return True
+
+    def close(self):
+        with self._proc_lock:
+            p = self._proc
+        if p is not None:
+            try:
+                if p.poll() is None:
+                    p.terminate()
+                    p.wait(timeout=5)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        if self._logf:
+            try:
+                self._logf.close()
+            except Exception:
+                pass
+
+
 # --- Factory -------------------------------------------------------------
 
 def make_backend(kind, *, model=None, reasoning_effort=None, log_dir: Optional[Path] = None) -> Backend:
@@ -872,4 +1193,11 @@ def make_backend(kind, *, model=None, reasoning_effort=None, log_dir: Optional[P
         if reasoning_effort is not None:
             kw["reasoning_effort"] = reasoning_effort
         return CodexAppServerBackend(**kw)
-    raise BackendError(f"unknown backend {kind!r} (expected 'copilot' or 'codex')")
+    if kind == "claude":
+        kw = {"log_path": log_dir / "claude_wire.log"}
+        if model is not None:
+            kw["model"] = model
+        if reasoning_effort is not None:
+            kw["reasoning_effort"] = reasoning_effort
+        return ClaudeCodeBackend(**kw)
+    raise BackendError(f"unknown backend {kind!r} (expected 'copilot', 'codex', or 'claude')")

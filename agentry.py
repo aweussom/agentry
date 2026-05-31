@@ -8,6 +8,9 @@ shutdown on every turn.
 Backends (see backends.py), selected with --backend:
   copilot  GitHub Copilot CLI (`copilot --acp`) — the free tier (default).
   codex    OpenAI Codex (`codex app-server`)    — paid-cheap (ChatGPT Go/Plus).
+  claude   Anthropic Claude Code (`claude -p`)  — premium. COLD-START: one fresh
+           process per turn (claude-code has no persistent stdio server). ~2.5s
+           startup overhead; trades that for zero cross-turn context bleed.
 
 Each backend resolves its own model + reasoning defaults; --model and
 --reasoning-effort override them.
@@ -16,6 +19,7 @@ Auth:
   copilot  must already be logged in (`copilot login`). On Windows the token
            is in the credential store, bound to the interactive logon session.
   codex    must already be logged in (`codex login`, ChatGPT account).
+  claude   must already be logged in (the Claude Code CLI's own OAuth/API key).
 """
 
 import argparse
@@ -125,7 +129,7 @@ def health():
 
 @app.route("/v1/models")
 def models():
-    owner = "openai" if BACKEND_KIND == "codex" else "github-copilot"
+    owner = {"codex": "openai", "claude": "anthropic"}.get(BACKEND_KIND, "github-copilot")
     return jsonify({
         "object": "list",
         "data": [{
@@ -226,11 +230,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--backend", choices=["copilot", "codex"], default="copilot",
-                   help="Agent backend: copilot (free) or codex (paid-cheap).")
+    p.add_argument("--backend", choices=["copilot", "codex", "claude"], default="copilot",
+                   help="Agent backend: copilot (free), codex (paid-cheap), or "
+                        "claude (premium, cold-start).")
     p.add_argument("--model", default=None,
                    help="Model override. copilot: e.g. gpt-5-mini. "
-                        "codex: e.g. gpt-5.4-mini (default).")
+                        "codex: e.g. gpt-5.4-mini (default). "
+                        "claude: e.g. claude-sonnet-4-6 (default).")
     p.add_argument("--reasoning-effort",
                    choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
                    default=None,

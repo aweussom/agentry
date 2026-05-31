@@ -24,6 +24,15 @@
       ChatGPT account login (no API key). Streams reasoning traces
       (`item/reasoning/textDelta`), which Copilot does not. Paid-cheap tier
       (ChatGPT Go $8 / Plus $20). See `archive/CODEX-PLAN.md`, `_bench/codex_probe.py`.
+- [x] Claude Code backend (`claude -p`, COLD-START). Landed 2026-05-31 as the
+      premium tier. claude-code has no persistent stdio server, so it spawns a
+      fresh process per turn: ~2.5s startup overhead (Sonnet 4.6, lean config),
+      which buys zero cross-turn context bleed — the right trade for independent
+      enrichment tasks (40–90s each). Lean config (`--strict-mcp-config` +
+      `--disallowedTools` + empty scratch cwd) ~halves cold start vs default.
+      Default model `claude-sonnet-4-6`. Persistent mode (~1.3s/turn) deferred —
+      see `archive/CLAUDE-PLAN.md` for why prompting can't cleanly fix its
+      cross-turn leakage. `_bench/claude_probe.py`.
 - [x] Linux / WSL2 launcher (`start.sh`) + `.gitattributes` for LF.
 - [x] README with persistent-wrapper pitch, Windows + Linux quick start,
       architecture overview, and known limits.
@@ -71,9 +80,10 @@ rather than a refactor. Remaining candidates are still deferred (see
 would prefer them already has paid tooling.
 
 - [ ] Evaluate remaining CLI tools as backend candidates (low priority):
-    - `claude-code` (Anthropic) — `--output-format stream-json` exists but
-      it's `-p`-per-turn, NOT a persistent stdio protocol; no speed win
-      from wrapping. Deferred.
+    - ~~`claude-code` (Anthropic)~~ — DONE, landed as cold-start backend #3
+      (2026-05-31). It IS `-p`-per-turn with no persistent protocol, but the
+      ~2.5s cold start is fine against 40–90s enrichment turns, and the
+      isolation is a feature here. See "Done" / `archive/CLAUDE-PLAN.md`.
     - `qwen3-code` — Qwen's coding-agent CLI. Unknown automation surface.
     - ~~`antigravity-cli`~~ — evaluated, shelved (see "Done").
     - ~~`codex` (OpenAI)~~ — DONE, landed as a backend.

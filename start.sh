@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch agentry. Run from a shell where the chosen backend's CLI is already
-# authenticated (`copilot login` or `codex login`). Mirrors start.ps1 — same
-# flag names, same defaults.
+# authenticated (`copilot login`, `codex login`, or the Claude Code CLI's own
+# login). Mirrors start.ps1 — same flag names, same defaults.
 #
 # Run a test instance on a different --port than a running prod instance to
 # avoid an "address already in use" collision (agentry-vs-agentry).
@@ -16,16 +16,19 @@ usage() {
     cat <<EOF
 Usage: ./start.sh [options]
   --port N                HTTP port (default: ${PORT})
-  --backend NAME          copilot | codex (default: ${BACKEND})
+  --backend NAME          copilot | codex | claude (default: ${BACKEND})
   --model NAME            Model override (copilot default: gpt-5-mini;
-                          codex default: gpt-5.4-mini)
-  --reasoning-effort X    low | medium | high (default: ${REASONING_EFFORT})
+                          codex default: gpt-5.4-mini;
+                          claude default: claude-sonnet-4-6)
+  --reasoning-effort X    low | medium | high (default: ${REASONING_EFFORT};
+                          no-op on claude — it has no effort knob)
   -h, --help              Show this help
 
 Examples:
   ./start.sh
   ./start.sh --backend codex
   ./start.sh --backend codex --model gpt-5.4-mini --reasoning-effort low
+  ./start.sh --backend claude
   ./start.sh --port 9000
 EOF
 }
@@ -54,7 +57,7 @@ if [[ ! -x venv/bin/python ]]; then
     venv/bin/python -m pip install --quiet -r requirements.txt
 fi
 
-CLI=$([[ "$BACKEND" == "codex" ]] && echo codex || echo copilot)
+case "$BACKEND" in codex) CLI=codex ;; claude) CLI=claude ;; *) CLI=copilot ;; esac
 if ! command -v "$CLI" >/dev/null 2>&1; then
     echo "ERROR: '$CLI' not found on PATH (needed for the $BACKEND backend)." >&2
     exit 1

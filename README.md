@@ -22,16 +22,22 @@ prints a clickable URL (`http://localhost:8765` by default) on startup.
 
 ![Bundled chat UI talking to the proxy as a regular OpenAI endpoint; footer shows the active backend and per-turn latency](./images/web-ui.png)
 
-Wraps two interchangeable backends, selected with `--backend`:
+Wraps three interchangeable backends, selected with `--backend`:
 
 - **`copilot`** (default) — GitHub Copilot CLI (`copilot --acp`). The free
   tier; `gpt-5-mini` at `low`/`high` reasoning.
 - **`codex`** — OpenAI Codex (`codex app-server`). The paid-but-cheap tier
   (ChatGPT Go $8 / Plus $20); default `gpt-5.4-mini` at `low` effort.
+- **`claude`** — Anthropic Claude Code (`claude -p`). The premium tier;
+  default `claude-sonnet-4-6`.
 
-Both speak persistent JSON-RPC 2.0 over stdio, so both get the no-spawn-cost
-win. Adding a third backend is implementing one `Backend` class in
-`backends.py`.
+The copilot and codex backends speak persistent JSON-RPC 2.0 over stdio, so
+both get the no-spawn-cost win. claude-code has no such server mode, so the
+`claude` backend is **cold-start** — one fresh `claude -p` per turn, ~2.5s
+overhead (lean config), trading that for zero cross-turn context bleed. It's
+built for long single-shot tasks (e.g. exam enrichment, 40–90s/turn) where the
+startup is noise. See `archive/CLAUDE-PLAN.md`. Adding a backend is implementing
+one `Backend` class in `backends.py`.
 
 ## The idea: reverse MCP
 
@@ -62,9 +68,9 @@ format.
 ## Status
 
 Working tool. Used by the author as the primary enricher across adjacent
-projects (`shiny-fiesta`, soon `geomap`). Two backends:
-`copilot` (free) and `codex` (paid-cheap) — see `TODONT.md` for which other
-CLIs were considered and declined, and why codex cleared the bar they didn't.
+projects (`shiny-fiesta`, soon `geomap`). Three backends:
+`copilot` (free), `codex` (paid-cheap), and `claude` (premium, cold-start) —
+see `TODONT.md` for which other CLIs were considered and declined.
 Auth uses your existing CLI logins via the local credential store. Operates
 in the same gray ToS zone as any project that wraps a vendor's interactive
 CLI as a programmatic backend — use a non-critical account, don't expose
@@ -79,6 +85,8 @@ Common prerequisites:
   (`copilot login`); Node.js 18+ (distributed as `@github/copilot` on npm).
 - For the `codex` backend: OpenAI Codex CLI on PATH and logged in
   (`codex login`, ChatGPT account — no `OPENAI_API_KEY` needed).
+- For the `claude` backend: Claude Code CLI on PATH and already logged in
+  (its own OAuth/API key); `-p` runs headless and never prompts.
 
 ### Windows (PowerShell 7+)
 
@@ -89,7 +97,7 @@ The launcher must be run from the same logon session as your interactive
 cd C:\devel\aweussom\python\agentry
 .\start.ps1                                          # copilot, gpt-5-mini, reasoning=low
 .\start.ps1 -Backend codex                           # codex, gpt-5.4-mini, effort=low
-.\start.ps1 -Model claude-haiku-4.5 -ReasoningEffort medium
+.\start.ps1 -Backend claude                          # claude, claude-sonnet-4-6 (cold-start)
 .\start.ps1 -Port 9000
 ```
 
@@ -108,7 +116,7 @@ cd ~/path/to/agentry
 chmod +x start.sh                                    # first checkout only
 ./start.sh                                           # copilot, gpt-5-mini, reasoning=low
 ./start.sh --backend codex                           # codex, gpt-5.4-mini, effort=low
-./start.sh --model claude-haiku-4.5 --reasoning-effort medium
+./start.sh --backend claude                          # claude, claude-sonnet-4-6 (cold-start)
 ./start.sh --port 9000
 ```
 
@@ -121,16 +129,18 @@ forwarding.
 Launcher params:
 
 - `-Port` — HTTP port (default `8765`).
-- `-Backend` — `copilot` (default) or `codex`.
+- `-Backend` — `copilot` (default), `codex`, or `claude`.
 - `-Model` — model override.
     - `copilot`: passed to `copilot --model`. Free tier: `gpt-5-mini`
       (default), `gpt-4.1`, `claude-haiku-4.5`. Paid tiers add more
       (Claude Sonnet 4.6, Opus 4.7, GPT-5.x family).
     - `codex`: passed on `turn/start`. Default `gpt-5.4-mini`.
+    - `claude`: passed to `claude --model`. Default `claude-sonnet-4-6`.
 - `-ReasoningEffort` — `low`, `medium`, `high` are confirmed end-to-end on
-  both backends. On `copilot` it is applied via ACP `session/set_config_option`
+  copilot and codex. On `copilot` it is applied via ACP `session/set_config_option`
   after `session/new`; on `codex` it is a `turn/start` param. Edge values
   (`none`, `xhigh`, `max`, `minimal`) are not reliably reachable on copilot.
+  **No-op on `claude`** — claude-code (`-p`) exposes no reasoning-effort knob.
 
 The web UI has a per-request reasoning-effort dropdown that overrides the
 launcher default at runtime.
@@ -183,6 +193,22 @@ your license is **org/enterprise-managed** (e.g. an SSO / enterprise-managed
 user), per-user billing is not exposed by GitHub's user-level API — it returns
 HTTP 400/403 — and agentry disables the display automatically with one log line.
 There is no user-level path for enterprise-managed seats.
+
+#### claude quota
+
+The `claude` backend shows your real Claude Code OAuth usage (5-hour session %
+and weekly %) when [`claude-code-quota`](https://github.com/aweussom/claude-code-quota)
+is installed — it keeps `~/.claude/quota-data.json` fresh off claude's own
+status-line ticks (no daemon). agentry reads that cache passively (no network,
+no extra dependency), rendering e.g.:
+
+```
+claude quota | 5h 54% left (resets in 31m) | weekly 74% left (resets in 1d15h)
+```
+
+If the tool isn't installed, it falls back to the coarse `rate_limit_event`
+claude streams each turn (status + reset window, no %), e.g.
+`claude five_hour: allowed (resets 31 May 12:10)`.
 
 ## Architecture
 
@@ -238,7 +264,7 @@ custom-instructions file in `~/.copilot/` that would otherwise leak hints
 | Path | Purpose |
 |---|---|
 | `agentry.py` | Flask server + OpenAI surface + backend selection |
-| `backends.py` | `Backend` ABC + `CopilotACPBackend` + `CodexAppServerBackend` |
+| `backends.py` | `Backend` ABC + `CopilotACPBackend` + `CodexAppServerBackend` + `ClaudeCodeBackend` |
 | `logutil.py` | Shared timestamped logging + idle keepalive |
 | `templates/index.html` | Web UI shell |
 | `static/css/style.css` | Web UI styles |
@@ -249,7 +275,8 @@ custom-instructions file in `~/.copilot/` that would otherwise leak hints
 | `TODO.md` | Roadmap and known polish items |
 | `TODONT.md` | Paths intentionally not taken, with reasons |
 | `archive/CODEX-PLAN.md` | Codex backend design + validation record (archived) |
-| `logs/` | Runtime traces (gitignored): `acp_wire.log`, `codex_wire.log` |
+| `archive/CLAUDE-PLAN.md` | Claude Code backend design + startup-cost bench (archived) |
+| `logs/` | Runtime traces (gitignored): `acp_wire.log`, `codex_wire.log`, `claude_wire.log` |
 
 ## Known limits
 
@@ -277,12 +304,14 @@ custom-instructions file in `~/.copilot/` that would otherwise leak hints
 ## Roadmap
 
 See `TODO.md` for active polish items and `TODONT.md` for paths
-intentionally not taken. The backend layer is now pluggable and ships two
-backends (`copilot`, `codex`). Further backends (`claude-code`,
-`qwen3-code`, `antigravity`) remain deferred — `claude-code` is
-`-p`-per-turn with no persistent protocol, so wrapping it buys no
-spawn-cost win, and the others were shelved for the reasons in `TODONT.md`.
-A new backend now means implementing one `Backend` class, not a refactor.
+intentionally not taken. The backend layer is pluggable and ships three
+backends (`copilot`, `codex`, `claude`). `claude-code` is `-p`-per-turn with
+no persistent protocol — once deferred for that reason, but it landed as a
+**cold-start** backend (2026-05-31): the ~2.5s spawn cost is noise against the
+long enrichment turns it targets, and the per-turn isolation is a feature
+(`archive/CLAUDE-PLAN.md`). Remaining candidates (`qwen3-code`, `antigravity`)
+stay deferred for the reasons in `TODONT.md`. A new backend means implementing
+one `Backend` class, not a refactor.
 
 ## Related work
 
