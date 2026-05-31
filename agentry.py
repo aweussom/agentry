@@ -27,7 +27,8 @@ import uuid
 from pathlib import Path
 from flask import Flask, Response, jsonify, request, render_template
 
-from logutil import REQ_T0 as _REQ_T0, now as _now, log as _log, start_keepalive
+from logutil import (REQ_T0 as _REQ_T0, now as _now, log as _log,
+                     start_keepalive, set_status_provider)
 from backends import make_backend
 
 app = Flask(__name__)
@@ -244,8 +245,10 @@ def main():
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     LOG_DIR.mkdir(exist_ok=True)
 
-    # Idle heartbeat: "[keepalive] idle" once a minute when nothing is happening.
-    start_keepalive(60)
+    # Idle heartbeat: an in-place "[keepalive] idle" line once a minute, with the
+    # backend's quota shown on every 10th tick (None backends just show idle).
+    set_status_provider(lambda: _backend.quota_status() if _backend else None)
+    start_keepalive(60, every_n=10)
 
     print(f"  agentry on http://localhost:{args.port}  (backend={BACKEND_KIND})", flush=True)
     print(f"  model={BACKEND_MODEL or '(backend default)'}  reasoning={REASONING_EFFORT or '(backend default)'}", flush=True)

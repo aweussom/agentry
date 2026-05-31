@@ -19,6 +19,7 @@ isolation. See CODEX-PLAN.md.
 """
 
 import abc
+import datetime
 import json
 import os
 import queue
@@ -71,6 +72,12 @@ class Backend(abc.ABC):
     @abc.abstractmethod
     def close(self) -> None:
         """Terminate the subprocess and release resources."""
+
+    def quota_status(self) -> Optional[str]:
+        """Short human-readable quota/usage string for the console, or None when
+        the backend doesn't meter usage (e.g. an unmetered tier). Default: None;
+        metered backends override."""
+        return None
 
 
 # --- Copilot ACP backend -------------------------------------------------
@@ -445,6 +452,8 @@ class CodexAppServerBackend(Backend):
         self.write_lock = threading.Lock()
         self.pending = {}              # id -> Queue (for initialize, thread/start, turn/start ack)
         self.active_turn_queue = None  # Queue for the active turn's notifications: (method, params)
+        self._rate_limits = None       # latest RateLimitSnapshot from notifications
+        self._rl_lock = threading.Lock()
         self.session_id = None         # codex thread id
         self.session_fresh = False
         self.turn_lock = threading.Lock()
@@ -525,9 +534,17 @@ class CodexAppServerBackend(Backend):
                                   "message": f"method '{msg['method']}' not supported by client"},
                     })
                 elif "method" in msg:
+                    params = msg.get("params") or {}
+                    # codex pushes account rate-limit snapshots as notifications
+                    # (account/rateLimitsUpdated etc.). Cache the latest so
+                    # quota_status() can render it with no extra traffic.
+                    rl = params.get("rateLimits") if isinstance(params, dict) else None
+                    if rl:
+                        with self._rl_lock:
+                            self._rate_limits = rl
                     # Notification: route to the active turn if one is listening.
                     if self.active_turn_queue is not None:
-                        self.active_turn_queue.put((msg["method"], msg.get("params", {})))
+                        self.active_turn_queue.put((msg["method"], params))
         except Exception as e:
             _log(f"codex reader exited: {e}")
 
@@ -632,6 +649,51 @@ class CodexAppServerBackend(Backend):
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _window_label(mins):
+        if not mins:
+            return "window"
+        if mins % 10080 == 0:
+            return "weekly" if mins == 10080 else f"{mins // 10080}w"
+        if mins % 1440 == 0:
+            return f"{mins // 1440}d"
+        if mins % 60 == 0:
+            return f"{mins // 60}h"
+        return f"{mins}m"
+
+    @staticmethod
+    def _fmt_reset(ts):
+        if not ts:
+            return None
+        try:
+            return datetime.datetime.fromtimestamp(int(ts)).strftime("%d %b %H:%M")
+        except Exception:
+            return None
+
+    def quota_status(self):
+        """Render the latest rate-limit snapshot codex pushed, e.g.
+        'codex go quota | 5h 88% left (resets 31 May 12:30) | weekly 24% left
+        (resets 06 Jun 10:51)'. None until the first turn populates it."""
+        with self._rl_lock:
+            rl = self._rate_limits
+        if not isinstance(rl, dict):
+            return None
+        parts = []
+        for key in ("primary", "secondary"):
+            w = rl.get(key)
+            if not isinstance(w, dict) or w.get("usedPercent") is None:
+                continue
+            left = max(0, 100 - int(w["usedPercent"]))
+            seg = f"{self._window_label(w.get('windowDurationMins'))} {left}% left"
+            resets = self._fmt_reset(w.get("resetsAt"))
+            if resets:
+                seg += f" (resets {resets})"
+            parts.append(seg)
+        if not parts:
+            return None
+        plan = rl.get("planType") or "codex"
+        return f"codex {plan} quota | " + " | ".join(parts)
 
     def is_alive(self):
         return self.proc.poll() is None

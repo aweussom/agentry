@@ -135,6 +135,18 @@ Launcher params:
 The web UI has a per-request reasoning-effort dropdown that overrides the
 launcher default at runtime.
 
+### Console
+
+When idle, the launcher console shows a single keepalive line that rewrites
+itself in place (no scroll). On the `codex` backend every ~10th tick prints a
+permanent line with remaining quota — e.g.
+`codex go quota | weekly 22% left (resets 06 Jun 10:51)` — read from the
+rate-limit snapshots codex pushes after each turn (no extra API calls). The
+`copilot` backend shows no quota: its metered resource is *premium requests*,
+which `gpt-5-mini` does not consume, so the default is effectively unmetered.
+(Output redirected to a file suppresses the in-place idle ticker; quota lines
+still appear.)
+
 ## Architecture
 
 `agentry.py` is the Flask layer (routes, OpenAI shape, session reuse).
