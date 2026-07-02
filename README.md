@@ -1,6 +1,12 @@
 # Agentry
 
-**Agentry removes the `-p` overhead of using CLI coding-tools for automation.**
+**Point your OpenAI SDK at the coding-agent subscription you already pay for.**
+*The agent built to call tools becomes the tool.*
+
+Agentry wraps a coding-agent CLI — GitHub Copilot, OpenAI Codex, or Claude Code —
+and serves the model behind it as a plain OpenAI-compatible HTTP API on localhost.
+Your scripts, apps, and pipelines talk to `gpt-5-mini` or `claude-sonnet` through the
+subscription you're already logged into — no per-token API bill, no `-p` spawn tax.
 
 [![A manic developer in a Norwegian sweater smashing an acoustic guitar into a laptop, keyboard keys flying out of the soundhole. The whiteboard reads "DAGENS PLAN: 1. Fikse litt på søk ✓ 2. Legge til AI ✓ 3. En liten proxy ✓ 4. ??? 5. Profit (kanskje)"](./images/dev-to-article-header.png)](https://dev.to/tommy_leonhardsen_81d1f4e/i-built-an-openai-compatible-proxy-for-github-copilot-because-search-was-too-stupid-to-understand-31de)
 
