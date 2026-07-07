@@ -64,8 +64,12 @@ class Backend(abc.ABC):
         """Start a fresh conversation; returns its id."""
 
     @abc.abstractmethod
-    def prompt(self, text: str, timeout: int = 180) -> Iterator[str]:
-        """Generator yielding assistant text deltas for one turn."""
+    def prompt(self, text: str, images=None, timeout: int = 180) -> Iterator[str]:
+        """Generator yielding assistant text deltas for one turn.
+
+        images: optional list of (mime_type, base64_data) tuples to attach to
+        the user turn. Backends that can't forward them must drop them loudly
+        (log + a visible note in the reply), never silently."""
 
     @abc.abstractmethod
     def cancel(self) -> bool:
@@ -318,10 +322,18 @@ class CopilotACPBackend(Backend):
                 _log(f"WARN: update reasoning_effort failed: {e}")
         return False
 
-    def prompt(self, text, timeout=900):
-        """Generator yielding text deltas for one turn. Requires an active session."""
+    def prompt(self, text, images=None, timeout=900):
+        """Generator yielding text deltas for one turn. Requires an active session.
+
+        Images ride as ACP image content blocks; the server advertises
+        promptCapabilities.image=true (see logs/acp_wire.log initialize)."""
         if not self.session_id:
             raise BackendError("no active session (call new_session first)")
+        blocks = []
+        if text:
+            blocks.append({"type": "text", "text": text})
+        for mime, data in (images or []):
+            blocks.append({"type": "image", "data": data, "mimeType": mime})
         with self.turn_lock:
             q = queue.Queue()
             msg_id = self._next_id()
@@ -332,7 +344,7 @@ class CopilotACPBackend(Backend):
                     "jsonrpc": "2.0", "id": msg_id, "method": "session/prompt",
                     "params": {
                         "sessionId": self.session_id,
-                        "prompt": [{"type": "text", "text": text}],
+                        "prompt": blocks,
                     },
                 })
                 self.session_fresh = False
@@ -716,10 +728,19 @@ class CodexAppServerBackend(Backend):
         _log(f"codex effort -> {value} (applies next turn)")
         return True
 
-    def prompt(self, text, timeout=900):
-        """Generator yielding text deltas for one turn. Requires an active thread."""
+    def prompt(self, text, images=None, timeout=900):
+        """Generator yielding text deltas for one turn. Requires an active thread.
+
+        Images ride as ImageUserInput items ({type:"image", url}) with a data:
+        URI — the UserInput schema (generate-json-schema) also offers
+        localImage{path} as a fallback if data: URLs turn out unsupported."""
         if not self.session_id:
             raise BackendError("no active session (call new_session first)")
+        input_items = []
+        if text:
+            input_items.append({"type": "text", "text": text})
+        for mime, data in (images or []):
+            input_items.append({"type": "image", "url": f"data:{mime};base64,{data}"})
         with self.turn_lock:
             q = queue.Queue()
             self.active_turn_queue = q
@@ -730,7 +751,7 @@ class CodexAppServerBackend(Backend):
                 ack = queue.Queue(maxsize=1)
                 self.pending[msg_id] = ack
                 tparams = {"threadId": self.session_id,
-                           "input": [{"type": "text", "text": text}]}
+                           "input": input_items}
                 if self.model:
                     tparams["model"] = self.model
                 if self.reasoning_effort:
@@ -967,12 +988,19 @@ class ClaudeCodeBackend(Backend):
         except Exception:
             pass
 
-    def prompt(self, text, timeout=900):
+    def prompt(self, text, images=None, timeout=900):
         """Generator yielding text deltas for one turn. Spawns a fresh `claude -p`
         process, feeds the prompt on stdin (robust for large enrichment prompts —
-        no cmdline-length limit), and streams stream-json output back."""
+        no cmdline-length limit), and streams stream-json output back.
+
+        Images are NOT supported yet (deferred): the text stdin path can't carry
+        them; supporting them means switching to --input-format stream-json and
+        sending API-style image content blocks. Dropped loudly, per Backend."""
         if not self.session_id:
             raise BackendError("no active session (call new_session first)")
+        if images:
+            _log(f"WARN: claude backend dropping {len(images)} image(s) (not supported yet)")
+            yield f"[agentry: {len(images)} image(s) dropped — claude backend is text-only for now]\n"
         with self.turn_lock:
             cmd = [self.claude_path, "-p",
                    "--output-format", "stream-json",
