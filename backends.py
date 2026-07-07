@@ -318,7 +318,7 @@ class CopilotACPBackend(Backend):
                 _log(f"WARN: update reasoning_effort failed: {e}")
         return False
 
-    def prompt(self, text, timeout=180):
+    def prompt(self, text, timeout=900):
         """Generator yielding text deltas for one turn. Requires an active session."""
         if not self.session_id:
             raise BackendError("no active session (call new_session first)")
@@ -716,7 +716,7 @@ class CodexAppServerBackend(Backend):
         _log(f"codex effort -> {value} (applies next turn)")
         return True
 
-    def prompt(self, text, timeout=180):
+    def prompt(self, text, timeout=900):
         """Generator yielding text deltas for one turn. Requires an active thread."""
         if not self.session_id:
             raise BackendError("no active session (call new_session first)")
@@ -967,7 +967,7 @@ class ClaudeCodeBackend(Backend):
         except Exception:
             pass
 
-    def prompt(self, text, timeout=180):
+    def prompt(self, text, timeout=900):
         """Generator yielding text deltas for one turn. Spawns a fresh `claude -p`
         process, feeds the prompt on stdin (robust for large enrichment prompts —
         no cmdline-length limit), and streams stream-json output back."""
