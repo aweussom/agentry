@@ -241,7 +241,11 @@ class CopilotACPBackend(Backend):
                     })
                 elif "method" in msg:
                     if msg["method"] == "session/update" and self.active_turn_queue is not None:
-                        self.active_turn_queue.put(("update", msg.get("params", {}).get("update", {})))
+                        params = msg.get("params") or {}
+                        # A turn abandoned by timeout can keep streaming after
+                        # new_session; drop updates tagged with a stale session.
+                        if params.get("sessionId") in (None, self.session_id):
+                            self.active_turn_queue.put(("update", params.get("update", {})))
         except Exception as e:
             _log(f"ACP reader exited: {e}")
 
@@ -352,6 +356,7 @@ class CopilotACPBackend(Backend):
                     try:
                         kind, payload = q.get(timeout=timeout)
                     except queue.Empty:
+                        self.cancel()   # stop the server-side turn we're abandoning
                         yield f"\n[ACP timeout after {timeout}s]"
                         return
                     if kind == "update":
@@ -574,6 +579,7 @@ class CodexAppServerBackend(Backend):
         self.write_lock = threading.Lock()
         self.pending = {}              # id -> Queue (for initialize, thread/start, turn/start ack)
         self.active_turn_queue = None  # Queue for the active turn's notifications: (method, params)
+        self._active_turn_id = None    # turn id from the turn/start ack, for turn/interrupt
         self._rate_limits = None       # latest RateLimitSnapshot from notifications
         self._rl_lock = threading.Lock()
         self.session_id = None         # codex thread id
@@ -759,20 +765,44 @@ class CodexAppServerBackend(Backend):
                 self._write({"jsonrpc": "2.0", "id": msg_id,
                              "method": "turn/start", "params": tparams})
                 self.session_fresh = False
+                # The ack normally arrives at once (notifications buffer in q
+                # meanwhile). An error response (bad model, dead thread) means
+                # no turn ever starts — surface it now instead of stalling
+                # until the notification timeout. On success it carries the
+                # turn id, needed for turn/interrupt and stale-turn filtering.
+                try:
+                    resp = ack.get(timeout=30)
+                except queue.Empty:
+                    yield "\n[codex error] no response to turn/start after 30s"
+                    return
+                if "error" in resp:
+                    err = resp["error"]
+                    msg = err.get("message", err) if isinstance(err, dict) else err
+                    yield f"\n[codex error] {msg}"
+                    return
+                turn_id = ((resp.get("result") or {}).get("turn") or {}).get("id")
+                self._active_turn_id = turn_id
                 while True:
                     try:
                         method, params = q.get(timeout=timeout)
                     except queue.Empty:
+                        self._interrupt(turn_id)   # stop the turn we're abandoning
                         yield f"\n[codex timeout after {timeout}s]"
                         return
                     if not isinstance(params, dict):
                         continue
                     if method == "item/agentMessage/delta":
+                        # A turn abandoned by timeout can keep streaming; drop
+                        # anything tagged with a different turn id.
+                        if turn_id and params.get("turnId") not in (None, turn_id):
+                            continue
                         t = params.get("delta")
                         if t:
                             yield t
                     elif method == "turn/completed":
                         turn = params.get("turn") or {}
+                        if turn_id and turn.get("id") not in (None, turn_id):
+                            continue
                         status = turn.get("status")
                         if status == "failed":
                             err = (turn.get("error") or {}).get("message", "unknown")
@@ -782,16 +812,26 @@ class CodexAppServerBackend(Backend):
                         return
             finally:
                 self.active_turn_queue = None
+                self._active_turn_id = None
                 self.pending.pop(msg_id, None)
 
-    def cancel(self):
-        if not self.session_id:
+    def _interrupt(self, turn_id):
+        """Fire-and-forget turn/interrupt. Per the v2 schema it is a REQUEST
+        requiring both threadId and turnId (a bare-threadId notification is
+        silently ignored); we send a real id and drop the response unread."""
+        if not (self.session_id and turn_id):
             return False
         try:
-            self._notify("turn/interrupt", {"threadId": self.session_id})
+            self._write({"jsonrpc": "2.0", "id": self._next_id(),
+                         "method": "turn/interrupt",
+                         "params": {"threadId": self.session_id,
+                                    "turnId": turn_id}})
             return True
         except Exception:
             return False
+
+    def cancel(self):
+        return self._interrupt(self._active_turn_id)
 
     @staticmethod
     def _window_label(mins):
