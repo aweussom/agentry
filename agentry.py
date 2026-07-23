@@ -54,6 +54,8 @@ def _get_backend():
     global _backend
     with _backend_lock:
         if _backend is None or not _backend.is_alive():
+            if _backend is not None:
+                _backend.close()   # reap the dead process, release its wire log
             _backend = make_backend(
                 BACKEND_KIND,
                 model=BACKEND_MODEL,
@@ -73,8 +75,10 @@ def _shutdown_backend():
 # --- HTTP helpers -------------------------------------------------------
 
 def _is_new_chat(messages):
-    user_msgs = sum(1 for m in messages if m.get("role") == "user")
-    assistant_msgs = sum(1 for m in messages if m.get("role") == "assistant")
+    user_msgs = sum(1 for m in messages
+                    if isinstance(m, dict) and m.get("role") == "user")
+    assistant_msgs = sum(1 for m in messages
+                         if isinstance(m, dict) and m.get("role") == "assistant")
     return user_msgs == 1 and assistant_msgs == 0
 
 
@@ -95,7 +99,7 @@ def _latest_user_content(messages):
     URIs are accepted; remote http(s) URLs are skipped (the proxy makes no
     outbound fetches on behalf of clients)."""
     for m in reversed(messages):
-        if m.get("role") != "user":
+        if not isinstance(m, dict) or m.get("role") != "user":
             continue
         content = m.get("content")
         if isinstance(content, str):
@@ -103,6 +107,8 @@ def _latest_user_content(messages):
         if isinstance(content, list):
             texts, images = [], []
             for p in content:
+                if not isinstance(p, dict):
+                    continue
                 if p.get("type") == "text":
                     texts.append(p.get("text", ""))
                 elif p.get("type") == "image_url":
