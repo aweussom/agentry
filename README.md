@@ -219,8 +219,9 @@ claude streams each turn (status + reset window, no %), e.g.
 ## Architecture
 
 `agentry.py` is the Flask layer (routes, OpenAI shape, session reuse).
-`backends.py` holds a `Backend` ABC and the two implementations, each
-owning one persistent subprocess driven by a small JSON-RPC 2.0 client.
+`backends.py` holds a `Backend` ABC and the three implementations —
+`copilot` and `codex` each own one persistent subprocess driven by a small
+JSON-RPC 2.0 client; `claude` spawns a fresh process per turn.
 The Flask layer talks only to the `Backend` interface
 (`new_session` / `prompt` / `cancel` / `update_reasoning_effort` /
 `is_alive` / `close`), so swapping backends is a `--backend` flag.
@@ -235,7 +236,7 @@ The two protocols map almost one-to-one:
 | Reasoning override | `session/set_config_option` | `effort` on `turn/start` |
 | Streamed deltas | `session/update` → `agent_message_chunk` | `item/agentMessage/delta` |
 | Turn complete | `session/prompt` result `stopReason` | `turn/completed` notification |
-| Cancel | `session/cancel` | `turn/interrupt` |
+| Cancel | `session/cancel` | `turn/interrupt` (`threadId`+`turnId`) |
 
 In both, agent→client requests for tools / permissions / filesystem are
 auto-denied with JSON-RPC `-32601` to keep the proxy a pure chat client (no
@@ -244,12 +245,21 @@ is enforced: the agent's tool-consuming half is switched off, leaving only the
 language model to be served. Codex additionally runs each thread with
 `approvalPolicy: never` + `sandbox: read-only`.
 
+Turn lifecycle is hardened against the ugly paths: a codex `turn/start` that
+errors (bad model, dead thread) is surfaced to the client immediately instead
+of stalling until the stream timeout; a turn abandoned by timeout is cancelled
+server-side (`session/cancel` / `turn/interrupt`) so it stops burning quota;
+and streamed updates tagged with a stale session/turn id are dropped, so a
+zombie turn can never bleed text into the next request's response.
+
 OpenAI-compatible endpoints exposed:
 
 - `GET /health` — readiness probe.
 - `GET /v1/models` — single model entry reflecting current `-Model`.
 - `POST /v1/chat/completions` — SSE streaming, standard OpenAI delta format.
-- `POST /v1/cancel` — sends `session/cancel` to the active turn.
+- `POST /v1/cancel` — cancels the in-flight turn (copilot: `session/cancel`;
+  codex: `turn/interrupt` with the active turn's id; claude: kills the
+  `claude -p` process).
 
 The web UI at `/` is a single-page chat copied and pared down from the
 NoLlama project. Markdown rendering, code-block copy, think-block support
@@ -333,9 +343,9 @@ API. The two solve overlapping problems with different framings:
   single developer uses these CLIs as an automation backend for their own
   scripts.
 
-The two-backend design also means agentry isn't tied to one vendor: the same
-OpenAI-shaped endpoint fronts either Copilot (free tier) or Codex (cheap paid
-tier), swapped with a flag. If you want a polished, broadly-applicable
+The multi-backend design also means agentry isn't tied to one vendor: the same
+OpenAI-shaped endpoint fronts Copilot (free tier), Codex (cheap paid tier), or
+Claude Code (premium), swapped with a flag. If you want a polished, broadly-applicable
 Copilot-as-an-API, copilot-api is the more capable project. If you
 specifically want a thin local persistent wrapper around the official agent
 CLIs with no reverse-engineering and a narrower scope, that is agentry.
