@@ -298,6 +298,11 @@ a reply get an "open ▸" button that renders them in a side panel — HTML/SVG
 in a sandboxed iframe (scripts run, but no same-origin access to the chat
 page), markdown through a small built-in document renderer (headers, lists,
 tables, quotes, links, code). Esc closes the panel.
+`.github/copilot-instructions.md` asks the model to precede renderable
+documents with YAML frontmatter (`title: ...`); the UI consumes it — the
+title labels the open button and the panel header instead of rendering as
+text. Frontmatter is optional: untitled fences still get a plain open
+button, and stray `---` blocks without a `title:` render as ordinary text.
 
 ## Per-project instructions
 

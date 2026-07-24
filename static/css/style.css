@@ -373,6 +373,10 @@ body {
     padding: 2px 8px;
     font-size: 11px;
     cursor: pointer;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .artifact-btn:hover { opacity: 0.85; }
 

@@ -181,13 +181,28 @@ function renderMarkdown(text, isStreaming) {
     // inside code survive verbatim (matters doubly now that artifacts
     // re-read the fence source via textContent).
     const fences = [];
-    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        const l = lang.toLowerCase();
-        const artifact = ARTIFACT_LANGS.has(l)
-            ? `<button class="artifact-btn" data-lang="${l}" onclick="openArtifact(this)">open &#9656;</button>` : '';
+    const stashFence = (lang, code, title) => {
+        const l = (lang || '').toLowerCase();
+        let artifact = '';
+        if (ARTIFACT_LANGS.has(l)) {
+            const safe = title ? title.replace(/"/g, '&quot;') : '';
+            artifact = `<button class="artifact-btn" data-lang="${l}"`
+                + (safe ? ` data-title="${safe}"` : '')
+                + ` onclick="openArtifact(this)">open &#9656;${safe ? ' ' + safe : ''}</button>`;
+        }
         fences.push(`<pre><code>${code.trim()}</code><button class="copy-btn" onclick="copyCode(this)">copy</button>${artifact}</pre>`);
         return `\x00F${fences.length - 1}\x00`;
-    });
+    };
+    // Titled artifacts: YAML frontmatter immediately before a fence (see
+    // .github/copilot-instructions.md). The frontmatter is consumed — it
+    // labels the button and panel instead of rendering as text.
+    html = html.replace(/(?:^|\n)---\n([^`]{0,300}?)\n---\n```(\w*)\n([\s\S]*?)```/g,
+        (m, yaml, lang, code) => {
+            const t = yaml.match(/^title:\s*["']?(.+?)["']?\s*$/m);
+            if (!t) return m;
+            return '\n' + stashFence(lang, code, t[1]);
+        });
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => stashFence(lang, code));
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
@@ -237,7 +252,7 @@ function openArtifact(btn) {
         doc.innerHTML = mdToHtml(source);
         artifactBody.appendChild(doc);
     }
-    artifactTitle.textContent = `Artifact (${lang})`;
+    artifactTitle.textContent = btn.dataset.title || `Artifact (${lang})`;
     artifactPanel.classList.add('active');
 }
 window.openArtifact = openArtifact;
@@ -250,6 +265,9 @@ function closeArtifact() {
 // Small markdown-document renderer for markdown artifacts. Deliberately
 // modest: headers, lists, quotes, hr, tables, links, code — not CommonMark.
 function mdToHtml(text) {
+    // A markdown artifact may carry its own frontmatter inside the fence;
+    // it's metadata, not document content.
+    text = text.replace(/^---\n[\s\S]*?\n---\n/, '');
     let h = escapeHtml(text);
     const fences = [];
     h = h.replace(/```(\w*)\n([\s\S]*?)```/g, (_, l, c) => {
