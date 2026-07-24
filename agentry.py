@@ -32,7 +32,7 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, request, render_template
 
 from logutil import (REQ_T0 as _REQ_T0, now as _now, log as _log,
-                     start_keepalive, set_status_provider)
+                     start_keepalive, set_status_provider, set_ticker_provider)
 from backends import make_backend
 
 app = Flask(__name__)
@@ -253,8 +253,11 @@ def main():
 
     # Idle heartbeat: pulses '...*...*...*' in place once a second, and drops a
     # permanent quota snapshot into scrollback every 10 min (codex; copilot is
-    # unmetered so no snapshot, just the pulse).
+    # unmetered so no snapshot, just the pulse). While a turn is in flight the
+    # same line becomes a news ticker scrolling the model's current output
+    # line (reasoning summary or response), so long turns show visible work.
     set_status_provider(lambda: _backend.quota_status() if _backend else None)
+    set_ticker_provider(lambda: _backend.ticker_line() if _backend else None)
     start_keepalive(pulse_interval=1.0, snapshot_interval=600.0)
 
     print(f"  agentry on http://localhost:{args.port}  (backend={BACKEND_KIND})", flush=True)

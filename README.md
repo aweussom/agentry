@@ -167,7 +167,11 @@ launcher default at runtime.
 ### Console
 
 When idle, the launcher console pulses a `...*...*...*` heartbeat that rewrites
-itself in place once a second (no scroll). On the `codex` backend it also drops
+itself in place once a second (no scroll). While a `copilot` turn is in flight,
+that same line becomes a **news ticker**: it scrolls the model's current output
+line — the streamed reasoning summary while it thinks, then the response as it
+writes — restarting whenever the model moves to a new line. Long high-effort
+turns show visible work instead of a silent console. On the `codex` backend it also drops
 a permanent quota line into scrollback when going idle and every ~10 min after —
 e.g. `codex go quota | weekly 22% left (resets 06 Jun 10:51)` — and appends the
 remaining quota to each turn's completion line. The figure is primed at startup

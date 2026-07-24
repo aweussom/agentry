@@ -93,6 +93,12 @@ class Backend(abc.ABC):
         metered backends override."""
         return None
 
+    def ticker_line(self) -> Optional[str]:
+        """Latest line of in-flight turn output (reasoning or response) for the
+        console's live ticker, or None when no turn is running / the backend
+        doesn't surface it. Default: None; streaming backends may override."""
+        return None
+
 
 # --- Copilot SDK backend ---------------------------------------------------
 
@@ -132,7 +138,8 @@ class CopilotSDKBackend(Backend):
             from copilot import CopilotClient
             from copilot.rpc import PermissionDecisionReject
             from copilot.session_events import (
-                AssistantMessageDeltaData, SessionErrorData, SessionIdleData)
+                AssistantMessageDeltaData, AssistantReasoningDeltaData,
+                SessionErrorData, SessionIdleData)
         except ImportError as e:
             raise BackendError(
                 "github-copilot-sdk is not installed (pip install github-copilot-sdk; "
@@ -140,6 +147,7 @@ class CopilotSDKBackend(Backend):
         # Event/decision classes are stashed on self because the SDK import is
         # deferred (other backends must not require it).
         self._DeltaData = AssistantMessageDeltaData
+        self._ReasoningDeltaData = AssistantReasoningDeltaData
         self._ErrorData = SessionErrorData
         self._IdleData = SessionIdleData
         self._Reject = PermissionDecisionReject
@@ -157,6 +165,8 @@ class CopilotSDKBackend(Backend):
         self.active_turn_queue = None     # Queue for the in-flight turn; tagged ("delta"|"error"|"idle", payload)
         self.turn_lock = threading.Lock()
         self._alive = False
+        self._ticker_buf = ""             # tail of the in-flight turn's streamed text
+        self._ticker_kind = None          # "reasoning"|"message"; newline on phase switch
 
         # The SDK logs through the stdlib `copilot` logger hierarchy; a file
         # handler there is the closest equivalent of the old wire log.
@@ -213,11 +223,42 @@ class CopilotSDKBackend(Backend):
         d = event.data
         if isinstance(d, self._DeltaData):
             if d.delta_content:
+                self._ticker_feed("message", d.delta_content)
                 q.put(("delta", d.delta_content))
+        elif isinstance(d, self._ReasoningDeltaData):
+            # Reasoning is not forwarded to the HTTP client, but it feeds the
+            # console ticker and proves the model is working: without the
+            # keepalive, a long silent reasoning stretch (high effort) would
+            # trip prompt()'s inactivity timeout mid-think.
+            if d.delta_content:
+                self._ticker_feed("reasoning", d.delta_content)
+            q.put(("keepalive", None))
         elif isinstance(d, self._ErrorData):
             q.put(("error", d.message or d.error_type or "unknown"))
         elif isinstance(d, self._IdleData):
             q.put(("idle", None))
+        else:
+            # Any other session event (ModelCallStart, usage ticks, ...) still
+            # proves the runtime is alive — count it against the inactivity
+            # timeout, render nothing.
+            q.put(("keepalive", None))
+
+    def _ticker_feed(self, kind, text):
+        """Append streamed text to the ticker buffer (tail-capped); a phase
+        switch (reasoning<->message) starts a fresh line."""
+        if kind != self._ticker_kind:
+            self._ticker_kind = kind
+            self._ticker_buf += "\n"
+        self._ticker_buf = (self._ticker_buf + text)[-2000:]
+
+    def ticker_line(self):
+        if self.active_turn_queue is None:
+            return None
+        for line in reversed(self._ticker_buf.splitlines()):
+            line = line.strip()
+            if line:
+                return line
+        return None
 
     def new_session(self, cwd=None):
         old, self._session = self._session, None
@@ -231,6 +272,10 @@ class CopilotSDKBackend(Backend):
             "streaming": True,
             "available_tools": [],
             "on_permission_request": self._deny_permission,
+            # Ask for streamed thinking summaries where the model supports
+            # them — they feed the console ticker during long reasoning
+            # stretches (and act as inactivity-timeout keepalives).
+            "reasoning_summary": "concise",
         }
         if self.model:
             kwargs["model"] = self.model
@@ -296,6 +341,8 @@ class CopilotSDKBackend(Backend):
             raise BackendError("no active session (call new_session first)")
         with self.turn_lock:
             q = queue.Queue()
+            self._ticker_buf = ""
+            self._ticker_kind = None
             self.active_turn_queue = q
             try:
                 self._call(self._session.send(text), timeout=30)
@@ -308,6 +355,8 @@ class CopilotSDKBackend(Backend):
                         return
                     if kind == "delta":
                         yield payload
+                    elif kind == "keepalive":
+                        continue    # reasoning tick; resets the q.get() window
                     elif kind == "error":
                         yield f"\n[copilot error] {payload}"
                         return
