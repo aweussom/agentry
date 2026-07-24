@@ -167,6 +167,7 @@ class CopilotSDKBackend(Backend):
         self._alive = False
         self._ticker_buf = ""             # tail of the in-flight turn's streamed text
         self._ticker_kind = None          # "reasoning"|"message"; newline on phase switch
+        self._turn_t0 = 0.0               # monotonic start of the in-flight turn
 
         # The SDK logs through the stdlib `copilot` logger hierarchy; a file
         # handler there is the closest equivalent of the old wire log.
@@ -258,7 +259,10 @@ class CopilotSDKBackend(Backend):
             line = line.strip()
             if line:
                 return line
-        return None
+        # Turn in flight but nothing streamed yet: at high effort the model
+        # reasons before it writes, and summaries arrive in bursts — show the
+        # wait itself so the silence doesn't read as a hang.
+        return f"thinking · {int(time.monotonic() - self._turn_t0)}s"
 
     def new_session(self, cwd=None):
         old, self._session = self._session, None
@@ -343,6 +347,7 @@ class CopilotSDKBackend(Backend):
             q = queue.Queue()
             self._ticker_buf = ""
             self._ticker_kind = None
+            self._turn_t0 = time.monotonic()
             self.active_turn_queue = q
             try:
                 self._call(self._session.send(text), timeout=30)
