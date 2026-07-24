@@ -52,15 +52,38 @@ if [[ -z "$MODEL" && "$BACKEND" == "copilot" ]]; then MODEL="gpt-5-mini"; fi
 
 if [[ ! -x venv/bin/python ]]; then
     echo "Creating venv..."
-    python3 -m venv venv
+    # github-copilot-sdk needs Python 3.11+; prefer the newest available.
+    PY=""
+    for v in python3.13 python3.12 python3.11; do
+        command -v "$v" >/dev/null 2>&1 && PY="$v" && break
+    done
+    if [[ -z "$PY" ]]; then
+        if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+            PY=python3
+        else
+            echo "ERROR: Python 3.11+ not found (required by github-copilot-sdk)." >&2
+            exit 1
+        fi
+    fi
+    "$PY" -m venv venv
     venv/bin/python -m pip install --quiet --upgrade pip
     venv/bin/python -m pip install --quiet -r requirements.txt
 fi
 
-case "$BACKEND" in codex) CLI=codex ;; claude) CLI=claude ;; *) CLI=copilot ;; esac
-if ! command -v "$CLI" >/dev/null 2>&1; then
-    echo "ERROR: '$CLI' not found on PATH (needed for the $BACKEND backend)." >&2
-    exit 1
+# The copilot backend runs on the SDK's own downloaded runtime — no CLI on
+# PATH needed — but it reads the ~/.copilot credential store, so a one-time
+# `copilot login` (from any installed Copilot CLI) must have happened.
+if [[ "$BACKEND" == "copilot" ]]; then
+    if [[ ! -d "$HOME/.copilot" ]]; then
+        echo "ERROR: no ~/.copilot found. Log in once first: npm i -g @github/copilot && copilot login" >&2
+        exit 1
+    fi
+else
+    case "$BACKEND" in codex) CLI=codex ;; *) CLI=claude ;; esac
+    if ! command -v "$CLI" >/dev/null 2>&1; then
+        echo "ERROR: '$CLI' not found on PATH (needed for the $BACKEND backend)." >&2
+        exit 1
+    fi
 fi
 
 # Optional: the claude backend shows real 5h/weekly quota if the claude-code-quota

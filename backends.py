@@ -5,9 +5,10 @@ agent subprocess driven over stdio (JSON-RPC 2.0, newline-delimited) and
 exposes a uniform turn interface to the Flask layer.
 
 Backends:
-  CopilotACPBackend    GitHub Copilot CLI (`copilot --acp`). The free tier.
-                       Behavior unchanged from the original single-backend
-                       ACPClient — this class is that code, renamed.
+  CopilotSDKBackend    GitHub Copilot via the official github-copilot-sdk
+                       (JSON-RPC to the Copilot CLI runtime in server mode).
+                       The free tier. Replaced the hand-rolled `copilot --acp`
+                       client on this branch — see git history for that code.
   CodexAppServerBackend  OpenAI Codex (`codex app-server`). The paid-cheap tier
                        (ChatGPT Go $8 / Plus $20). Validated 2026-05-30;
                        default model gpt-5.4-mini @ low effort.
@@ -18,15 +19,18 @@ Backends:
                        startup overhead (Sonnet 4.6, lean config) — see
                        archive/CLAUDE-PLAN.md and _bench/claude_probe.py.
 
-The transports are deliberately NOT merged into a shared base: the Copilot
-path is in production, so it is kept byte-for-byte to carry zero regression
-risk. The duplicated JSON-RPC / process plumbing is the price of that
-isolation. See archive/CODEX-PLAN.md and archive/CLAUDE-PLAN.md.
+The transports are deliberately NOT merged into a shared base: each backend
+owns its plumbing so a change to one carries zero regression risk for the
+others. The Copilot backend delegates its transport to the official SDK; the
+Codex and Claude backends keep their hand-rolled JSON-RPC / subprocess code.
+See archive/CODEX-PLAN.md and archive/CLAUDE-PLAN.md.
 """
 
 import abc
+import asyncio
 import datetime
 import json
+import logging
 import os
 import queue
 import subprocess
@@ -90,30 +94,29 @@ class Backend(abc.ABC):
         return None
 
 
-# --- Copilot ACP backend -------------------------------------------------
+# --- Copilot SDK backend ---------------------------------------------------
 
-class CopilotACPBackend(Backend):
-    """JSON-RPC 2.0 client for `copilot --acp` over stdio.
+class CopilotSDKBackend(Backend):
+    """GitHub Copilot via the official github-copilot-sdk (Python 3.11+).
 
-    One persistent subprocess. Turns are serialized via turn_lock — the
-    protocol allows concurrent sessions but we only need one for chat.
+    The SDK spawns the Copilot CLI runtime in server mode and owns the wire
+    protocol (JSON-RPC over stdio); this class only bridges the SDK's
+    async-only API onto agentry's sync Backend interface. One asyncio event
+    loop runs in a daemon thread; sync methods submit coroutines with
+    run_coroutine_threadsafe and block on the Future. Turn deltas flow through
+    a queue.Queue drained by the prompt() generator — the same shape the
+    retired hand-rolled `copilot --acp` client used (see git history on main).
 
-    ACP protocol (v1) messages we use:
-      client -> agent   initialize          handshake; negotiates capabilities
-      client -> agent   session/new         creates session, returns sessionId
-      client -> agent   session/prompt      user turn; result = stopReason
-      agent  -> client  session/update      streamed deltas (sessionUpdate variants)
-      client -> agent   session/cancel      cancel in-flight prompt
+    Read-only chat client, enforced two ways:
+      available_tools=[]          the session exposes no tools at all
+      deny-all permission handler belt-and-braces if anything slips through
 
-    We treat agent->client requests (session/request_permission, fs/*,
-    terminal/*) as unsupported and reply with JSON-RPC error -32601. That keeps
-    the proxy a read-only chat client: copilot will not run shell commands or
-    edit files.
+    Runtime binary: the SDK downloads and caches its own pinned CLI build on
+    first start (one-time network fetch); it does NOT use the `copilot` on
+    PATH. Auth is shared regardless: the runtime reads the same ~/.copilot
+    credential store, so an existing `copilot login` covers it.
 
-    Spec:        https://agentclientprotocol.com/protocol/overview
-    Copilot doc: https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server
-
-    Auth: `copilot` must already be logged in (`copilot login`).
+    SDK: https://github.com/github/copilot-sdk  (pip install github-copilot-sdk)
     """
 
     # Monthly premium-request allotments per plan tier (GitHub Copilot).
@@ -121,283 +124,210 @@ class CopilotACPBackend(Backend):
                    "business": 300, "enterprise": 1000}
     _QUOTA_TTL = 600.0   # seconds between billing-API fetches
 
-    def __init__(self, copilot_path="copilot", cwd=None, model=None,
-                 reasoning_effort=None, log_path=None, quota_config=None):
+    def __init__(self, cwd=None, model=None, reasoning_effort=None,
+                 log_path=None, quota_config=None):
         # quota_config: optional dict from agentry.ini [copilot_quota] enabling
         # premium-request quota display via the GitHub billing API.
+        try:
+            from copilot import CopilotClient
+            from copilot.rpc import PermissionDecisionReject
+            from copilot.session_events import (
+                AssistantMessageDeltaData, SessionErrorData, SessionIdleData)
+        except ImportError as e:
+            raise BackendError(
+                "github-copilot-sdk is not installed (pip install github-copilot-sdk; "
+                "requires Python 3.11+)") from e
+        # Event/decision classes are stashed on self because the SDK import is
+        # deferred (other backends must not require it).
+        self._DeltaData = AssistantMessageDeltaData
+        self._ErrorData = SessionErrorData
+        self._IdleData = SessionIdleData
+        self._Reject = PermissionDecisionReject
+
         self._quota = quota_config
         self._quota_cache = None
         self._quota_cache_t = 0.0
         self._quota_disabled = False
-        # reasoning_effort is intentionally NOT passed to the CLI: in --acp
-        # mode the flag is silently ignored and copilot uses its stored user
-        # preference instead. We apply it via session/set_config_option once
-        # we have a session.
+        self.model = model
         self.reasoning_effort = reasoning_effort
-        # --no-custom-instructions is intentionally NOT set: we have a
-        # tailored .github/copilot-instructions.md in this directory and
-        # want copilot to load it (overriding any global ~/.copilot
-        # instructions that were causing <system_reminder> SQL-table
-        # injections in previous tests).
-        cmd = [copilot_path, "--acp", "--no-ask-user", "--no-remote"]
-        if model:
-            cmd += ["--model", model]
-        _log(f"ACP spawn: {' '.join(cmd)}")
-        self.proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1, encoding="utf-8", errors="replace",
-            cwd=cwd or os.path.dirname(os.path.abspath(__file__)),
-        )
-        self.next_id = 1
-        self.id_lock = threading.Lock()
-        self.write_lock = threading.Lock()
-        self.pending = {}                 # id -> Queue (for initialize, session/new)
-        self.active_turn_queue = None     # Queue for active session/prompt; tagged ("update"|"result", payload)
-        self.active_prompt_id = None
+        self._cwd = cwd or os.path.dirname(os.path.abspath(__file__))
+        self._session = None
         self.session_id = None
         self.session_fresh = False        # True between new_session() and the first prompt()
+        self.active_turn_queue = None     # Queue for the in-flight turn; tagged ("delta"|"error"|"idle", payload)
         self.turn_lock = threading.Lock()
-        self.log_path = log_path
-        self._logf = None
-        if self.log_path:
-            self.log_path.parent.mkdir(exist_ok=True)
-            self._logf = open(self.log_path, "w", encoding="utf-8")
+        self._alive = False
 
-        threading.Thread(target=self._reader_loop, daemon=True).start()
-        threading.Thread(target=self._stderr_loop, daemon=True).start()
+        # The SDK logs through the stdlib `copilot` logger hierarchy; a file
+        # handler there is the closest equivalent of the old wire log.
+        self._log_handler = None
+        if log_path:
+            log_path.parent.mkdir(exist_ok=True)
+            self._log_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+            self._log_handler.setFormatter(
+                logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+            sdk_logger = logging.getLogger("copilot")
+            sdk_logger.setLevel(logging.DEBUG)
+            sdk_logger.addHandler(self._log_handler)
 
-        self._initialize()
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(target=self._loop.run_forever, daemon=True,
+                         name="copilot-sdk-loop").start()
 
-    def _log_wire(self, direction, msg):
-        if self._logf:
-            try:
-                self._logf.write(f"{direction} {json.dumps(msg)}\n")
-                self._logf.flush()
-            except Exception:
-                pass
+        # skip_custom_instructions is left at its default (off): we have a
+        # tailored .github/copilot-instructions.md in this directory and want
+        # the runtime to load it.
+        self._client = CopilotClient(working_directory=self._cwd)
+        t0 = time.monotonic()
+        _log("SDK client starting (first run downloads the pinned Copilot runtime)")
+        self._call(self._client.start(), timeout=600)
+        self._alive = True
+        _log(f"SDK client started in {time.monotonic() - t0:.1f}s")
 
-    def _next_id(self):
-        with self.id_lock:
-            i = self.next_id
-            self.next_id += 1
-            return i
-
-    def _write(self, msg):
-        line = json.dumps(msg) + "\n"
-        self._log_wire(">>", msg)
-        with self.write_lock:
-            self.proc.stdin.write(line)
-            self.proc.stdin.flush()
-
-    def _request(self, method, params, timeout=60):
-        msg_id = self._next_id()
-        q = queue.Queue(maxsize=1)
-        self.pending[msg_id] = q
-        self._write({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params})
+    def _call(self, coro, timeout=60):
+        """Run a coroutine on the SDK loop from sync code; block for the result."""
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
-            resp = q.get(timeout=timeout)
-        except queue.Empty:
-            raise BackendError(f"timeout waiting for {method}")
-        finally:
-            self.pending.pop(msg_id, None)
-        if "error" in resp:
-            raise BackendError(f"{method}: {resp['error']}")
-        return resp.get("result", {})
-
-    def _notify(self, method, params):
-        self._write({"jsonrpc": "2.0", "method": method, "params": params})
-
-    def _reader_loop(self):
-        try:
-            for line in iter(self.proc.stdout.readline, ""):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    _log(f"ACP non-JSON line: {line[:120]!r}")
-                    continue
-                self._log_wire("<<", msg)
-
-                if "id" in msg and ("result" in msg or "error" in msg):
-                    # Response to one of our requests
-                    if msg["id"] == self.active_prompt_id and self.active_turn_queue is not None:
-                        self.active_turn_queue.put(("result", msg))
-                    else:
-                        q = self.pending.pop(msg["id"], None)
-                        if q is not None:
-                            q.put(msg)
-                elif "id" in msg and "method" in msg:
-                    # Agent -> client request. Minimal chat client: deny everything.
-                    self._write({
-                        "jsonrpc": "2.0", "id": msg["id"],
-                        "error": {"code": -32601,
-                                  "message": f"method '{msg['method']}' not supported by client"},
-                    })
-                elif "method" in msg:
-                    if msg["method"] == "session/update" and self.active_turn_queue is not None:
-                        self.active_turn_queue.put(("update", msg.get("params", {}).get("update", {})))
+            return fut.result(timeout)
+        except TimeoutError:
+            fut.cancel()
+            raise BackendError(f"timeout after {timeout}s waiting for SDK call")
+        except BackendError:
+            raise
         except Exception as e:
-            _log(f"ACP reader exited: {e}")
+            raise BackendError(f"{e.__class__.__name__}: {e}") from e
 
-    def _stderr_loop(self):
-        try:
-            for line in iter(self.proc.stderr.readline, ""):
-                if line:
-                    _log(f"ACP stderr: {line.rstrip()[:200]}")
-        except Exception:
-            pass
+    def _deny_permission(self, request, invocation):
+        # Minimal chat client: deny everything (the session also exposes no
+        # tools, so this should never fire).
+        return self._Reject(feedback="agentry is a read-only chat relay; "
+                                     "tool use is not permitted")
 
-    def _initialize(self):
-        result = self._request("initialize", {
-            "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {"readTextFile": False, "writeTextFile": False},
-                "terminal": False,
-            },
-            "clientInfo": {"name": "agentry", "version": "0.2.0"},
-        })
-        agent_info = result.get("agentInfo") or {}
-        _log(f"ACP initialized; agent={agent_info.get('name')!r} version={agent_info.get('version')!r}")
-        # If the server advertises auth methods, follow through with `authenticate`.
-        # An empty list means "already authed, no action needed".
-        auth_methods = result.get("authMethods") or []
-        if auth_methods:
-            chosen = auth_methods[0]
-            method_id = chosen.get("id")
-            terminal_hint = ((chosen.get("_meta") or {}).get("terminal-auth") or {})
-            _log(f"ACP authenticate via {method_id!r} ({chosen.get('name')!r})")
-            try:
-                self._request("authenticate", {"methodId": method_id}, timeout=15)
-                _log(f"ACP authenticated")
-            except BackendError as e:
-                cmd = terminal_hint.get("command") or "copilot"
-                cmd_args = " ".join(terminal_hint.get("args") or ["login"])
-                raise BackendError(
-                    f"authenticate failed ({e}). "
-                    f"Run `{cmd} {cmd_args}` in a separate terminal to log in, "
-                    f"then restart the proxy."
-                )
+    def _on_event(self, event):
+        """Session event handler; runs on the SDK loop thread. Feeds the
+        in-flight turn's queue, drops events between turns (e.g. the idle
+        emitted right after session creation)."""
+        q = self.active_turn_queue
+        if q is None:
+            return
+        d = event.data
+        if isinstance(d, self._DeltaData):
+            if d.delta_content:
+                q.put(("delta", d.delta_content))
+        elif isinstance(d, self._ErrorData):
+            q.put(("error", d.message or d.error_type or "unknown"))
+        elif isinstance(d, self._IdleData):
+            q.put(("idle", None))
 
     def new_session(self, cwd=None):
-        cwd = cwd or os.path.dirname(os.path.abspath(__file__))
-        result = self._request("session/new", {"cwd": cwd, "mcpServers": []})
-        self.session_id = result["sessionId"]
-        self.session_fresh = True
-        _log(f"ACP session: {self.session_id}")
-        # Apply per-session config overrides via the standard ACP method.
-        # Schema: session/set_config_option {sessionId, configId, value}.
-        if self.reasoning_effort:
+        old, self._session = self._session, None
+        if old is not None:
             try:
-                self.set_config_option("reasoning_effort", self.reasoning_effort)
-                _log(f"ACP reasoning_effort -> {self.reasoning_effort}")
-            except Exception as e:
-                _log(f"WARN: set reasoning_effort failed: {e}")
+                self._call(old.disconnect(), timeout=15)
+            except BackendError as e:
+                _log(f"WARN: old session disconnect failed: {e}")
+        kwargs = {
+            "working_directory": cwd or self._cwd,
+            "streaming": True,
+            "available_tools": [],
+            "on_permission_request": self._deny_permission,
+        }
+        if self.model:
+            kwargs["model"] = self.model
+        if self.reasoning_effort:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        session = self._call(self._client.create_session(**kwargs), timeout=120)
+        session.on(self._on_event)
+        self._session = session
+        self.session_id = session.session_id
+        self.session_fresh = True
+        _log(f"SDK session: {self.session_id}"
+             + (f" (reasoning_effort={self.reasoning_effort})" if self.reasoning_effort else ""))
         return self.session_id
 
-    def set_config_option(self, config_id, value):
-        return self._request("session/set_config_option", {
-            "sessionId": self.session_id,
-            "configId": config_id,
-            "value": value,
-        })
-
     def update_reasoning_effort(self, value):
-        """Idempotent: applies via set_config_option only on change. Updates
-        the stored intent so future sessions also start at this value."""
+        """Idempotent: applies to the live session via model/switchTo only on
+        change. Updates the stored intent so future sessions also start at
+        this value."""
         if value == self.reasoning_effort:
             return False
         self.reasoning_effort = value
-        if self.session_id:
+        if self._session:
             try:
-                self.set_config_option("reasoning_effort", value)
-                _log(f"ACP reasoning_effort -> {value}")
+                # switchTo needs a model id; ask the runtime which one is
+                # active rather than trusting our (possibly unset) default.
+                current = self._call(self._session.rpc.model.get_current(), timeout=15)
+                model_id = current.model_id or self.model
+                if not model_id:
+                    _log("WARN: active model unknown; reasoning effort applies from next session")
+                    return False
+                self._call(self._session.set_model(model_id, reasoning_effort=value), timeout=15)
+                _log(f"SDK reasoning_effort -> {value}")
                 return True
-            except Exception as e:
+            except BackendError as e:
                 _log(f"WARN: update reasoning_effort failed: {e}")
         return False
 
     def prompt(self, text, timeout=180):
         """Generator yielding text deltas for one turn. Requires an active session."""
-        if not self.session_id:
+        if not self._session:
             raise BackendError("no active session (call new_session first)")
         with self.turn_lock:
             q = queue.Queue()
-            msg_id = self._next_id()
             self.active_turn_queue = q
-            self.active_prompt_id = msg_id
             try:
-                self._write({
-                    "jsonrpc": "2.0", "id": msg_id, "method": "session/prompt",
-                    "params": {
-                        "sessionId": self.session_id,
-                        "prompt": [{"type": "text", "text": text}],
-                    },
-                })
+                self._call(self._session.send(text), timeout=30)
                 self.session_fresh = False
                 while True:
                     try:
                         kind, payload = q.get(timeout=timeout)
                     except queue.Empty:
-                        yield f"\n[ACP timeout after {timeout}s]"
+                        yield f"\n[copilot timeout after {timeout}s]"
                         return
-                    if kind == "update":
-                        for delta in self._extract_delta(payload):
-                            yield delta
-                    elif kind == "result":
-                        if "error" in payload:
-                            yield f"\n[ACP error] {payload['error'].get('message', 'unknown')}"
-                        else:
-                            stop = (payload.get("result") or {}).get("stopReason")
-                            _log(f"turn stopReason={stop}")
+                    if kind == "delta":
+                        yield payload
+                    elif kind == "error":
+                        yield f"\n[copilot error] {payload}"
+                        return
+                    elif kind == "idle":
                         return
             finally:
                 self.active_turn_queue = None
-                self.active_prompt_id = None
-
-    @staticmethod
-    def _extract_delta(update):
-        if not isinstance(update, dict):
-            return
-        kind = update.get("sessionUpdate")
-        if kind != "agent_message_chunk":
-            return
-        content = update.get("content") or {}
-        if content.get("type") == "text":
-            t = content.get("text")
-            if t:
-                yield t
 
     def cancel(self):
-        if not self.session_id:
+        if not self._session:
             return False
         try:
-            self._notify("session/cancel", {"sessionId": self.session_id})
+            # Fire-and-forget: abort the in-flight turn, don't block the
+            # HTTP handler on the round-trip.
+            asyncio.run_coroutine_threadsafe(self._session.abort(), self._loop)
             return True
         except Exception:
             return False
 
     def is_alive(self):
-        return self.proc.poll() is None
+        return self._alive and self._loop.is_running()
 
     def close(self):
+        self._alive = False
+        if self._session is not None:
+            try:
+                self._call(self._session.disconnect(), timeout=10)
+            except Exception:
+                pass
+            self._session = None
         try:
-            if self.proc.stdin and not self.proc.stdin.closed:
-                self.proc.stdin.close()
+            self._call(self._client.stop(), timeout=15)
         except Exception:
             pass
         try:
-            self.proc.terminate()
-            self.proc.wait(timeout=5)
+            self._loop.call_soon_threadsafe(self._loop.stop)
         except Exception:
+            pass
+        if self._log_handler:
             try:
-                self.proc.kill()
-            except Exception:
-                pass
-        if self._logf:
-            try:
-                self._logf.close()
+                logging.getLogger("copilot").removeHandler(self._log_handler)
+                self._log_handler.close()
             except Exception:
                 pass
 
@@ -504,9 +434,9 @@ class CodexAppServerBackend(Backend):
       server -> client  turn/completed           terminal signal (params.turn.status)
       client -> server  turn/interrupt           cancel in-flight turn
 
-    Unlike Copilot's ACP, model and reasoning effort are TURN-level params
-    (turn/start), not session config — so update_reasoning_effort() just stores
-    the value and the next turn carries it. Auth is the ChatGPT account login
+    Unlike the Copilot backend, model and reasoning effort are TURN-level
+    params (turn/start), not session config — so update_reasoning_effort()
+    just stores the value and the next turn carries it. Auth is the ChatGPT account login
     (`codex login`); no OPENAI_API_KEY needed.
 
     Reference: https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md
@@ -863,7 +793,7 @@ class CodexAppServerBackend(Backend):
 class ClaudeCodeBackend(Backend):
     """Cold-start client for Anthropic's Claude Code CLI (`claude -p`).
 
-    Unlike the Copilot (`--acp`) and Codex (`app-server`) backends, claude-code
+    Unlike the Copilot (SDK) and Codex (`app-server`) backends, claude-code
     exposes NO persistent JSON-RPC server over stdio. Its `-p` (print) mode runs
     one request and exits. So this backend spawns a FRESH `claude -p` process for
     every turn — there is no long-lived subprocess to reuse.
@@ -1180,10 +1110,10 @@ def make_backend(kind, *, model=None, reasoning_effort=None, log_dir: Optional[P
     log_dir = log_dir or (Path(__file__).parent / "logs")
     if kind == "copilot":
         import config
-        return CopilotACPBackend(
+        return CopilotSDKBackend(
             model=model,
             reasoning_effort=reasoning_effort,
-            log_path=log_dir / "acp_wire.log",
+            log_path=log_dir / "copilot_sdk.log",
             quota_config=config.copilot_quota(),
         )
     if kind == "codex":
