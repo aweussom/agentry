@@ -92,13 +92,25 @@ would prefer them already has paid tooling.
 
 ## Polish (lower priority)
 
+- [ ] Chat persistence in the web UI (from the OpenWebUI comparison,
+      2026-07-24): F5 currently destroys the conversation. localStorage
+      only — persist `chatHistory` client-side, restore on load. No
+      server-side chat store; state ownership stays with the client.
+- [ ] Stop + regenerate buttons in the web UI. Esc-to-cancel exists but
+      is undiscoverable; add a visible stop during generation and a
+      regenerate on the last assistant message (resend same user text).
 - [ ] Surface usage stats (premiumRequests, api_ms, tokens) in the UI's
-      per-turn meta line, not just in the launcher console.
-- [ ] Add a model dropdown to the web UI. Currently only reasoning
-      effort is per-request; model is fixed at launch via `--model`.
-- [ ] Probe whether `xhigh` / `max` reasoning levels work via ACP
-      `set_config_option`. CLI accepts them but they're not in the
-      session's published options; might still round-trip.
+      per-turn meta line, not just in the launcher console. Got cheaper
+      with the SDK: it emits per-turn `AssistantUsageData` events that
+      the copilot backend currently discards in `_on_event`.
+- [ ] Add a model dropdown to the web UI. Was launch-fixed in the ACP
+      era; the SDK made it easy — `client.list_models()` supplies the
+      dropdown, `session.set_model()` switches mid-session with history
+      preserved (already used for reasoning-effort changes).
+- [ ] Probe whether `xhigh` / `max` reasoning levels work on the SDK
+      backend. `create_session`/`set_model` type them as
+      low/medium/high/xhigh; `max` is likely rejected, `xhigh` untested
+      on the free-tier models.
 - [ ] Consider selective tool permissions instead of blanket `-32601`
       deny. Currently every agent->client request is rejected, so any
       prompt that genuinely needs a tool fails rather than degrading.
