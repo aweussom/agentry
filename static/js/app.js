@@ -177,13 +177,22 @@ function renderMarkdown(text, isStreaming) {
     }
 
     let html = escapeHtml(mainText);
+    // Pull code fences out before the inline transforms so *, ** and `
+    // inside code survive verbatim (matters doubly now that artifacts
+    // re-read the fence source via textContent).
+    const fences = [];
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        return `<pre><code>${code.trim()}</code><button class="copy-btn" onclick="copyCode(this)">copy</button></pre>`;
+        const l = lang.toLowerCase();
+        const artifact = ARTIFACT_LANGS.has(l)
+            ? `<button class="artifact-btn" data-lang="${l}" onclick="openArtifact(this)">open &#9656;</button>` : '';
+        fences.push(`<pre><code>${code.trim()}</code><button class="copy-btn" onclick="copyCode(this)">copy</button>${artifact}</pre>`);
+        return `\x00F${fences.length - 1}\x00`;
     });
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
     html = html.replace(/\n/g, '<br>');
+    html = html.replace(/\x00F(\d+)\x00/g, (_, i) => fences[i]);
 
     return thinkHtml + html;
 }
@@ -201,6 +210,83 @@ function copyCode(btn) {
     setTimeout(() => btn.textContent = 'copy', 1500);
 }
 window.copyCode = copyCode;
+
+// --- Artifacts: render a fenced block as a live document ---
+
+const ARTIFACT_LANGS = new Set(['html', 'svg', 'markdown', 'md']);
+const artifactPanel = document.getElementById('artifact-panel');
+const artifactTitle = document.getElementById('artifact-title');
+const artifactBody = document.getElementById('artifact-body');
+const artifactClose = document.getElementById('artifact-close');
+
+function openArtifact(btn) {
+    // textContent un-escapes the entities renderMarkdown put in the <code>
+    const source = btn.parentElement.querySelector('code').textContent;
+    const lang = btn.dataset.lang;
+    artifactBody.innerHTML = '';
+    if (lang === 'html' || lang === 'svg') {
+        const iframe = document.createElement('iframe');
+        // scripts may run; the artifact stays cross-origin to the app
+        // (no allow-same-origin), so it can't touch the chat page.
+        iframe.setAttribute('sandbox', 'allow-scripts');
+        iframe.srcdoc = source;
+        artifactBody.appendChild(iframe);
+    } else {
+        const doc = document.createElement('div');
+        doc.className = 'artifact-doc';
+        doc.innerHTML = mdToHtml(source);
+        artifactBody.appendChild(doc);
+    }
+    artifactTitle.textContent = `Artifact (${lang})`;
+    artifactPanel.classList.add('active');
+}
+window.openArtifact = openArtifact;
+
+function closeArtifact() {
+    artifactPanel.classList.remove('active');
+    artifactBody.innerHTML = '';
+}
+
+// Small markdown-document renderer for markdown artifacts. Deliberately
+// modest: headers, lists, quotes, hr, tables, links, code — not CommonMark.
+function mdToHtml(text) {
+    let h = escapeHtml(text);
+    const fences = [];
+    h = h.replace(/```(\w*)\n([\s\S]*?)```/g, (_, l, c) => {
+        fences.push(`<pre><code>${c.trim()}</code></pre>`);
+        return `\x00F${fences.length - 1}\x00`;
+    });
+    h = h.replace(/^(#{1,6}) (.+)$/gm,
+        (_, hashes, t) => `<h${hashes.length}>${t}</h${hashes.length}>`);
+    h = h.replace(/^&gt; ?(.*)$/gm, '<blockquote>$1</blockquote>');
+    h = h.replace(/<\/blockquote>\n<blockquote>/g, '<br>');
+    h = h.replace(/^ {0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/gm, '<hr>');
+    // tables: header | separator | rows
+    h = h.replace(/^\|(.+)\|\n\|[\s\-:|]+\|\n((?:\|.*\|\n?)*)/gm, (_, head, rows) => {
+        const th = head.split('|').map(c => `<th>${c.trim()}</th>`).join('');
+        const trs = rows.trim().split('\n').filter(Boolean).map(r =>
+            `<tr>${r.replace(/^\||\|$/g, '').split('|').map(c => `<td>${c.trim()}</td>`).join('')}</tr>`
+        ).join('');
+        return `<table><tr>${th}</tr>${trs}</table>`;
+    });
+    h = h.replace(/^[-*+] (.+)$/gm, '<li data-l="ul">$1</li>');
+    h = h.replace(/^\d+[.)] (.+)$/gm, '<li data-l="ol">$1</li>');
+    h = h.replace(/(?:<li data-l="(ul|ol)">[\s\S]*?<\/li>\n?)+/g,
+        (m) => `<${m.includes('data-l="ol"') ? 'ol' : 'ul'}>${m.replace(/ data-l="(?:ul|ol)"/g, '')}</${m.includes('data-l="ol"') ? 'ol' : 'ul'}>`);
+    h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
+    h = h.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    h = h.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+    h = h.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    h = h.replace(/\x00F(\d+)\x00/g, (_, i) => fences[i]);
+    // paragraphs: blank-line-separated runs that aren't already block elements
+    return h.split(/\n{2,}/).map(b => {
+        b = b.trim();
+        if (!b) return '';
+        return /^<(h\d|ul|ol|pre|blockquote|hr|table)/.test(b)
+            ? b : `<p>${b.replace(/\n/g, '<br>')}</p>`;
+    }).join('\n');
+}
 
 // --- Send / receive ---
 
@@ -395,14 +481,20 @@ window.addEventListener('drop', (e) => {
     setImage(e.dataTransfer?.files?.[0]);
 });
 
+artifactClose.addEventListener('click', closeArtifact);
+
 document.addEventListener('keydown', (e) => {
     if (e.ctrlKey && e.key === 'n') {
         e.preventDefault();
         newChat();
     }
-    if (e.key === 'Escape' && isGenerating && abortController) {
-        abortController.abort();
-        fetch('/v1/cancel', { method: 'POST' }).catch(() => {});
+    if (e.key === 'Escape') {
+        if (isGenerating && abortController) {
+            abortController.abort();
+            fetch('/v1/cancel', { method: 'POST' }).catch(() => {});
+        } else if (artifactPanel.classList.contains('active')) {
+            closeArtifact();
+        }
     }
 });
 

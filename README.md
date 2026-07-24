@@ -293,6 +293,12 @@ OpenAI clients ignore it) and the UI folds them into a collapsible
 "Thinking..." block above the answer. Codex reasoning
 (`item/reasoning/textDelta`) is not forwarded yet.
 
+**Artifacts**: fenced ` ```html `, ` ```svg `, and ` ```markdown ` blocks in
+a reply get an "open ▸" button that renders them in a side panel — HTML/SVG
+in a sandboxed iframe (scripts run, but no same-origin access to the chat
+page), markdown through a small built-in document renderer (headers, lists,
+tables, quotes, links, code). Esc closes the panel.
+
 ## Per-project instructions
 
 `.github/copilot-instructions.md` is loaded by Copilot for each session

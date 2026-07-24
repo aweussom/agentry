@@ -361,3 +361,81 @@ body {
     border: 1px solid var(--border);
     margin-top: 6px;
 }
+
+/* --- Artifact panel --- */
+.artifact-btn {
+    position: absolute;
+    top: 4px; right: 52px;
+    background: var(--accent);
+    border: none;
+    color: #fff;
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-size: 11px;
+    cursor: pointer;
+}
+.artifact-btn:hover { opacity: 0.85; }
+
+.artifact-panel {
+    display: none;
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: min(48%, 720px);
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.35);
+    z-index: 90;
+    flex-direction: column;
+}
+.artifact-panel.active { display: flex; }
+.artifact-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+    font-weight: 600;
+}
+.artifact-body {
+    flex: 1;
+    overflow: auto;
+    background: #fff;
+}
+.artifact-body iframe {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: #fff;
+    display: block;
+}
+.artifact-doc {
+    padding: 20px 26px;
+    color: #1a1a2a;
+    font-size: 15px;
+    line-height: 1.55;
+}
+.artifact-doc h1, .artifact-doc h2, .artifact-doc h3,
+.artifact-doc h4, .artifact-doc h5, .artifact-doc h6 { margin: 0.8em 0 0.4em; }
+.artifact-doc p { margin: 0.5em 0; }
+.artifact-doc ul, .artifact-doc ol { margin: 0.5em 0; padding-left: 1.6em; }
+.artifact-doc blockquote {
+    border-left: 3px solid #b8c0d0;
+    margin: 0.6em 0;
+    padding: 2px 12px;
+    color: #4a5468;
+}
+.artifact-doc pre {
+    background: #f0f2f6;
+    border-radius: 4px;
+    padding: 8px 10px;
+    overflow-x: auto;
+}
+.artifact-doc code {
+    font-family: "Cascadia Code", "Fira Code", monospace;
+    font-size: 13px;
+}
+.artifact-doc a { color: #0b6bcb; }
+.artifact-doc hr { border: 0; border-top: 1px solid #d8dde6; margin: 1em 0; }
+.artifact-doc table { border-collapse: collapse; margin: 0.6em 0; }
+.artifact-doc th, .artifact-doc td { border: 1px solid #c8cfda; padding: 4px 10px; }
