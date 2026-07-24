@@ -54,6 +54,8 @@ def _get_backend():
     global _backend
     with _backend_lock:
         if _backend is None or not _backend.is_alive():
+            if _backend is not None:
+                _backend.close()   # reap the dead process, release its wire log
             _backend = make_backend(
                 BACKEND_KIND,
                 model=BACKEND_MODEL,
@@ -73,22 +75,51 @@ def _shutdown_backend():
 # --- HTTP helpers -------------------------------------------------------
 
 def _is_new_chat(messages):
-    user_msgs = sum(1 for m in messages if m.get("role") == "user")
-    assistant_msgs = sum(1 for m in messages if m.get("role") == "assistant")
+    user_msgs = sum(1 for m in messages
+                    if isinstance(m, dict) and m.get("role") == "user")
+    assistant_msgs = sum(1 for m in messages
+                         if isinstance(m, dict) and m.get("role") == "assistant")
     return user_msgs == 1 and assistant_msgs == 0
 
 
-def _latest_user_text(messages):
+def _parse_data_uri(url):
+    """data:image/png;base64,... -> (mime_type, base64_data), else None."""
+    if not url.startswith("data:"):
+        return None
+    header, sep, data = url.partition(",")
+    if not sep or not header.endswith(";base64") or not data:
+        return None
+    mime = header[len("data:"):-len(";base64")]
+    return (mime or "application/octet-stream"), data
+
+
+def _latest_user_content(messages):
+    """(text, images) from the most recent user message. images is a list of
+    (mime_type, base64_data) parsed from OpenAI image_url parts. Only data:
+    URIs are accepted; remote http(s) URLs are skipped (the proxy makes no
+    outbound fetches on behalf of clients)."""
     for m in reversed(messages):
-        if m.get("role") != "user":
+        if not isinstance(m, dict) or m.get("role") != "user":
             continue
         content = m.get("content")
         if isinstance(content, str):
-            return content
+            return content, []
         if isinstance(content, list):
-            parts = [p.get("text", "") for p in content if p.get("type") == "text"]
-            return "\n".join(parts)
-    return ""
+            texts, images = [], []
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "text":
+                    texts.append(p.get("text", ""))
+                elif p.get("type") == "image_url":
+                    url = (p.get("image_url") or {}).get("url", "")
+                    img = _parse_data_uri(url)
+                    if img:
+                        images.append(img)
+                    else:
+                        _log(f"WARN: skipping image_url (not a base64 data: URI): {url[:60]!r}")
+            return "\n".join(t for t in texts if t), images
+    return "", []
 
 
 def _sse(delta, model, done=False):
@@ -157,8 +188,8 @@ def chat_completions():
     stream = bool(body.get("stream"))
     req_reasoning = body.get("reasoning_effort")  # optional per-request override
 
-    prompt_text = _latest_user_text(messages)
-    if not prompt_text:
+    prompt_text, images = _latest_user_content(messages)
+    if not prompt_text and not images:
         _REQ_T0.pop(tid, None)
         return jsonify({"error": {"message": "no user message content"}}), 400
 
@@ -191,7 +222,8 @@ def chat_completions():
     elif req_reasoning:
         _log(f"WARN: ignoring unsupported reasoning_effort={req_reasoning!r}")
 
-    _log(f"prompt: session={backend.session_id} text={prompt_text[:60]!r}")
+    img_note = f" images={len(images)}" if images else ""
+    _log(f"prompt: session={backend.session_id}{img_note} text={prompt_text[:60]!r}")
 
     headers = {"X-Device": BACKEND_KIND, "X-Model": _model_label()}
     model = _model_label()
@@ -199,7 +231,7 @@ def chat_completions():
     if stream:
         def generate():
             try:
-                for delta in backend.prompt(prompt_text):
+                for delta in backend.prompt(prompt_text, images=images):
                     yield _sse(delta, model)
                 yield _sse("", model, done=True)
             finally:
@@ -207,7 +239,7 @@ def chat_completions():
         return Response(generate(), mimetype="text/event-stream", headers=headers)
 
     try:
-        full = "".join(backend.prompt(prompt_text))
+        full = "".join(backend.prompt(prompt_text, images=images))
     finally:
         _REQ_T0.pop(tid, None)
     return jsonify({

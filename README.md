@@ -236,14 +236,14 @@ claude streams each turn (status + reset window, no %), e.g.
 ## Architecture
 
 `agentry.py` is the Flask layer (routes, OpenAI shape, session reuse).
-`backends.py` holds a `Backend` ABC and the implementations. The copilot
-backend delegates transport to the official `github-copilot-sdk` (which runs
-the Copilot CLI runtime in server mode and speaks JSON-RPC to it); codex owns
-a persistent subprocess driven by a small hand-rolled JSON-RPC 2.0 client;
-claude cold-starts one `claude -p` process per turn. The Flask layer talks
-only to the `Backend` interface (`new_session` / `prompt` / `cancel` /
-`update_reasoning_effort` / `is_alive` / `close`), so swapping backends is a
-`--backend` flag.
+`backends.py` holds a `Backend` ABC and the three implementations. The
+copilot backend delegates transport to the official `github-copilot-sdk`
+(which runs the Copilot CLI runtime in server mode and speaks JSON-RPC to
+it); codex owns a persistent subprocess driven by a small hand-rolled
+JSON-RPC 2.0 client; claude cold-starts one `claude -p` process per turn.
+The Flask layer talks only to the `Backend` interface (`new_session` /
+`prompt` / `cancel` / `update_reasoning_effort` / `is_alive` / `close`), so
+swapping backends is a `--backend` flag.
 
 The turn lifecycles map almost one-to-one:
 
@@ -255,7 +255,7 @@ The turn lifecycles map almost one-to-one:
 | Reasoning override | session param / `set_model()` | `effort` on `turn/start` |
 | Streamed deltas | `AssistantMessageDelta` events | `item/agentMessage/delta` |
 | Turn complete | `SessionIdle` event | `turn/completed` notification |
-| Cancel | `session.abort()` | `turn/interrupt` |
+| Cancel | `session.abort()` | `turn/interrupt` (`threadId`+`turnId`) |
 
 In both, the agent's tool surface is switched off to keep the proxy a pure
 chat client (no agent capabilities — by design): the copilot session is
@@ -266,17 +266,28 @@ with JSON-RPC `-32601` and additionally runs each thread with
 inversion is enforced: the tool-consuming half is off, leaving only the
 language model to be served.
 
+Turn lifecycle is hardened against the ugly paths: a codex `turn/start` that
+errors (bad model, dead thread) is surfaced to the client immediately instead
+of stalling until the stream timeout; a turn abandoned by timeout is cancelled
+server-side (`session.abort()` / `turn/interrupt`) so it stops burning quota;
+and stray updates from an abandoned turn are dropped (copilot: the event
+queue is turn-scoped; codex: updates tagged with a stale turn id are
+filtered), so a zombie turn can never bleed text into the next request's
+response.
+
 OpenAI-compatible endpoints exposed:
 
 - `GET /health` — readiness probe.
 - `GET /v1/models` — single model entry reflecting current `-Model`.
 - `POST /v1/chat/completions` — SSE streaming, standard OpenAI delta format.
-- `POST /v1/cancel` — sends `session/cancel` to the active turn.
+- `POST /v1/cancel` — cancels the in-flight turn (copilot: `session.abort()`;
+  codex: `turn/interrupt` with the active turn's id; claude: kills the
+  `claude -p` process).
 
 The web UI at `/` is a single-page chat copied and pared down from the
 NoLlama project. Markdown rendering, code-block copy, think-block support
-(inert on `copilot`, which does not surface reasoning traces; `codex` does
-emit `item/reasoning/textDelta` events, not yet wired into the UI).
+(reasoning streams exist on both backends — copilot's summaries feed the
+console ticker — but neither is wired into the web UI yet).
 
 ## Per-project instructions
 
@@ -355,9 +366,9 @@ API. The two solve overlapping problems with different framings:
   a single developer uses these agents as an automation backend for their
   own scripts.
 
-The two-backend design also means agentry isn't tied to one vendor: the same
-OpenAI-shaped endpoint fronts either Copilot (free tier) or Codex (cheap paid
-tier), swapped with a flag. If you want a polished, broadly-applicable
+The multi-backend design also means agentry isn't tied to one vendor: the same
+OpenAI-shaped endpoint fronts Copilot (free tier), Codex (cheap paid tier), or
+Claude Code (premium), swapped with a flag. If you want a polished, broadly-applicable
 Copilot-as-an-API, copilot-api is the more capable project. If you
 specifically want a thin local persistent wrapper around the official agent
 CLIs with no reverse-engineering and a narrower scope, that is agentry.

@@ -28,6 +28,7 @@ See archive/CODEX-PLAN.md and archive/CLAUDE-PLAN.md.
 
 import abc
 import asyncio
+import base64
 import datetime
 import json
 import logging
@@ -68,8 +69,12 @@ class Backend(abc.ABC):
         """Start a fresh conversation; returns its id."""
 
     @abc.abstractmethod
-    def prompt(self, text: str, timeout: int = 180) -> Iterator[str]:
-        """Generator yielding assistant text deltas for one turn."""
+    def prompt(self, text: str, images=None, timeout: int = 180) -> Iterator[str]:
+        """Generator yielding assistant text deltas for one turn.
+
+        images: optional list of (mime_type, base64_data) tuples to attach to
+        the user turn. Backends that can't forward them must drop them loudly
+        (log + a visible note in the reply), never silently."""
 
     @abc.abstractmethod
     def cancel(self) -> bool:
@@ -339,10 +344,34 @@ class CopilotSDKBackend(Backend):
                 _log(f"WARN: update reasoning_effort failed: {e}")
         return False
 
-    def prompt(self, text, timeout=180):
-        """Generator yielding text deltas for one turn. Requires an active session."""
+    _IMAGE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+                  "image/gif": ".gif", "application/pdf": ".pdf"}
+
+    def prompt(self, text, images=None, timeout=900):
+        """Generator yielding text deltas for one turn. Requires an active session.
+
+        Images ride as SDK *file* attachments via temp files: that is the
+        runtime's native vision path. Blob attachments are accepted by the
+        API but land as opaque file context — the model never actually sees
+        the pixels (verified: a red/blue test image drew hallucinated colors
+        as a blob, correct ones as a file). Undecodable images are dropped
+        loudly, per the Backend contract."""
         if not self._session:
             raise BackendError("no active session (call new_session first)")
+        attachments, tmp_paths = [], []
+        for i, (mime, data) in enumerate(images or []):
+            try:
+                raw = base64.b64decode(data, validate=True)
+            except Exception as e:
+                _log(f"WARN: dropping undecodable image {i} ({mime}): {e}")
+                continue
+            ext = self._IMAGE_EXT.get(mime, ".bin")
+            with tempfile.NamedTemporaryFile(prefix="agentry_img_", suffix=ext,
+                                             delete=False) as f:
+                f.write(raw)
+                tmp_paths.append(f.name)
+            attachments.append({"type": "file", "path": tmp_paths[-1],
+                                "displayName": f"image-{i}{ext}"})
         with self.turn_lock:
             q = queue.Queue()
             self._ticker_buf = ""
@@ -350,12 +379,14 @@ class CopilotSDKBackend(Backend):
             self._turn_t0 = time.monotonic()
             self.active_turn_queue = q
             try:
-                self._call(self._session.send(text), timeout=30)
+                self._call(self._session.send(text, attachments=attachments or None),
+                           timeout=30)
                 self.session_fresh = False
                 while True:
                     try:
                         kind, payload = q.get(timeout=timeout)
                     except queue.Empty:
+                        self.cancel()   # stop the server-side turn we're abandoning
                         yield f"\n[copilot timeout after {timeout}s]"
                         return
                     if kind == "delta":
@@ -369,6 +400,11 @@ class CopilotSDKBackend(Backend):
                         return
             finally:
                 self.active_turn_queue = None
+                for p in tmp_paths:       # turn is over; the runtime has read them
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
 
     def cancel(self):
         if not self._session:
@@ -568,6 +604,7 @@ class CodexAppServerBackend(Backend):
         self.write_lock = threading.Lock()
         self.pending = {}              # id -> Queue (for initialize, thread/start, turn/start ack)
         self.active_turn_queue = None  # Queue for the active turn's notifications: (method, params)
+        self._active_turn_id = None    # turn id from the turn/start ack, for turn/interrupt
         self._rate_limits = None       # latest RateLimitSnapshot from notifications
         self._rl_lock = threading.Lock()
         self.session_id = None         # codex thread id
@@ -722,10 +759,19 @@ class CodexAppServerBackend(Backend):
         _log(f"codex effort -> {value} (applies next turn)")
         return True
 
-    def prompt(self, text, timeout=180):
-        """Generator yielding text deltas for one turn. Requires an active thread."""
+    def prompt(self, text, images=None, timeout=900):
+        """Generator yielding text deltas for one turn. Requires an active thread.
+
+        Images ride as ImageUserInput items ({type:"image", url}) with a data:
+        URI — the UserInput schema (generate-json-schema) also offers
+        localImage{path} as a fallback if data: URLs turn out unsupported."""
         if not self.session_id:
             raise BackendError("no active session (call new_session first)")
+        input_items = []
+        if text:
+            input_items.append({"type": "text", "text": text})
+        for mime, data in (images or []):
+            input_items.append({"type": "image", "url": f"data:{mime};base64,{data}"})
         with self.turn_lock:
             q = queue.Queue()
             self.active_turn_queue = q
@@ -736,7 +782,7 @@ class CodexAppServerBackend(Backend):
                 ack = queue.Queue(maxsize=1)
                 self.pending[msg_id] = ack
                 tparams = {"threadId": self.session_id,
-                           "input": [{"type": "text", "text": text}]}
+                           "input": input_items}
                 if self.model:
                     tparams["model"] = self.model
                 if self.reasoning_effort:
@@ -744,20 +790,44 @@ class CodexAppServerBackend(Backend):
                 self._write({"jsonrpc": "2.0", "id": msg_id,
                              "method": "turn/start", "params": tparams})
                 self.session_fresh = False
+                # The ack normally arrives at once (notifications buffer in q
+                # meanwhile). An error response (bad model, dead thread) means
+                # no turn ever starts — surface it now instead of stalling
+                # until the notification timeout. On success it carries the
+                # turn id, needed for turn/interrupt and stale-turn filtering.
+                try:
+                    resp = ack.get(timeout=30)
+                except queue.Empty:
+                    yield "\n[codex error] no response to turn/start after 30s"
+                    return
+                if "error" in resp:
+                    err = resp["error"]
+                    msg = err.get("message", err) if isinstance(err, dict) else err
+                    yield f"\n[codex error] {msg}"
+                    return
+                turn_id = ((resp.get("result") or {}).get("turn") or {}).get("id")
+                self._active_turn_id = turn_id
                 while True:
                     try:
                         method, params = q.get(timeout=timeout)
                     except queue.Empty:
+                        self._interrupt(turn_id)   # stop the turn we're abandoning
                         yield f"\n[codex timeout after {timeout}s]"
                         return
                     if not isinstance(params, dict):
                         continue
                     if method == "item/agentMessage/delta":
+                        # A turn abandoned by timeout can keep streaming; drop
+                        # anything tagged with a different turn id.
+                        if turn_id and params.get("turnId") not in (None, turn_id):
+                            continue
                         t = params.get("delta")
                         if t:
                             yield t
                     elif method == "turn/completed":
                         turn = params.get("turn") or {}
+                        if turn_id and turn.get("id") not in (None, turn_id):
+                            continue
                         status = turn.get("status")
                         if status == "failed":
                             err = (turn.get("error") or {}).get("message", "unknown")
@@ -767,16 +837,26 @@ class CodexAppServerBackend(Backend):
                         return
             finally:
                 self.active_turn_queue = None
+                self._active_turn_id = None
                 self.pending.pop(msg_id, None)
 
-    def cancel(self):
-        if not self.session_id:
+    def _interrupt(self, turn_id):
+        """Fire-and-forget turn/interrupt. Per the v2 schema it is a REQUEST
+        requiring both threadId and turnId (a bare-threadId notification is
+        silently ignored); we send a real id and drop the response unread."""
+        if not (self.session_id and turn_id):
             return False
         try:
-            self._notify("turn/interrupt", {"threadId": self.session_id})
+            self._write({"jsonrpc": "2.0", "id": self._next_id(),
+                         "method": "turn/interrupt",
+                         "params": {"threadId": self.session_id,
+                                    "turnId": turn_id}})
             return True
         except Exception:
             return False
+
+    def cancel(self):
+        return self._interrupt(self._active_turn_id)
 
     @staticmethod
     def _window_label(mins):
@@ -973,12 +1053,19 @@ class ClaudeCodeBackend(Backend):
         except Exception:
             pass
 
-    def prompt(self, text, timeout=180):
+    def prompt(self, text, images=None, timeout=900):
         """Generator yielding text deltas for one turn. Spawns a fresh `claude -p`
         process, feeds the prompt on stdin (robust for large enrichment prompts —
-        no cmdline-length limit), and streams stream-json output back."""
+        no cmdline-length limit), and streams stream-json output back.
+
+        Images are NOT supported yet (deferred): the text stdin path can't carry
+        them; supporting them means switching to --input-format stream-json and
+        sending API-style image content blocks. Dropped loudly, per Backend."""
         if not self.session_id:
             raise BackendError("no active session (call new_session first)")
+        if images:
+            _log(f"WARN: claude backend dropping {len(images)} image(s) (not supported yet)")
+            yield f"[agentry: {len(images)} image(s) dropped — claude backend is text-only for now]\n"
         with self.turn_lock:
             cmd = [self.claude_path, "-p",
                    "--output-format", "stream-json",
