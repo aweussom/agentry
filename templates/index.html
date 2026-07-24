@@ -28,13 +28,21 @@
 
 <div class="input-area">
     <div class="input-wrap">
+        <div class="image-preview" id="image-preview">
+            <img id="image-preview-img" alt="attached image">
+            <button class="remove" id="image-remove" title="Remove image">&times;</button>
+        </div>
         <div class="input-row">
-            <textarea id="message-input" rows="1" placeholder="Type a message... (Copilot CLI backend)"></textarea>
+            <textarea id="message-input" rows="1" placeholder="Type a message... (paste or drop an image to attach)"></textarea>
+            <button class="btn icon" id="attach-btn" title="Attach image">&#128206;</button>
             <button class="btn" id="send-btn">Send</button>
             <button class="btn icon" id="new-chat-btn" title="New chat">&#10227;</button>
         </div>
     </div>
 </div>
+
+<div class="drop-overlay" id="drop-overlay"><span>Drop image to attach</span></div>
+<input type="file" id="file-input" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
 
 <script src="/static/js/app.js"></script>
 </body>

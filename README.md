@@ -285,9 +285,13 @@ OpenAI-compatible endpoints exposed:
   `claude -p` process).
 
 The web UI at `/` is a single-page chat copied and pared down from the
-NoLlama project. Markdown rendering, code-block copy, think-block support
-(reasoning streams exist on both backends — copilot's summaries feed the
-console ticker — but neither is wired into the web UI yet).
+NoLlama project. Markdown rendering, code-block copy, image attach
+(button / paste / drag-drop — sent as `image_url` data: URIs), and live
+think-blocks: the server forwards copilot's streamed reasoning summaries as
+`delta.reasoning_content` (the DeepSeek-popularized SSE extension; standard
+OpenAI clients ignore it) and the UI folds them into a collapsible
+"Thinking..." block above the answer. Codex reasoning
+(`item/reasoning/textDelta`) is not forwarded yet.
 
 ## Per-project instructions
 
@@ -322,11 +326,11 @@ custom-instructions file in `~/.copilot/` that would otherwise leak hints
 - **Tool requests are always denied.** If a prompt genuinely needs a tool
   (file read, shell command), the agent will either degrade gracefully or
   error out rather than working around it. By design.
-- **Reasoning trace depends on backend.** The Copilot SDK can stream
-  reasoning deltas (`AssistantReasoningDelta`) for models that surface them,
-  and codex streams reasoning too (`item/reasoning/textDelta`) — but agentry
-  does not yet forward either to the UI; only a typing indicator appears
-  during server-side reasoning.
+- **Reasoning trace depends on backend.** Copilot's streamed reasoning
+  summaries reach both the console ticker and the web UI's think-block
+  (as `delta.reasoning_content` in the SSE stream). Codex also streams
+  reasoning (`item/reasoning/textDelta`) but it is not forwarded yet;
+  there you only get a typing indicator during server-side reasoning.
 - **Auth is session-bound.** The Windows credential store entry that
   `copilot login` writes is reachable only to processes in the same
   interactive logon session. Running the launcher from a different shell

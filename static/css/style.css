@@ -351,3 +351,13 @@ body {
     color: var(--accent);
 }
 .drop-overlay.active { display: flex; }
+
+/* Image attached to a sent user message */
+.message.user img.attached {
+    display: block;
+    max-height: 120px;
+    max-width: 100%;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    margin-top: 6px;
+}

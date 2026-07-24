@@ -74,7 +74,11 @@ class Backend(abc.ABC):
 
         images: optional list of (mime_type, base64_data) tuples to attach to
         the user turn. Backends that can't forward them must drop them loudly
-        (log + a visible note in the reply), never silently."""
+        (log + a visible note in the reply), never silently.
+
+        Backends that stream reasoning may additionally yield tagged tuples
+        ("reasoning", str) interleaved with the plain-str answer deltas;
+        consumers that only want the answer must filter for str items."""
 
     @abc.abstractmethod
     def cancel(self) -> bool:
@@ -232,13 +236,15 @@ class CopilotSDKBackend(Backend):
                 self._ticker_feed("message", d.delta_content)
                 q.put(("delta", d.delta_content))
         elif isinstance(d, self._ReasoningDeltaData):
-            # Reasoning is not forwarded to the HTTP client, but it feeds the
-            # console ticker and proves the model is working: without the
-            # keepalive, a long silent reasoning stretch (high effort) would
-            # trip prompt()'s inactivity timeout mid-think.
+            # Reasoning feeds the console ticker, streams to the web UI as
+            # tagged deltas, and proves the model is working: without an item
+            # on the queue, a long silent reasoning stretch (high effort)
+            # would trip prompt()'s inactivity timeout mid-think.
             if d.delta_content:
                 self._ticker_feed("reasoning", d.delta_content)
-            q.put(("keepalive", None))
+                q.put(("reasoning", d.delta_content))
+            else:
+                q.put(("keepalive", None))
         elif isinstance(d, self._ErrorData):
             q.put(("error", d.message or d.error_type or "unknown"))
         elif isinstance(d, self._IdleData):
@@ -391,8 +397,10 @@ class CopilotSDKBackend(Backend):
                         return
                     if kind == "delta":
                         yield payload
+                    elif kind == "reasoning":
+                        yield ("reasoning", payload)
                     elif kind == "keepalive":
-                        continue    # reasoning tick; resets the q.get() window
+                        continue    # activity tick; resets the q.get() window
                     elif kind == "error":
                         yield f"\n[copilot error] {payload}"
                         return

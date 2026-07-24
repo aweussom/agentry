@@ -122,7 +122,15 @@ def _latest_user_content(messages):
     return "", []
 
 
-def _sse(delta, model, done=False):
+def _sse(delta, model, done=False, reasoning=False):
+    # reasoning deltas ride in "reasoning_content" (the de-facto extension
+    # DeepSeek popularized); standard OpenAI clients ignore the unknown key.
+    if done:
+        d = {}
+    elif reasoning:
+        d = {"reasoning_content": delta}
+    else:
+        d = {"content": delta}
     chunk = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion.chunk",
@@ -130,7 +138,7 @@ def _sse(delta, model, done=False):
         "model": model,
         "choices": [{
             "index": 0,
-            "delta": {} if done else {"content": delta},
+            "delta": d,
             "finish_reason": "stop" if done else None,
         }],
     }
@@ -232,14 +240,19 @@ def chat_completions():
         def generate():
             try:
                 for delta in backend.prompt(prompt_text, images=images):
-                    yield _sse(delta, model)
+                    if isinstance(delta, tuple):    # ("reasoning", text)
+                        yield _sse(delta[1], model, reasoning=True)
+                    else:
+                        yield _sse(delta, model)
                 yield _sse("", model, done=True)
             finally:
                 _REQ_T0.pop(tid, None)
         return Response(generate(), mimetype="text/event-stream", headers=headers)
 
     try:
-        full = "".join(backend.prompt(prompt_text, images=images))
+        # Non-streaming: reasoning tuples are dropped; only answer text joins.
+        full = "".join(d for d in backend.prompt(prompt_text, images=images)
+                       if isinstance(d, str))
     finally:
         _REQ_T0.pop(tid, None)
     return jsonify({

@@ -1,8 +1,11 @@
 // Agentry Web UI — minimal chat over OpenAI-shape SSE.
-// Pared down from the NoLlama UI: temp slider, no-think toggle, and image
-// attach were removed because Copilot CLI's -p mode doesn't expose them.
-// Think-block rendering is kept (inert when no <think> tags appear) so a
-// future backend that does emit reasoning can light it up for free.
+// Pared down from the NoLlama UI (temp slider and no-think toggle removed),
+// then re-lit as the backends grew up:
+// - image attach/paste/drop -> OpenAI image_url data: URI parts (copilot
+//   forwards them to the model; one image per message — the free-tier
+//   models accept max_prompt_images=1)
+// - live thinking: the server streams reasoning summaries as
+//   delta.reasoning_content; the UI folds them into the think-block.
 
 const chat = document.getElementById('chat');
 const input = document.getElementById('message-input');
@@ -11,11 +14,44 @@ const modelSelect = document.getElementById('model-select');
 const reasoningSelect = document.getElementById('reasoning-select');
 const statusDot = document.getElementById('status-dot');
 const newChatBtn = document.getElementById('new-chat-btn');
+const attachBtn = document.getElementById('attach-btn');
+const fileInput = document.getElementById('file-input');
+const imagePreview = document.getElementById('image-preview');
+const imagePreviewImg = document.getElementById('image-preview-img');
+const imageRemove = document.getElementById('image-remove');
+const dropOverlay = document.getElementById('drop-overlay');
 
 let chatHistory = [];
 let thinkExpanded = false;
 let isGenerating = false;
 let abortController = null;
+let pendingImage = null;   // data: URI of the image attached to the next message
+
+const MAX_IMAGE_BYTES = 3 * 1024 * 1024;   // backend vision limit (3 MB)
+
+// --- Image attach ---
+
+function setImage(file) {
+    if (!file || !file.type.startsWith('image/')) return;
+    if (file.size > MAX_IMAGE_BYTES) {
+        alert(`Image too large (${(file.size / 1048576).toFixed(1)} MB > 3 MB limit)`);
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+        pendingImage = reader.result;
+        imagePreviewImg.src = pendingImage;
+        imagePreview.style.display = 'block';
+        input.focus();
+    };
+    reader.readAsDataURL(file);
+}
+
+function clearImage() {
+    pendingImage = null;
+    imagePreviewImg.src = '';
+    imagePreview.style.display = 'none';
+}
 
 function shouldAutoScroll() {
     return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80;
@@ -77,10 +113,10 @@ function buildRequestBody() {
 
 // --- Chat rendering ---
 
-function addMessage(role, content, meta) {
+function addMessage(role, content, meta, rawHtml = false) {
     const div = document.createElement('div');
     div.className = `message ${role}`;
-    div.innerHTML = typeof content === 'string' ? renderMarkdown(content) : content;
+    div.innerHTML = rawHtml ? content : renderMarkdown(content);
     if (meta) {
         const metaDiv = document.createElement('div');
         metaDiv.className = 'meta';
@@ -170,12 +206,22 @@ window.copyCode = copyCode;
 
 async function sendMessage() {
     const text = input.value.trim();
-    if (!text) return;
+    if (!text && !pendingImage) return;
     if (isGenerating) return;
     thinkExpanded = false;
 
-    addMessage('user', escapeHtml(text).replace(/\n/g, '<br>'));
-    chatHistory.push({ role: 'user', content: text });
+    let userHtml = escapeHtml(text).replace(/\n/g, '<br>');
+    if (pendingImage) {
+        userHtml += `<img class="attached" src="${pendingImage}" alt="attached image">`;
+        chatHistory.push({ role: 'user', content: [
+            { type: 'text', text: text },
+            { type: 'image_url', image_url: { url: pendingImage } },
+        ]});
+    } else {
+        chatHistory.push({ role: 'user', content: text });
+    }
+    addMessage('user', userHtml, null, true);   // userHtml is pre-escaped
+    clearImage();
 
     input.value = '';
     input.style.height = 'auto';
@@ -206,6 +252,15 @@ async function sendMessage() {
         const contentType = resp.headers.get('content-type') || '';
         if (contentType.includes('text/event-stream')) {
             let fullText = '';
+            let reasoningText = '';
+            // Fold streamed reasoning into the <think> convention the
+            // renderer already speaks: open while only reasoning has
+            // arrived, closed once (or when) the answer starts.
+            const displayText = (streaming) => {
+                if (!reasoningText) return fullText;
+                const closed = fullText || !streaming;
+                return `<think>${reasoningText}${closed ? '</think>' : ''}${fullText}`;
+            };
             const reader = resp.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
@@ -222,17 +277,18 @@ async function sendMessage() {
                     if (data === '[DONE]') continue;
                     try {
                         const chunk = JSON.parse(data);
-                        const delta = chunk.choices?.[0]?.delta?.content;
-                        if (delta) {
-                            fullText += delta;
-                            assistantDiv.innerHTML = renderMarkdown(fullText, true);
+                        const d = chunk.choices?.[0]?.delta || {};
+                        if (d.content) fullText += d.content;
+                        if (d.reasoning_content) reasoningText += d.reasoning_content;
+                        if (d.content || d.reasoning_content) {
+                            assistantDiv.innerHTML = renderMarkdown(displayText(true), true);
                             scrollToBottom();
                         }
                     } catch {}
                 }
             }
 
-            assistantDiv.innerHTML = renderMarkdown(fullText, false);
+            assistantDiv.innerHTML = renderMarkdown(displayText(false), false);
             const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
             const metaDiv = document.createElement('div');
             metaDiv.className = 'meta';
@@ -298,6 +354,46 @@ input.addEventListener('input', () => {
 });
 
 newChatBtn.addEventListener('click', newChat);
+
+// --- Image attach wiring ---
+
+attachBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+    setImage(fileInput.files[0]);
+    fileInput.value = '';
+});
+imageRemove.addEventListener('click', clearImage);
+
+document.addEventListener('paste', (e) => {
+    for (const item of e.clipboardData?.items || []) {
+        if (item.type.startsWith('image/')) {
+            e.preventDefault();
+            setImage(item.getAsFile());
+            return;
+        }
+    }
+});
+
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => {
+    if ([...(e.dataTransfer?.types || [])].includes('Files')) {
+        dragDepth++;
+        dropOverlay.classList.add('active');
+    }
+});
+window.addEventListener('dragleave', () => {
+    if (--dragDepth <= 0) {
+        dragDepth = 0;
+        dropOverlay.classList.remove('active');
+    }
+});
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    dropOverlay.classList.remove('active');
+    setImage(e.dataTransfer?.files?.[0]);
+});
 
 document.addEventListener('keydown', (e) => {
     if (e.ctrlKey && e.key === 'n') {
