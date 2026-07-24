@@ -236,13 +236,35 @@ class CopilotSDKBackend(Backend):
             kwargs["model"] = self.model
         if self.reasoning_effort:
             kwargs["reasoning_effort"] = self.reasoning_effort
-        session = self._call(self._client.create_session(**kwargs), timeout=120)
+        try:
+            session = self._call(self._client.create_session(**kwargs), timeout=120)
+        except BackendError as e:
+            # A disallowed pin usually gets silently overridden (checked
+            # below), but if the runtime ever hard-rejects it, fall back to
+            # an unpinned session (resolves to "auto") rather than dying.
+            if "model" not in kwargs:
+                raise
+            _log(f"WARN: create_session with model={kwargs['model']!r} failed ({e}); "
+                 f"retrying unpinned (auto)")
+            del kwargs["model"]
+            session = self._call(self._client.create_session(**kwargs), timeout=120)
         session.on(self._on_event)
         self._session = session
         self.session_id = session.session_id
         self.session_fresh = True
         _log(f"SDK session: {self.session_id}"
              + (f" (reasoning_effort={self.reasoning_effort})" if self.reasoning_effort else ""))
+        # Org model policy (e.g. a Business plan restricted to "Auto") does not
+        # fail a pinned create_session — it silently overrides the pin. Verify
+        # what the runtime actually selected and shout if it differs.
+        if self.model:
+            try:
+                current = self._call(session.rpc.model.get_current(), timeout=15)
+                if current.model_id and current.model_id != self.model:
+                    _log(f"WARN: requested model {self.model!r} but session runs "
+                         f"{current.model_id!r} — likely an org model-policy override")
+            except BackendError as e:
+                _log(f"WARN: could not verify session model: {e}")
         return self.session_id
 
     def update_reasoning_effort(self, value):
