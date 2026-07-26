@@ -24,25 +24,56 @@ Set-Location -LiteralPath $PSScriptRoot
 # default (gpt-5.4-mini) unless overridden.
 if (-not $Model -and $Backend -eq "copilot") { $Model = "gpt-5-mini" }
 
-if (-not (Test-Path .\venv\Scripts\python.exe)) {
-    Write-Host "Creating venv..."
-    # github-copilot-sdk needs Python 3.11+; prefer the newest via the py launcher.
-    $py = $null
+# github-copilot-sdk needs Python 3.11+. A venv left over from an older
+# interpreter silently skips the SDK, so validate the venv's version on every
+# start and rebuild it when it's missing, broken, or too old.
+$minMinor = 11
+
+function Find-Python {
+    # Prefer the newest 3.x via the py launcher, fall back to `python` on PATH.
     $pyList = if (Get-Command py -ErrorAction SilentlyContinue) { py -0p 2>$null } else { @() }
     foreach ($v in "3.13", "3.12", "3.11") {
-        if ($pyList -match [regex]::Escape("-V:$v")) { $py = @("py", "-$v"); break }
+        if ($pyList -match [regex]::Escape("-V:$v")) { return @("py", "-$v") }
     }
+    $sys = python --version 2>$null
+    if ($sys -match 'Python 3\.(\d+)' -and [int]$Matches[1] -ge $minMinor) { return @("python") }
+    return $null
+}
+
+$venvPy = ".\venv\Scripts\python.exe"
+$venvOk = $false
+if (Test-Path $venvPy) {
+    $ver = & $venvPy --version 2>$null
+    if ($ver -match 'Python 3\.(\d+)' -and [int]$Matches[1] -ge $minMinor) { $venvOk = $true }
+    else { Write-Host "Existing venv is $ver (need 3.$minMinor+); recreating..." }
+}
+
+if (-not $venvOk) {
+    $py = Find-Python
     if (-not $py) {
-        $sys = python --version 2>$null
-        if ($sys -match 'Python 3\.(\d+)' -and [int]$Matches[1] -ge 11) { $py = @("python") }
-        else {
-            Write-Warning "Python 3.11+ not found (required by github-copilot-sdk). Install it, e.g.: winget install Python.Python.3.13"
-            exit 1
-        }
+        Write-Warning "Python 3.$minMinor+ not found (required by github-copilot-sdk). Install it, e.g.: winget install Python.Python.3.13"
+        exit 1
     }
+    if (Test-Path .\venv) { Remove-Item -Recurse -Force .\venv }
+    Write-Host "Creating venv..."
     & $py[0] @($py[1..($py.Count-1)] + @('-m', 'venv', 'venv'))
-    .\venv\Scripts\python.exe -m pip install --quiet --upgrade pip
-    .\venv\Scripts\python.exe -m pip install --quiet -r requirements.txt
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPy)) {
+        Write-Warning "venv creation failed."
+        exit 1
+    }
+    & $venvPy -m pip install --quiet --upgrade pip
+}
+
+# Verify deps are importable (catches a venv created before requirements.txt
+# grew, or an interrupted install); install only when something is missing.
+& $venvPy -c "import flask, copilot" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Installing requirements..."
+    & $venvPy -m pip install --quiet -r requirements.txt
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "pip install -r requirements.txt failed."
+        exit 1
+    }
 }
 
 # The copilot backend runs on the SDK's own downloaded runtime — no CLI on
