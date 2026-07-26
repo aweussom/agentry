@@ -313,7 +313,8 @@ def main():
     try:
         backend = _get_backend()
         backend.new_session()
-        print(f"  {BACKEND_KIND} ready  (session={backend.session_id})", flush=True)
+        user_note = f"user={backend.auth_login}  " if backend.auth_login else ""
+        print(f"  {BACKEND_KIND} ready  ({user_note}session={backend.session_id})", flush=True)
     except Exception as e:
         print(f"  WARN: backend eager init failed: {e}", flush=True)
 

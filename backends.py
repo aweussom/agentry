@@ -63,6 +63,10 @@ class Backend(abc.ABC):
 
     session_id: Optional[str] = None
     session_fresh: bool = False
+    # GitHub/provider login the backend authenticated as, when knowable.
+    # Shown in the startup ready-line so a mismatched quota display (which may
+    # meter a different account) can't be misread as the session identity.
+    auth_login: Optional[str] = None
 
     @abc.abstractmethod
     def new_session(self, cwd: Optional[str] = None) -> str:
@@ -203,6 +207,12 @@ class CopilotSDKBackend(Backend):
         self._call(self._client.start(), timeout=600)
         self._alive = True
         _log(f"SDK client started in {time.monotonic() - t0:.1f}s")
+        try:
+            st = self._call(self._client.get_auth_status(), timeout=15)
+            self.auth_login = st.login
+            _log(f"SDK auth: login={st.login} type={st.authType} host={st.host}")
+        except Exception as e:
+            _log(f"SDK auth status unavailable: {e}")
 
     def _call(self, coro, timeout=60):
         """Run a coroutine on the SDK loop from sync code; block for the result."""
