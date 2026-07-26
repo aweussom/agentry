@@ -12,6 +12,3 @@ logs/
 # Generated codex app-server protocol schema dump (~3 MB, regenerate with
 # `codex app-server generate-json-schema --out _bench/codex_schema`).
 _bench/codex_schema/
-
-# Local config with secrets (copy from agentry.ini.template). Never commit.
-agentry.ini

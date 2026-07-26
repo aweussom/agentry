@@ -180,42 +180,19 @@ pushes per turn, so there are no extra API calls during normal use. (Output
 redirected to a file suppresses the heartbeat; the permanent quota lines still
 appear.)
 
-#### copilot quota (opt-in)
+#### copilot quota
 
-The `copilot` backend can show your monthly Copilot **premium-request** quota,
-read from the documented GitHub billing API
-(`GET /users/{username}/settings/billing/premium_request/usage`). Enable it by
-copying `agentry.ini.template` to `agentry.ini` and filling in a fine-grained
-PAT (Account → **Plan: read-only**), your username, and plan tier. The console
-then shows, e.g.:
-
-```
-copilot pro | premium 142/300 (53% left, resets in 9d)
-```
-
-cached for 10 minutes, with an optional PAT-expiry warning (`expiry`/`pat_name`
-in the ini). It's **off by default** (blank `pat`).
-
-**What it tracks — and what it does *not*.** This endpoint reports *monthly
-premium-request* usage: the billed/metered requests (premium models like Claude
-Sonnet/Opus). In testing it returned **empty (0)** on a personal account whose
-copilot footer simultaneously showed ~24% consumed (`Remaining reqs 76%`). The
-likely explanation: base/included models such as `gpt-5-mini` and `haiku-4.5`
-aren't premium requests at all — they're throttled by a short **rolling-window
-rate limit** (the same primary/secondary-window shape codex exposes), and *that*
-is what the footer shows. The rolling figure is **not** in the billing API; it
-lives only in copilot's internal real-time endpoint, which isn't cleanly
-accessible. So agentry's number is a monthly *premium-billing* readout (0 unless
-you actually run premium models), **not** a mirror of the footer's live
-'Remaining reqs'. It's a global monthly total across all your Copilot usage.
-(Premium allowances: Pro = 300/month, Pro+ = 1500.)
-
-**Caveat — personal billing only.** This works only for accounts that pay their
-own Copilot bill (verified end-to-end against a personally-billed account). If
-your license is **org/enterprise-managed** (e.g. an SSO / enterprise-managed
-user), per-user billing is not exposed by GitHub's user-level API — it returns
-HTTP 400/403 — and agentry disables the display automatically with one log line.
-There is no user-level path for enterprise-managed seats.
+The `copilot` backend shows no quota line. An earlier opt-in feature metered
+monthly **premium-request** billing via a GitHub PAT and the user billing API,
+but it was removed: base models like `gpt-5-mini` never consume premium
+requests (the readout was a permanent `0/N`), the footer's live rolling-window
+rate limit isn't exposed by any public API, and org/enterprise-managed (SSO)
+accounts return HTTP 400/403 from user-level billing altogether. The startup
+ready-line does print the authenticated login (`user=...`, via the SDK's
+`auth.getStatus`) so you can always see which account is serving requests.
+If a real meter is ever wanted, the SDK's per-turn `assistant.usage` events
+carry quota snapshots (entitlement/used/remaining %) for the logged-in account
+— internal SDK fields today, but the right source when they stabilize.
 
 #### claude quota
 
