@@ -280,7 +280,8 @@ def main():
                         "claude (premium, cold-start).")
     p.add_argument("--model", default=None,
                    help="Model override. copilot: e.g. gpt-5-mini. "
-                        "codex: e.g. gpt-5.4-mini (default). "
+                        "codex: e.g. gpt-5.6-luna (default: codex's own "
+                        "configured model, i.e. the last TUI selection). "
                         "claude: e.g. claude-sonnet-4-6 (default).")
     p.add_argument("--reasoning-effort",
                    choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],

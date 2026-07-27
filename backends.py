@@ -11,7 +11,8 @@ Backends:
                        client on this branch — see git history for that code.
   CodexAppServerBackend  OpenAI Codex (`codex app-server`). The paid-cheap tier
                        (ChatGPT Go $8 / Plus $20). Validated 2026-05-30;
-                       default model gpt-5.4-mini @ low effort.
+                       inherits codex's own configured model (the one last
+                       selected in the codex TUI) @ low effort.
   ClaudeCodeBackend    Anthropic Claude Code (`claude -p`). The premium tier.
                        Unlike the other two, claude-code has NO persistent
                        stdio server mode, so this backend is COLD-START: one
@@ -490,8 +491,13 @@ class CodexAppServerBackend(Backend):
         "object), return exactly that and nothing else."
     )
 
-    def __init__(self, codex_path="codex", cwd=None, model="gpt-5.4-mini",
+    def __init__(self, codex_path="codex", cwd=None, model=None,
                  reasoning_effort="low", developer_instructions=None, log_path=None):
+        # model=None omits the turn-level override, so each thread runs on
+        # codex's own configured default (~/.codex/config.toml, i.e. whatever
+        # was last selected in the codex TUI). This tracks OpenAI's model
+        # migrations (e.g. gpt-5.4-mini -> gpt-5.6-luna) without a code change;
+        # the thread/start log line below shows what each thread resolved to.
         self.model = model
         # codex calls it "effort"; we keep agentry's "reasoning_effort" name on
         # the public interface for parity with the Copilot backend.

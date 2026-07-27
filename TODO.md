@@ -24,6 +24,16 @@
       ChatGPT account login (no API key). Streams reasoning traces
       (`item/reasoning/textDelta`), which Copilot does not. Paid-cheap tier
       (ChatGPT Go $8 / Plus $20). See `archive/CODEX-PLAN.md`, `_bench/codex_probe.py`.
+- [x] Codex backend: stop hardcoding the model (2026-07-27). OpenAI deprecated
+      `gpt-5.4-mini` (migration target `gpt-5.6-luna`), which would have broken
+      every `turn/start` once removed. `CodexAppServerBackend` now defaults
+      `model=None` — the turn-level override is omitted and each thread runs on
+      codex's own configured model (`~/.codex/config.toml`, i.e. the last TUI
+      selection). `--model` still pins explicitly. Probed `gpt-5.6-luna` @ `low`
+      via `_bench/codex_probe.py`: median TTFB 6.20s (vs 6.5s on 5.4-mini), and
+      verified end-to-end through Flask on a test port. Trade-off documented in
+      README: switching models in the codex TUI now silently changes what
+      agentry uses on its next thread.
 - [x] Claude Code backend (`claude -p`, COLD-START). Landed 2026-05-31 as the
       premium tier. claude-code has no persistent stdio server, so it spawns a
       fresh process per turn: ~2.5s startup overhead (Sonnet 4.6, lean config),

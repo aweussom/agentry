@@ -34,7 +34,8 @@ Wraps three interchangeable backends, selected with `--backend`:
   [Copilot SDK](https://github.com/github/copilot-sdk). The free
   tier; `gpt-5-mini` at `low`/`high` reasoning.
 - **`codex`** — OpenAI Codex (`codex app-server`). The paid-but-cheap tier
-  (ChatGPT Go $8 / Plus $20); default `gpt-5.4-mini` at `low` effort.
+  (ChatGPT Go $8 / Plus $20); runs whatever model codex itself is configured
+  for (see note under Configuration) at `low` effort.
 - **`claude`** — Anthropic Claude Code (`claude -p`). The premium tier;
   default `claude-sonnet-4-6`.
 
@@ -114,7 +115,7 @@ The launcher must be run from the same logon session as your interactive
 ```powershell
 cd C:\devel\aweussom\python\agentry
 .\start.ps1                                          # copilot, gpt-5-mini, reasoning=low
-.\start.ps1 -Backend codex                           # codex, gpt-5.4-mini, effort=low
+.\start.ps1 -Backend codex                           # codex, model from codex config, effort=low
 .\start.ps1 -Backend claude                          # claude, claude-sonnet-4-6 (cold-start)
 .\start.ps1 -Port 9000
 ```
@@ -133,7 +134,7 @@ copilot login
 cd ~/path/to/agentry
 chmod +x start.sh                                    # first checkout only
 ./start.sh                                           # copilot, gpt-5-mini, reasoning=low
-./start.sh --backend codex                           # codex, gpt-5.4-mini, effort=low
+./start.sh --backend codex                           # codex, model from codex config, effort=low
 ./start.sh --backend claude                          # claude, claude-sonnet-4-6 (cold-start)
 ./start.sh --port 9000
 ```
@@ -152,7 +153,19 @@ Launcher params:
     - `copilot`: set as the SDK session's model. Free tier: `gpt-5-mini`
       (default), `gpt-4.1`, `claude-haiku-4.5`. Paid tiers add more
       (Claude Sonnet 4.6, Opus 4.7, GPT-5.x family).
-    - `codex`: passed on `turn/start`. Default `gpt-5.4-mini`.
+    - `codex`: passed on `turn/start`. No default — when unset, agentry
+      omits the override and each thread runs on codex's own configured
+      model (`~/.codex/config.toml`).
+
+      > **Note:** codex persists the model you last selected in its
+      > interactive TUI to that same config file. So without an explicit
+      > `-Model`, switching models in the codex TUI **silently changes what
+      > agentry uses** from its next thread on. This is deliberate — it
+      > tracks OpenAI's model migrations (e.g. `gpt-5.4-mini` →
+      > `gpt-5.6-luna`) without a code change — but if you need a stable
+      > prod model, pin it with `-Model`. The startup log's
+      > `codex thread: ... (default model=...)` line shows what each thread
+      > actually resolved to.
     - `claude`: passed to `claude --model`. Default `claude-sonnet-4-6`.
 - `-ReasoningEffort` — `low`, `medium`, `high` are confirmed end-to-end on
   copilot and codex. On `copilot` it is a session parameter (live changes go

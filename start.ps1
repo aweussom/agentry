@@ -20,8 +20,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
-# Backend defaults: copilot pins gpt-5-mini (benchmarked); codex uses its own
-# default (gpt-5.4-mini) unless overridden.
+# Backend defaults: copilot pins gpt-5-mini (benchmarked); codex follows its
+# own configured model (last selected in the codex TUI) unless overridden.
 if (-not $Model -and $Backend -eq "copilot") { $Model = "gpt-5-mini" }
 
 # github-copilot-sdk needs Python 3.11+. A venv left over from an older
