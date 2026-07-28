@@ -75,6 +75,25 @@
   which point the in-process SDK obsoletes the wrapper anyway — or
   (b) `agy` grows a streaming / JSON delta output mode.
 
+  **Re-evaluated 2026-07-28** — trigger (a) fired: `google-antigravity`
+  0.1.8 (2026-07-23) ships `win_amd64`/`win_arm64` wheels; weekly release
+  cadence since 0.1.0. Validated on Windows in a scratch venv: in-process
+  `Agent` API (no subprocess JSON-RPC needed), `Agent.chat()` returning
+  streamed `chunks`, `CapabilitiesConfig(enabled_tools=[])` for native
+  tool-stripping (cleaner than our `-32601` refusals; write tools require
+  an explicit safety policy), per-turn `UsageMetadata` incl. cached tokens,
+  ~2.3s session startup. On paper: the Copilot-SDK story again.
+  **New blocker: auth.** The SDK is API-key / Vertex only (it silently
+  consumed a `GEMINI_API_KEY` from env and billed AI Studio prepay
+  credits — 429 RESOURCE_EXHAUSTED on a depleted account). It cannot ride
+  the sponsored/liberal `agy` subscription quota, which is the only thing
+  worth unlocking — the Gemini API itself is directly purchasable by any
+  client, so the SDK today fails the same bar that disqualified
+  `qwen3-code`. STILL SHELVED. Watch: SDK issue #20 (OAuth / CLI-credential
+  reuse — lands ⇒ copilot-SDK-style backend on sponsored quota) and CLI
+  issue #31 (`--acp` on `agy` — lands ⇒ codex-style persistent wrapper).
+  Either one changes the answer.
+
   First-run gotcha: `agy.exe` does OAuth on first invocation via
   a browser popup. Headless sessions (e.g. CI, automated harnesses)
   hang silently with 0% CPU because the consent never completes;

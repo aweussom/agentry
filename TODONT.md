@@ -66,8 +66,15 @@ second backend justified it.
   exist. Wrapping the qwen CLI would add auth surface and a support tail to
   reach a model you can already `curl`. (The earlier note — unknown
   automation surface, no demand — remains true but is now moot.)
-- `antigravity` / `agy` — evaluated and shelved 2026-05-26 (no Windows
-  wheel; `agy -p -c` reprints the full transcript per turn, no streaming).
+- `antigravity` / `agy` — evaluated 2026-05-26, re-evaluated 2026-07-28.
+  The original blocker (no Windows wheel) is gone: SDK 0.1.8 ships
+  `win_amd64` and the in-process `Agent` API is technically excellent
+  (streaming, native tool-stripping, usage metadata). The remaining
+  blocker is auth: the SDK is API-key/Vertex only — it bills the plain
+  Gemini API, which any client can buy directly, instead of the sponsored
+  `agy` subscription quota. Fails the qwen3-code test until SDK issue #20
+  (credential reuse) or CLI issue #31 (`--acp`) lands. See TODO.md for the
+  full re-evaluation record.
 - General caution still holds: each backend adds CLI surface, auth
   gotchas, and a support tail. Add a backend only when it clears the bar
   codex did — a clean persistent JSON/streaming protocol AND a distinct
