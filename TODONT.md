@@ -66,15 +66,28 @@ second backend justified it.
   exist. Wrapping the qwen CLI would add auth surface and a support tail to
   reach a model you can already `curl`. (The earlier note — unknown
   automation surface, no demand — remains true but is now moot.)
-- `antigravity` / `agy` — evaluated 2026-05-26, re-evaluated 2026-07-28.
-  The original blocker (no Windows wheel) is gone: SDK 0.1.8 ships
-  `win_amd64` and the in-process `Agent` API is technically excellent
-  (streaming, native tool-stripping, usage metadata). The remaining
-  blocker is auth: the SDK is API-key/Vertex only — it bills the plain
-  Gemini API, which any client can buy directly, instead of the sponsored
-  `agy` subscription quota. Fails the qwen3-code test until SDK issue #20
-  (credential reuse) or CLI issue #31 (`--acp`) lands. See TODO.md for the
-  full re-evaluation record.
+- `antigravity` / `agy` — DECLINED (2026-07-28) after three evaluation
+  rounds, and NOT for technical reasons. By July 2026 it cleared every
+  technical bar: SDK 0.1.8 ships Windows wheels; `agy -p` 1.0.2 grew
+  `--output-format stream-json`, `--effort low|medium|high`, per-step
+  usage (incl. cached tokens), and headless auto-deny of tool permissions
+  (validated live: `run_command` → "User denied permission", clean ERROR
+  step, no stall). Declined on economics and risk:
+    1. The SDK can't reach the subscription quota at all — API-key/Vertex
+       billing only, i.e. the plain Gemini API any client can buy. Fails
+       the qwen3-code test.
+    2. The sponsored CLI quota was gutted in March 2026: free "Starter
+       Quota" is ~20 requests/day inside a weekly refresh window —
+       unusable for enrichment. The only liberal paid pool (Flash on a
+       5h refresh, Pro $20/mo) buys roughly what Copilot's free tier
+       already provides for $0.
+    3. Ban risk is asymmetric: Google suspended entire Google accounts —
+       including paid Ultra subscribers — for driving subscriptions
+       through third-party tools (Feb 2026 ban wave), and a personal
+       Gmail account is attached here. GitHub and Anthropic tolerate the
+       gray zone; Google demonstrably does not.
+  The former watch items (SDK #20 credential reuse, CLI #31 `--acp`) are
+  dropped: even if they land, (2) and (3) stand.
 - General caution still holds: each backend adds CLI surface, auth
   gotchas, and a support tail. Add a backend only when it clears the bar
   codex did — a clean persistent JSON/streaming protocol AND a distinct

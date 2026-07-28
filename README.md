@@ -372,10 +372,13 @@ backends (`copilot`, `codex`, `claude`). `claude-code` is `-p`-per-turn with
 no persistent protocol — once deferred for that reason, but it landed as a
 **cold-start** backend (2026-05-31): the ~2.5s spawn cost is noise against the
 long enrichment turns it targets, and the per-turn isolation is a feature
-(`archive/CLAUDE-PLAN.md`). `antigravity` stays deferred and `qwen3-code` is
-declined outright — Qwen sells a direct OpenAI-compatible API, so there is no
-subscription-locked model to unlock (reasons in `TODONT.md`). A new backend
-means implementing one `Backend` class, not a refactor.
+(`archive/CLAUDE-PLAN.md`). The remaining candidates are declined, not
+deferred: `qwen3-code` (Qwen sells a direct OpenAI-compatible API — nothing
+subscription-locked to unlock) and `antigravity` (technically viable by
+mid-2026, but the sponsored quota was cut to ~20 requests/day and Google has
+suspended accounts for third-party subscription use — full reasoning in
+`TODONT.md`). A new backend means implementing one `Backend` class, not a
+refactor.
 
 ## Related work
 

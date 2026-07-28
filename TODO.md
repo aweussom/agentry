@@ -92,7 +92,13 @@
   `qwen3-code`. STILL SHELVED. Watch: SDK issue #20 (OAuth / CLI-credential
   reuse — lands ⇒ copilot-SDK-style backend on sponsored quota) and CLI
   issue #31 (`--acp` on `agy` — lands ⇒ codex-style persistent wrapper).
-  Either one changes the answer.
+  ~~Either one changes the answer.~~
+  **Final verdict, same day: DECLINED — watch items dropped.** A same-day
+  `agy -p` probe passed the remaining technical bars (stream-json,
+  `--effort`, headless tool auto-deny), but the sponsored quota was gutted
+  in March 2026 (~20 req/day free, weekly window) and Google has banned
+  whole accounts for third-party subscription use. Economics + account
+  risk kill it regardless of protocol. Full reasoning in `TODONT.md`.
 
   First-run gotcha: `agy.exe` does OAuth on first invocation via
   a browser popup. Headless sessions (e.g. CI, automated harnesses)
