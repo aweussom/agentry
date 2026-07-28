@@ -94,7 +94,9 @@ would prefer them already has paid tooling.
       (2026-05-31). It IS `-p`-per-turn with no persistent protocol, but the
       ~2.5s cold start is fine against 40–90s enrichment turns, and the
       isolation is a feature here. See "Done" / `archive/CLAUDE-PLAN.md`.
-    - `qwen3-code` — Qwen's coding-agent CLI. Unknown automation surface.
+    - ~~`qwen3-code`~~ — DECLINED 2026-07-28 (see TODONT.md): Qwen sells a
+      direct OpenAI-compatible API to any subscriber, so there is no locked
+      model for agentry to unlock. Not a deferral — off the list.
     - ~~`antigravity-cli`~~ — evaluated, shelved (see "Done").
     - ~~`codex` (OpenAI)~~ — DONE, landed as a backend.
   For any new candidate: implement the `Backend` ABC in `backends.py`,

@@ -26,7 +26,7 @@ A minimal chat **web UI** ships with the proxy. It is not the point of the
 project — just a quick way to confirm the API works end-to-end. The launcher
 prints a clickable URL (`http://localhost:8765` by default) on startup.
 
-![Bundled chat UI talking to the proxy as a regular OpenAI endpoint; footer shows the active backend and per-turn latency](./images/web-ui.png)
+![Bundled chat UI talking to the proxy as a regular OpenAI endpoint: markdown answer with a copy button on the code block, a collapsible thinking block above it, a per-turn backend + latency tag, image attach, and a header showing the active model and reasoning effort](./images/web-ui.png)
 
 Wraps three interchangeable backends, selected with `--backend`:
 
@@ -47,6 +47,18 @@ overhead (lean config), trading that for zero cross-turn context bleed. It's
 built for long single-shot tasks (e.g. exam enrichment, 40–90s/turn) where the
 startup is noise. See `archive/CLAUDE-PLAN.md`. Adding a backend is implementing
 one `Backend` class in `backends.py`.
+
+**Contents:**
+[The idea](#the-idea-reverse-mcp) ·
+[Status](#status) ·
+[Quick start](#quick-start) ·
+[Configuration](#configuration) ·
+[Architecture](#architecture) ·
+[Per-project instructions](#per-project-instructions) ·
+[File map](#file-map) ·
+[Known limits](#known-limits) ·
+[Roadmap](#roadmap) ·
+[Related work](#related-work)
 
 ## The idea: reverse MCP
 
@@ -77,8 +89,8 @@ format.
 
 ## Status
 
-Working tool. Used by the author as the primary enricher across adjacent
-projects (`shiny-fiesta`, soon `geomap`). Three backends:
+In production — the author's primary enricher across adjacent projects
+(`shiny-fiesta`, soon `geomap`). Three backends:
 `copilot` (free), `codex` (paid-cheap), and `claude` (premium, cold-start) —
 see `TODONT.md` for which other CLIs were considered and declined.
 Auth uses your existing CLI logins via the local credential store.
@@ -86,11 +98,15 @@ Auth uses your existing CLI logins via the local credential store.
 ToS posture differs per backend. The `copilot` backend rides the official
 [GitHub Copilot SDK](https://github.com/github/copilot-sdk) (GA) — embedding
 Copilot programmatically is now a *supported* product surface, not a hack.
-(Serving it back out as an OpenAI-shaped chat endpoint is admittedly not the
-use case GitHub had in mind, but it's built on the front door, not a wrapped
-interactive CLI.) The `codex` and `claude` backends still wrap interactive
-CLIs programmatically and sit in the usual gray ToS zone — for those, use a
-non-critical account, don't expose externally, keep volume modest.
+Agentry walks in through the front door, papers in order. Is "confiscate the
+agent's tools and serve the bare model back out as an OpenAI endpoint" the
+use case GitHub pictured when they published an SDK for embedding agents?
+Almost certainly not. But that's the thing about front doors: once you're
+invited in, nobody dictates what you cook. Sanctioned entrance, unexpected
+choreography — such is the world. The `codex` and `claude` backends still
+wrap interactive CLIs programmatically and sit in the usual gray ToS zone —
+for those, use a non-critical account, don't expose externally, keep volume
+modest.
 
 ## Quick start
 
@@ -120,7 +136,7 @@ cd C:\devel\aweussom\python\agentry
 .\start.ps1 -Port 9000
 ```
 
-![Launcher console: Flask boots, the Copilot runtime is spawned via the SDK, and the session comes up ready — then every subsequent chat request lands on the same warm process. (Screenshot predates the SDK migration; the boot lines now mention the SDK instead of ACP, the shape is the same.)](./images/startup-console.png)
+![Launcher console: the SDK client starts in under two seconds, reports the authenticated GitHub login, opens a session, and settles into the idle heartbeat — every subsequent chat request lands on the same warm process](./images/startup-console.png)
 
 ### Linux / WSL2 Ubuntu
 
@@ -152,7 +168,8 @@ Launcher params:
 - `-Model` — model override.
     - `copilot`: set as the SDK session's model. Free tier: `gpt-5-mini`
       (default), `gpt-4.1`, `claude-haiku-4.5`. Paid tiers add more
-      (Claude Sonnet 4.6, Opus 4.7, GPT-5.x family).
+      (larger Claude and GPT-5.x models — the set tracks Copilot's plans,
+      so check your plan's model picker rather than this README).
     - `codex`: passed on `turn/start`. No default — when unset, agentry
       omits the override and each thread runs on codex's own configured
       model (`~/.codex/config.toml`).
@@ -283,6 +300,8 @@ OpenAI clients ignore it) and the UI folds them into a collapsible
 "Thinking..." block above the answer. Codex reasoning
 (`item/reasoning/textDelta`) is not forwarded yet.
 
+![The thinking block live during a turn: the model's streamed reasoning summary scrolls in a collapsible panel before the first answer token arrives](./images/web-ui-thinking.png)
+
 **Artifacts**: fenced ` ```html `, ` ```svg `, and ` ```markdown ` blocks in
 a reply get an "open ▸" button that renders them in a side panel — HTML/SVG
 in a sandboxed iframe (scripts run, but no same-origin access to the chat
@@ -353,33 +372,48 @@ backends (`copilot`, `codex`, `claude`). `claude-code` is `-p`-per-turn with
 no persistent protocol — once deferred for that reason, but it landed as a
 **cold-start** backend (2026-05-31): the ~2.5s spawn cost is noise against the
 long enrichment turns it targets, and the per-turn isolation is a feature
-(`archive/CLAUDE-PLAN.md`). Remaining candidates (`qwen3-code`, `antigravity`)
-stay deferred for the reasons in `TODONT.md`. A new backend means implementing
-one `Backend` class, not a refactor.
+(`archive/CLAUDE-PLAN.md`). `antigravity` stays deferred and `qwen3-code` is
+declined outright — Qwen sells a direct OpenAI-compatible API, so there is no
+subscription-locked model to unlock (reasons in `TODONT.md`). A new backend
+means implementing one `Backend` class, not a refactor.
 
 ## Related work
 
-[`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) is a more
-mature project that also exposes GitHub Copilot through an OpenAI-shaped
-API. The two solve overlapping problems with different framings:
+[`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) is the
+best-known project exposing GitHub Copilot through an OpenAI-shaped API. It
+reverse-engineers Copilot's internal HTTP endpoints directly (impersonating
+an editor client) and is built as a general-purpose API gateway for any
+client. It has been unmaintained since October 2025 — the community moved on
+to the actively developed fork
+[`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api), which
+extends the same approach into a Copilot + Codex + third-party gateway.
 
-- *copilot-api* reverse-engineers Copilot's HTTP/WebSocket endpoints
-  directly and is built to be a general-purpose API gateway for any client.
+The difference in integration surface turned out to be the difference that
+matters:
+
+- *copilot-api* and its forks speak Copilot's internal wire protocol.
+  Broader scope and lower per-call overhead — but permanent exposure to
+  upstream breakage. The original repo froze mid-chase, one
+  "update vscode fallback ver" commit at a time; the forks inherit the
+  treadmill.
 - *Agentry* drives the official agent runtimes through their supported
-  integration surfaces — the GitHub Copilot SDK and `codex app-server` — and
-  is built for one specific use case: killing the per-call startup cost when
-  a single developer uses these agents as an automation backend for their
-  own scripts.
+  integration surfaces — the GitHub Copilot SDK and `codex app-server` — for
+  one narrow use case: killing the per-call startup cost when a single
+  developer uses these agents as an automation backend for their own
+  scripts.
 
 The multi-backend design also means agentry isn't tied to one vendor: the same
 OpenAI-shaped endpoint fronts Copilot (free tier), Codex (cheap paid tier), or
-Claude Code (premium), swapped with a flag. If you want a polished, broadly-applicable
-Copilot-as-an-API, copilot-api is the more capable project. If you
-specifically want a thin local persistent wrapper around the official agent
-CLIs with no reverse-engineering and a narrower scope, that is agentry.
+Claude Code (premium), swapped with a flag. If you want a broad
+Copilot-as-an-API gateway for many clients, the copilot-api family is wider in
+scope — pick a maintained fork. If you want a thin local persistent wrapper
+around the official agent surfaces with no reverse-engineering, that is
+agentry.
 
 ## Acknowledgments
 
-- [Agent Client Protocol](https://agentclientprotocol.com) by Zed Industries.
+- [Agent Client Protocol](https://agentclientprotocol.com) by Zed Industries —
+  the copilot backend's original transport, since replaced by the official
+  Copilot SDK.
 - Web UI based on the [NoLlama](https://github.com/aweussom/NoLlama)
   project (an OpenVINO-based LLM server for Intel NPU/GPU).

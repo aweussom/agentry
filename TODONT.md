@@ -58,7 +58,14 @@ second backend justified it.
 - `claude-code` (Anthropic) — `--output-format stream-json` is still
   `-p`-per-turn, NOT a persistent protocol. Wrapping it gives no spawn-cost
   win, which was the whole point of the persistent backend. Skip.
-- `qwen3-code` — unknown automation surface; no demand.
+- `qwen3-code` — DECLINED (2026-07-28), not merely deferred. Qwen's models
+  are sold as a plain OpenAI-compatible API (DashScope / qwen.ai) that any
+  client can call directly with a subscription — there is no
+  subscription-locked model for agentry to liberate, and unlocking
+  agent-subscription models behind CLIs is this project's entire reason to
+  exist. Wrapping the qwen CLI would add auth surface and a support tail to
+  reach a model you can already `curl`. (The earlier note — unknown
+  automation surface, no demand — remains true but is now moot.)
 - `antigravity` / `agy` — evaluated and shelved 2026-05-26 (no Windows
   wheel; `agy -p -c` reprints the full transcript per turn, no streaming).
 - General caution still holds: each backend adds CLI surface, auth
