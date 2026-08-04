@@ -186,9 +186,10 @@ function renderMarkdown(text, isStreaming) {
         let artifact = '';
         if (ARTIFACT_LANGS.has(l)) {
             const safe = title ? title.replace(/"/g, '&quot;') : '';
+            const verb = (l === 'javascript' || l === 'js') ? 'run' : 'open';
             artifact = `<button class="artifact-btn" data-lang="${l}"`
                 + (safe ? ` data-title="${safe}"` : '')
-                + ` onclick="openArtifact(this)">open &#9656;${safe ? ' ' + safe : ''}</button>`;
+                + ` onclick="openArtifact(this)">${verb} &#9656;${safe ? ' ' + safe : ''}</button>`;
         }
         fences.push(`<pre><code>${code.trim()}</code><button class="copy-btn" onclick="copyCode(this)">copy</button>${artifact}</pre>`);
         return `\x00F${fences.length - 1}\x00`;
@@ -228,7 +229,42 @@ window.copyCode = copyCode;
 
 // --- Artifacts: render a fenced block as a live document ---
 
-const ARTIFACT_LANGS = new Set(['html', 'svg', 'markdown', 'md']);
+const ARTIFACT_LANGS = new Set(['html', 'svg', 'markdown', 'md', 'javascript', 'js']);
+
+// Runner harness for javascript artifacts: executes the snippet in the
+// sandboxed iframe and mirrors console output / errors into the page, so
+// "open" shows the program's output instead of a blank document.
+function jsRunnerDoc(code) {
+    // </script> inside the snippet would terminate the harness script tag
+    const safe = code.replace(/<\/script/gi, '<\\/script');
+    return `<!doctype html><meta charset="utf-8">
+<style>
+  body { margin: 0; background: #fff; }
+  #out { font: 13px/1.5 "Cascadia Code", "Fira Code", monospace;
+         padding: 14px 18px; white-space: pre-wrap; word-break: break-word;
+         color: #1a1a2a; }
+  .err { color: #b91c1c; }
+</style>
+<pre id="out"></pre>
+<script>
+  const out = document.getElementById('out');
+  const show = (cls, args) => {
+    const span = document.createElement('span');
+    if (cls) span.className = cls;
+    span.textContent = args.map(a => {
+      if (typeof a === 'string') return a;
+      try { return JSON.stringify(a, null, 2); } catch { return String(a); }
+    }).join(' ') + '\\n';
+    out.appendChild(span);
+  };
+  for (const k of ['log', 'info', 'warn', 'debug'])
+    console[k] = (...a) => show(k === 'warn' ? 'err' : '', a);
+  console.error = (...a) => show('err', a);
+  window.onerror = (msg, src, line) => { show('err', ['Error: ' + msg + ' (line ' + line + ')']); };
+  window.addEventListener('unhandledrejection', e => show('err', ['Unhandled rejection: ' + e.reason]));
+<\/script>
+<script>${safe}<\/script>`;
+}
 const artifactPanel = document.getElementById('artifact-panel');
 const artifactTitle = document.getElementById('artifact-title');
 const artifactBody = document.getElementById('artifact-body');
@@ -239,12 +275,13 @@ function openArtifact(btn) {
     const source = btn.parentElement.querySelector('code').textContent;
     const lang = btn.dataset.lang;
     artifactBody.innerHTML = '';
-    if (lang === 'html' || lang === 'svg') {
+    if (lang === 'html' || lang === 'svg' || lang === 'javascript' || lang === 'js') {
         const iframe = document.createElement('iframe');
         // scripts may run; the artifact stays cross-origin to the app
         // (no allow-same-origin), so it can't touch the chat page.
         iframe.setAttribute('sandbox', 'allow-scripts');
-        iframe.srcdoc = source;
+        iframe.srcdoc = (lang === 'javascript' || lang === 'js')
+            ? jsRunnerDoc(source) : source;
         artifactBody.appendChild(iframe);
     } else {
         const doc = document.createElement('div');
