@@ -148,7 +148,20 @@ def _sse(delta, model, done=False, reasoning=False):
     return out
 
 
+# Effort vocabulary across all backends; each backend validates/no-ops what
+# its runtime can't apply (claude has no knob at all). "ultra" is codex-only
+# (model/list: "maximum reasoning with automatic task delegation").
+EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+
+
 def _model_label():
+    """Model actually serving turns, per the backend — truthful even when a
+    pin was silently overridden (org policy) or resolved from a backend
+    default (codex config.toml)."""
+    if _backend is not None:
+        m = _backend.current_model()
+        if m:
+            return m
     return BACKEND_MODEL or f"{BACKEND_KIND}-default"
 
 
@@ -169,14 +182,31 @@ def health():
 @app.route("/v1/models")
 def models():
     owner = {"codex": "openai", "claude": "anthropic"}.get(BACKEND_KIND, "github-copilot")
-    return jsonify({
-        "object": "list",
-        "data": [{
+    # Real list when the backend can enumerate (copilot's models.list); the
+    # extra fields (price_category, name) are non-standard but OpenAI clients
+    # ignore unknown keys. Falls back to the single synthetic entry.
+    try:
+        entries = _get_backend().list_models()
+    except Exception as e:
+        _log(f"WARN: model listing failed: {e}")
+        entries = None
+    if entries:
+        data = [{
+            "id": m.get("id"),
+            "object": "model",
+            "owned_by": owner,
+            "name": m.get("name") or m.get("displayName"),
+            "price_category": m.get("modelPickerPriceCategory"),
+            "active": m.get("id") == _model_label(),
+        } for m in entries if m.get("id")]
+    else:
+        data = [{
             "id": f"{_model_label()}@{BACKEND_KIND}",
             "object": "model",
             "owned_by": owner,
-        }],
-    })
+            "active": True,
+        }]
+    return jsonify({"object": "list", "data": data})
 
 
 @app.route("/v1/cancel", methods=["POST"])
@@ -195,6 +225,7 @@ def chat_completions():
     messages = body.get("messages") or []
     stream = bool(body.get("stream"))
     req_reasoning = body.get("reasoning_effort")  # optional per-request override
+    req_model = body.get("model")                 # optional per-request model
 
     prompt_text, images = _latest_user_content(messages)
     if not prompt_text and not images:
@@ -206,6 +237,29 @@ def chat_completions():
     except Exception as e:
         _REQ_T0.pop(tid, None)
         return jsonify({"error": {"message": f"backend init failed: {e}"}}), 500
+
+    # Per-request model, OpenAI-style — BEFORE session handling, so a new
+    # chat's session is created with the right pin instead of created-then-
+    # switched. Accepts bare ids and the legacy "<id>@<backend>" form
+    # /v1/models used to expose; the synthetic "<backend>-default"
+    # placeholder means "leave as configured". Model and effort are
+    # session-scoped, not request-isolated: concurrent clients asking for
+    # different models take turns switching (last write wins).
+    if isinstance(req_model, str) and req_model:
+        want = req_model.split("@", 1)[0]
+        if want not in ("", f"{BACKEND_KIND}-default") \
+                and want != backend.current_model():
+            try:
+                backend.update_model(want)
+            except Exception as e:
+                _REQ_T0.pop(tid, None)
+                return jsonify({"error": {
+                    "message": f"model {want!r} is not available on the "
+                               f"{BACKEND_KIND} backend: {e}",
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                }}), 404
 
     # New chat from UI -> need a fresh session, unless the eager startup
     # session has not been used yet (in which case reuse it and avoid waste).
@@ -222,13 +276,13 @@ def chat_completions():
             _REQ_T0.pop(tid, None)
             return jsonify({"error": {"message": f"new_session failed: {e}"}}), 500
 
-    # Guard: forward only reasoning values known to round-trip cleanly on both
-    # backends. Copilot/gpt-5-mini rejects "none" ("Supported: minimal, low,
-    # medium, high"); xhigh/max are CLI-only. low/medium/high are safe for both.
-    if req_reasoning in ("low", "medium", "high"):
+    # Forward the full effort vocabulary; each backend validates or no-ops
+    # what its runtime can't apply (a model that rejects a level keeps the
+    # previous one and logs a WARN — see the backend implementations).
+    if req_reasoning in EFFORTS:
         backend.update_reasoning_effort(req_reasoning)
     elif req_reasoning:
-        _log(f"WARN: ignoring unsupported reasoning_effort={req_reasoning!r}")
+        _log(f"WARN: ignoring unknown reasoning_effort={req_reasoning!r}")
 
     img_note = f" images={len(images)}" if images else ""
     _log(f"prompt: session={backend.session_id}{img_note} text={prompt_text[:60]!r}")
@@ -276,18 +330,21 @@ def main():
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--backend", choices=["copilot", "codex", "claude"], default="copilot",
-                   help="Agent backend: copilot (free), codex (paid-cheap), or "
-                        "claude (premium, cold-start).")
+                   help="Agent backend: copilot (AI-credit metered, cheapest), "
+                        "codex (paid-cheap), or claude (premium, cold-start).")
     p.add_argument("--model", default=None,
-                   help="Model override. copilot: e.g. gpt-5-mini. "
+                   help="Model override. copilot: e.g. gpt-5.6-luna. "
                         "codex: e.g. gpt-5.6-luna (default: codex's own "
                         "configured model, i.e. the last TUI selection). "
                         "claude: e.g. claude-sonnet-4-6 (default).")
     p.add_argument("--reasoning-effort",
-                   choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                   choices=["none", "minimal", "low", "medium", "high", "xhigh",
+                            "max", "ultra"],
                    default=None,
-                   help="Reasoning effort override. Only low/medium/high are "
-                        "confirmed end-to-end on copilot.")
+                   help="Reasoning effort override. The gpt-5.6 models take "
+                        "none..max on copilot and none..ultra on codex; a "
+                        "model that rejects a level keeps its previous one "
+                        "(logged). No-op on claude.")
     args = p.parse_args()
     BACKEND_KIND = args.backend
     BACKEND_MODEL = args.model
@@ -298,8 +355,8 @@ def main():
     LOG_DIR.mkdir(exist_ok=True)
 
     # Idle heartbeat: pulses '...*...*...*' in place once a second, and drops a
-    # permanent quota snapshot into scrollback every 10 min (codex; copilot is
-    # unmetered so no snapshot, just the pulse). While a turn is in flight the
+    # permanent quota snapshot into scrollback every 10 min (codex: rate-limit
+    # %, copilot: AI-credit spend). While a turn is in flight the
     # same line becomes a news ticker scrolling the model's current output
     # line (reasoning summary or response), so long turns show visible work.
     set_status_provider(lambda: _backend.quota_status() if _backend else None)

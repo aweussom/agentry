@@ -16,3 +16,13 @@ Pinning a long system prompt in `.github/copilot-instructions.md` and reusing it
 - Every byte of instructions costs TTFB roughly linearly. Keep system prompts as small as possible.
 - If real prompt caching matters, route past Copilot to direct OpenAI/Anthropic APIs — but that loses the free-quota property from [[project-agentry-vs-azure-llm]].
 - Re-test if model changes (gpt-5, Claude via Copilot, etc.) — this finding is specific to gpt-5-mini + current Copilot backend.
+
+**SUPERSEDED for the 5.6 generation (retest 2026-08-13):** after GitHub's
+copilot-cli/SDK refactor, prompt caching **works** on `gpt-5.6-luna` via the
+SDK backend. Probe (3 turns, one session, repo cwd): turn 1 cacheWrite=4692
+cacheRead=0; turns 2-3 cacheRead≈4700, fresh input=3 tokens. Cache TTL 30 min
+(`cacheTtlSeconds: 1800` in `SessionUsageCheckpointData`). Under AI-credit
+billing this is a cost lever, not just latency: cache reads bill at 2
+credits/M vs 20/M fresh input on luna — cached turns cost ~10× less
+(measured: turn 1 = 0.118 credits, turns 2-3 = 0.011 each, exact figures in
+`AssistantUsageData.copilotUsage.totalNanoAiu`, 1e9 nanoAIU = 1 credit).

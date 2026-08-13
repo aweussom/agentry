@@ -43,6 +43,47 @@
       Default model `claude-sonnet-4-6`. Persistent mode (~1.3s/turn) deferred —
       see `archive/CLAUDE-PLAN.md` for why prompting can't cleanly fix its
       cross-turn leakage. `_bench/claude_probe.py`.
+- [x] OpenAI-like model handling (2026-08-13, after the GitHub AI-credits
+      billing switch made model choice a per-token cost decision):
+    - Per-request `model` honored on `/v1/chat/completions` (copilot switches
+      the live session via `session.set_model`; codex/claude pin the next
+      turn/spawn). Unknown copilot models get an OpenAI-style 404
+      `model_not_found`.
+    - Truthful reporting: backends expose `current_model()` (verified against
+      the runtime's `get_current`, resolves codex's config.toml default), so
+      response `model` fields, `X-Model`, and `/v1/models` no longer lie.
+      `/v1/models` lists the real account model set with price categories.
+    - Full reasoning-effort vocabulary forwarded (none..max); UI dropdown +
+      model picker expanded to match.
+    - AI-credit cost tracking: per-turn credits from `AssistantUsageData`
+      (`totalNanoAiu`, 1e9 = 1 credit) logged per turn; `quota_status()` shows
+      session spend + this machine's month total from
+      `~/.copilot/session-store.db` (agentry's SDK turns update that ledger
+      directly — no interactive copilot-cli needed).
+    - Copilot default model: gpt-5-mini → `gpt-5.6-luna` (cheapest band,
+      $0.20/M in; prompt caching verified working on 5.6 — turn 2+ bills
+      ~10× less; see `_bench/copilot_sdk_probe.py`, which replaces the
+      retired `--acp` bench.py).
+- [x] Codex backend refresh (2026-08-13, codex-cli 0.147.0 / app-server v2
+      era). Probed live (`_bench/codex_usage_probe.py`) + web research:
+    - **Reasoning streamed**: `item/reasoning/summaryTextDelta` now yielded
+      as ("reasoning", text) — the web UI thinking block works on codex.
+      Requires `config: {model_reasoning_summary: "detailed"}` on
+      thread/start (verified: without it, NO reasoning notifications fire
+      at any effort).
+    - **Usage/cost accounting**: per-turn tokens from
+      `thread/tokenUsage/updated` + a Codex-credits estimate from the
+      official rate card (April 2026 token-aligned scheme: sol 125/750,
+      terra 50/300, luna 5/30 credits per 1M in/out; ~$0.04/credit) logged
+      per turn and summed per session. Plus-plan quota is currently
+      weekly-window only (5h bucket suspended July 2026); credits balance
+      and banked rate-limit resets surface in `account/rateLimits/read`.
+    - **model/list wired in**: `/v1/models` lists codex's real models,
+      update_model validates against it (404 on unknown ids). New effort
+      levels max/ultra + "fast" service tiers exist; ultra added to the
+      effort vocabulary.
+    - **Spawn fix**: npm ships codex only as .cmd/.ps1 shims now —
+      resolve via shutil.which() or Popen dies with WinError 2.
 - [x] Linux / WSL2 launcher (`start.sh`) + `.gitattributes` for LF.
 - [x] README with persistent-wrapper pitch, Windows + Linux quick start,
       architecture overview, and known limits.
@@ -129,6 +170,21 @@ would prefer them already has paid tooling.
 
 ## Polish (lower priority)
 
+- [ ] (claude, LOW priority — claude-code stays a second-tier client until a
+      better integration exists) Proper quota/cost for the claude backend by
+      borrowing from `C:\devel\aweussom\python\claude-code-quota`
+      (github.com/aweussom/claude-code-quota). Today agentry only *passively*
+      reads that tool's `~/.claude/quota-data.json` cache, so the 5h/weekly
+      numbers go stale unless an interactive claude-code session elsewhere
+      keeps refreshing them (headless `claude -p` doesn't tick the status
+      line). The fetch itself lives in the repo's `quota-lib.ps1` /
+      `quota-lib.sh`: OAuth-token quota read + cache write with TTL (60s
+      active / 5min idle), non-blocking background refresh, and stale/error
+      marking. Port that refresh logic into `ClaudeCodeBackend.quota_status()`
+      (Python, direct — not shelling out to the ps1/sh) so agentry keeps its
+      own cache fresh; keep reading the shared cache file so the statusline
+      and agentry don't double-fetch.
+
 - [ ] Chat persistence in the web UI (from the OpenWebUI comparison,
       2026-07-24): F5 currently destroys the conversation. localStorage
       only — persist `chatHistory` client-side, restore on load. No
@@ -136,18 +192,31 @@ would prefer them already has paid tooling.
 - [ ] Stop + regenerate buttons in the web UI. Esc-to-cancel exists but
       is undiscoverable; add a visible stop during generation and a
       regenerate on the last assistant message (resend same user text).
-- [ ] Surface usage stats (premiumRequests, api_ms, tokens) in the UI's
-      per-turn meta line, not just in the launcher console. Got cheaper
-      with the SDK: it emits per-turn `AssistantUsageData` events that
-      the copilot backend currently discards in `_on_event`.
-- [ ] Add a model dropdown to the web UI. Was launch-fixed in the ACP
-      era; the SDK made it easy — `client.list_models()` supplies the
-      dropdown, `session.set_model()` switches mid-session with history
-      preserved (already used for reasoning-effort changes).
-- [ ] Probe whether `xhigh` / `max` reasoning levels work on the SDK
-      backend. `create_session`/`set_model` type them as
-      low/medium/high/xhigh; `max` is likely rejected, `xhigh` untested
-      on the free-tier models.
+- [ ] Surface usage stats in the UI's per-turn meta line, not just the
+      launcher console. The copilot backend now accumulates per-turn AI
+      credits (2026-08-13) — remaining work is riding the figure into the
+      SSE stream (e.g. an extension field on the final chunk) and the UI
+      meta line. codex equivalent: token counts from turn/completed.
+- [x] ~~Add a model dropdown to the web UI~~ — done 2026-08-13, see the
+      OpenAI-like model handling entry under Done.
+- [ ] Probe whether `xhigh` / `max` reasoning levels work END-TO-END on
+      the copilot SDK backend. models.list now advertises none..max on the
+      gpt-5.6 models and the HTTP layer forwards them (2026-08-13), but a
+      rejected level only logs a WARN and keeps the previous one — verify
+      each level actually applies (get_current after set_model) before
+      trusting bench numbers taken at xhigh/max.
+- [x] ~~(codex) Yield reasoning deltas from the codex backend~~ — done
+      2026-08-13, see the codex refresh entry under Done. Gotcha discovered:
+      codex emits NO reasoning notifications unless thread/start passes
+      `config: {model_reasoning_summary: ...}`.
+- [ ] (codex) Switch to per-thread server-truth cost when codex-cli ships
+      the `account/usage/read {threadId}` variant (documented in codex-rs
+      main as returning estimated credits/cost per thread; 0.147.0 rejects
+      params with "expected unit"). Replaces the local `_CREDITS_PER_MTOK`
+      rate-card estimate, which silently drifts when OpenAI reprices.
+- [ ] (codex) Consider `ephemeral: true` on thread/start so agentry's relay
+      threads stop accumulating in codex's thread history / TUI resume list
+      (ThreadStartParams supports it since ~0.147).
 - [ ] Consider selective tool permissions instead of blanket `-32601`
       deny. Currently every agent->client request is rejected, so any
       prompt that genuinely needs a tool fails rather than degrading.

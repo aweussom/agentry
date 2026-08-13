@@ -17,12 +17,13 @@ usage() {
 Usage: ./start.sh [options]
   --port N                HTTP port (default: ${PORT})
   --backend NAME          copilot | codex | claude (default: ${BACKEND})
-  --model NAME            Model override (copilot default: gpt-5-mini;
+  --model NAME            Model override (copilot default: gpt-5.6-luna;
                           codex default: whatever codex itself is
                           configured for (last TUI selection);
                           claude default: claude-sonnet-4-6)
-  --reasoning-effort X    low | medium | high (default: ${REASONING_EFFORT};
-                          no-op on claude — it has no effort knob)
+  --reasoning-effort X    none|minimal|low|medium|high|xhigh|max|ultra
+                          (default: ${REASONING_EFFORT}; what applies is
+                          per model; no-op on claude — it has no effort knob)
   -h, --help              Show this help
 
 Examples:
@@ -47,9 +48,10 @@ done
 
 cd "$(dirname "$(readlink -f "$0")")"
 
-# Backend defaults: copilot pins gpt-5-mini (benchmarked); codex follows its
-# own configured model (last selected in the codex TUI) unless overridden.
-if [[ -z "$MODEL" && "$BACKEND" == "copilot" ]]; then MODEL="gpt-5-mini"; fi
+# Backend defaults: copilot pins gpt-5.6-luna — cheapest current AI-credit
+# tier ($0.20/M input, ~10x below terra), benchmarked 2026-08; codex follows
+# its own configured model (last selected in the codex TUI) unless overridden.
+if [[ -z "$MODEL" && "$BACKEND" == "copilot" ]]; then MODEL="gpt-5.6-luna"; fi
 
 if [[ ! -x venv/bin/python ]]; then
     echo "Creating venv..."

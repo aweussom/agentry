@@ -131,7 +131,7 @@ class Codex:
         i = self.nid; self.nid += 1; self.pending[i] = queue.Queue(maxsize=1)
         self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "turn/start",
             "params": {"threadId": tid, "input": [{"type": "text", "text": prompt}],
-                       "model": "gpt-5.4-mini", "effort": effort}}) + "\n")
+                       "model": "gpt-5.6-luna", "effort": effort}}) + "\n")
         self.proc.stdin.flush()
         text = []
         item_types = {}

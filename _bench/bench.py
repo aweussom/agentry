@@ -1,4 +1,9 @@
-"""Minimal ACP bench: drive `copilot --acp` directly to measure TTFB and total
+"""RETIRED (2026-08-13): drives the old `copilot --acp` client, which agentry
+replaced with the official github-copilot-sdk. Kept for the 2026-05 result
+history only — use _bench/copilot_sdk_probe.py for current numbers (SDK
+transport, models.list credit table, cache verification, per-turn credits).
+
+Minimal ACP bench: drive `copilot --acp` directly to measure TTFB and total
 time per turn for a given cwd (which determines the .github/copilot-instructions.md
 the agent loads at session/new).
 

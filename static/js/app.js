@@ -92,8 +92,15 @@ async function loadModels() {
             opt.value = m.id;
             const parts = m.id.split('@');
             const name = parts[0];
-            const device = parts[1] || (m.owned_by || '').replace('local-', '').toUpperCase();
-            opt.textContent = device ? `${name} (${device})` : name;
+            // Real backend listings carry a price band (low/medium/high cost)
+            // — more useful in the picker than the backend tag.
+            if (m.price_category) {
+                opt.textContent = `${name} · ${m.price_category}`;
+            } else {
+                const device = parts[1] || (m.owned_by || '').replace('local-', '').toUpperCase();
+                opt.textContent = device ? `${name} (${device})` : name;
+            }
+            if (m.active) opt.selected = true;
             modelSelect.appendChild(opt);
         }
     } catch {}

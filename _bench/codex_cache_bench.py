@@ -83,7 +83,7 @@ class Codex:
         self.pending[i] = queue.Queue(maxsize=1)
         self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "turn/start",
             "params": {"threadId": tid, "input": [{"type": "text", "text": "Reply with exactly: OK"}],
-                       "model": "gpt-5.4-mini", "effort": "low"}}) + "\n")
+                       "model": "gpt-5.6-luna", "effort": "low"}}) + "\n")
         self.proc.stdin.flush()
         t0 = time.monotonic()
         ttfb = None

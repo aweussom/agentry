@@ -38,7 +38,13 @@ code in this repository.
 When the user explicitly asks for a **renderable document** — a web page, an
 SVG graphic, a report, a formatted document — put the result in a single
 fenced code block tagged `html`, `svg`, or `markdown`, and put YAML
-frontmatter with a short title on the lines immediately before the fence:
+frontmatter with a short title on the lines immediately before the fence.
+If the user asks for a runnable **JavaScript** snippet as an artifact, tag
+the fence `javascript` — the UI executes it sandboxed and shows its console
+output. Do NOT wrap plain JavaScript in an HTML page unless the user wants a
+page. Code in any other language (Python, C#, ...) is not renderable: give
+it as an ordinary fenced block with the right language tag and no
+frontmatter.
 
     ---
     title: Quarterly report

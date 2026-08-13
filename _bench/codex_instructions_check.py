@@ -56,7 +56,7 @@ class Raw:
         i = self.nid; self.nid += 1
         q = queue.Queue(maxsize=1); self.pending[i] = q
         p = {"threadId": thread_id, "input": [{"type": "text", "text": text}],
-             "model": "gpt-5.4-mini", "effort": "low"}
+             "model": "gpt-5.6-luna", "effort": "low"}
         self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "turn/start", "params": p}) + "\n")
         self.proc.stdin.flush()
         full = []

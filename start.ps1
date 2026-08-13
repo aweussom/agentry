@@ -13,16 +13,17 @@ param(
     [ValidateSet("copilot","codex","claude")]
     [string]$Backend = "copilot",
     [string]$Model = "",
-    [ValidateSet("none","minimal","low","medium","high","xhigh","max","")]
+    [ValidateSet("none","minimal","low","medium","high","xhigh","max","ultra","")]
     [string]$ReasoningEffort = "low"
 )
 
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
-# Backend defaults: copilot pins gpt-5-mini (benchmarked); codex follows its
-# own configured model (last selected in the codex TUI) unless overridden.
-if (-not $Model -and $Backend -eq "copilot") { $Model = "gpt-5-mini" }
+# Backend defaults: copilot pins gpt-5.6-luna — cheapest current AI-credit
+# tier ($0.20/M input, ~10x below terra), benchmarked 2026-08; codex follows
+# its own configured model (last selected in the codex TUI) unless overridden.
+if (-not $Model -and $Backend -eq "copilot") { $Model = "gpt-5.6-luna" }
 
 # github-copilot-sdk needs Python 3.11+. A venv left over from an older
 # interpreter silently skips the SDK, so validate the venv's version on every

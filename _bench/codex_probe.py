@@ -179,9 +179,9 @@ def median(xs):
 def main():
     label = sys.argv[1] if len(sys.argv) > 1 else "codex"
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-    # gpt-5.4-mini @ low is the chosen default backend config: fastest stable
-    # TTFB (~6.5s median) and lowest variance. Pass "" to let codex auto-route.
-    model = sys.argv[3] if len(sys.argv) > 3 else "gpt-5.4-mini"
+    # gpt-5.6-luna @ low is codex's own migration target for the deprecated
+    # gpt-5.4-mini (probed 2026-07: median TTFB 6.2s). Pass "" to auto-route.
+    model = sys.argv[3] if len(sys.argv) > 3 else "gpt-5.6-luna"
     effort = sys.argv[4] if len(sys.argv) > 4 else "low"
     user_prompt = "Reply with exactly: OK"
 

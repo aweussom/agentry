@@ -5,8 +5,8 @@
 
 Agentry wraps a coding-agent CLI — GitHub Copilot, OpenAI Codex, or Claude Code —
 and serves the model behind it as a plain OpenAI-compatible HTTP API on localhost.
-Your scripts, apps, and pipelines talk to `gpt-5-mini` or `claude-sonnet` through the
-subscription you're already logged into — no per-token API bill, no `-p` spawn tax.
+Your scripts, apps, and pipelines talk to `gpt-5.6-luna` or `claude-sonnet` through the
+subscription you're already logged into — no separate API bill, no `-p` spawn tax.
 
 [![A manic developer in a Norwegian sweater smashing an acoustic guitar into a laptop, keyboard keys flying out of the soundhole. The whiteboard reads "DAGENS PLAN: 1. Fikse litt på søk ✓ 2. Legge til AI ✓ 3. En liten proxy ✓ 4. ??? 5. Profit (kanskje)"](./images/dev-to-article-header.png)](https://dev.to/tommy_leonhardsen_81d1f4e/i-built-an-openai-compatible-proxy-for-github-copilot-because-search-was-too-stupid-to-understand-31de)
 
@@ -19,7 +19,7 @@ README is the boring documentation, which sysadmins know to love.
 It holds one coding-agent CLI subprocess persistent across requests, drives it
 over JSON-RPC 2.0 (stdio), and exposes the result as an OpenAI-compatible HTTP
 API on localhost. Per-turn latency drops from ~8 s in `-p` mode to roughly the
-model's own `api_ms` floor (~2–3 s for short replies with `gpt-5-mini` at
+model's own `api_ms` floor (~1.5 s for short replies with `gpt-5.6-luna` at
 `low` reasoning effort).
 
 A minimal chat **web UI** ships with the proxy. It is not the point of the
@@ -28,14 +28,23 @@ prints a clickable URL (`http://localhost:8765` by default) on startup.
 
 ![Bundled chat UI talking to the proxy as a regular OpenAI endpoint: markdown answer with a copy button on the code block, a collapsible thinking block above it, a per-turn backend + latency tag, image attach, and a header showing the active model and reasoning effort](./images/web-ui.png)
 
+> **Intended use:** a personal, localhost-only adapter. Each backend stays
+> authenticated through its own official client/interface and remains subject
+> to that provider's terms — agentry adds no access path, credentials, or
+> multi-user service on top. Don't expose it publicly.
+
 Wraps three interchangeable backends, selected with `--backend`:
 
 - **`copilot`** (default) — GitHub Copilot via the official
-  [Copilot SDK](https://github.com/github/copilot-sdk). The free
-  tier; `gpt-5-mini` at `low`/`high` reasoning.
+  [Copilot SDK](https://github.com/github/copilot-sdk). The cheapest tier —
+  billed in Copilot AI credits per token; default `gpt-5.6-luna`
+  (lightweight price band, $0.20/M input) at `low` reasoning.
 - **`codex`** — OpenAI Codex (`codex app-server`). The paid-but-cheap tier
   (ChatGPT Go $8 / Plus $20); runs whatever model codex itself is configured
-  for (see note under Configuration) at `low` effort.
+  for (see note under Configuration) at `low` effort. Metered in **Codex
+  credits** since April 2026 (token-aligned, per-model: `gpt-5.6-luna` is
+  25× cheaper per token than `gpt-5.6-sol`) against 5h/weekly windows —
+  the 5h window is suspended for paid plans since July 2026.
 - **`claude`** — Anthropic Claude Code (`claude -p`). The premium tier;
   default `claude-sonnet-4-6`.
 
@@ -130,7 +139,7 @@ The launcher must be run from the same logon session as your interactive
 
 ```powershell
 cd C:\devel\aweussom\python\agentry
-.\start.ps1                                          # copilot, gpt-5-mini, reasoning=low
+.\start.ps1                                          # copilot, gpt-5.6-luna, reasoning=low
 .\start.ps1 -Backend codex                           # codex, model from codex config, effort=low
 .\start.ps1 -Backend claude                          # claude, claude-sonnet-4-6 (cold-start)
 .\start.ps1 -Port 9000
@@ -149,7 +158,7 @@ copilot login
 
 cd ~/path/to/agentry
 chmod +x start.sh                                    # first checkout only
-./start.sh                                           # copilot, gpt-5-mini, reasoning=low
+./start.sh                                           # copilot, gpt-5.6-luna, reasoning=low
 ./start.sh --backend codex                           # codex, model from codex config, effort=low
 ./start.sh --backend claude                          # claude, claude-sonnet-4-6 (cold-start)
 ./start.sh --port 9000
@@ -166,10 +175,13 @@ Launcher params:
 - `-Port` — HTTP port (default `8765`).
 - `-Backend` — `copilot` (default), `codex`, or `claude`.
 - `-Model` — model override.
-    - `copilot`: set as the SDK session's model. Free tier: `gpt-5-mini`
-      (default), `gpt-4.1`, `claude-haiku-4.5`. Paid tiers add more
-      (larger Claude and GPT-5.x models — the set tracks Copilot's plans,
-      so check your plan's model picker rather than this README).
+    - `copilot`: set as the SDK session's model. Default `gpt-5.6-luna`.
+      Since June 2026 Copilot bills all models in **AI credits per token**
+      (1 credit = $0.01), so the model choice sets your burn rate: the
+      lightweight band (`gpt-5.6-luna` $0.20/M input / $1.20/M output) is
+      ~10× cheaper than `gpt-5.6-terra` and ~25× cheaper than `gpt-5.6-sol`.
+      The available set tracks Copilot's plans — check your plan's model
+      picker rather than this README.
     - `codex`: passed on `turn/start`. No default — when unset, agentry
       omits the override and each thread runs on codex's own configured
       model (`~/.codex/config.toml`).
@@ -184,15 +196,36 @@ Launcher params:
       > `codex thread: ... (default model=...)` line shows what each thread
       > actually resolved to.
     - `claude`: passed to `claude --model`. Default `claude-sonnet-4-6`.
-- `-ReasoningEffort` — `low`, `medium`, `high` are confirmed end-to-end on
-  copilot and codex. On `copilot` it is a session parameter (live changes go
-  through the SDK's model-switch call); on `codex` it is a `turn/start` param.
-  The SDK accepts `low`/`medium`/`high`/`xhigh`; other edge values (`none`,
-  `max`, `minimal`) are not reachable on copilot.
+- `-ReasoningEffort` — `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`.
+  What actually applies is per model: the gpt-5.6 copilot models advertise
+  `none`→`max` (models.list), codex takes `none`→`xhigh`, and a model that
+  rejects a level keeps its previous one (logged as a WARN, not an error).
+  On `copilot` it is a session parameter (live changes go through the SDK's
+  model-switch call); on `codex` it is a `turn/start` param.
   **No-op on `claude`** — claude-code (`-p`) exposes no reasoning-effort knob.
 
-The web UI has a per-request reasoning-effort dropdown that overrides the
-launcher default at runtime.
+### Per-request model and effort (OpenAI-style)
+
+The launcher values are only *defaults*. Like a normal OpenAI endpoint,
+`/v1/chat/completions` honors the request body per call:
+
+- `"model"` — switches the backend (copilot: live `session.model/switchTo`
+  with conversation history preserved; codex/claude: applies from the next
+  turn/spawn). Ids are validated against the account's model list (copilot
+  `models.list`, codex `model/list`); an unknown id returns an OpenAI-style
+  `404 model_not_found` instead of silently running on a fallback. `/v1/models` returns the real
+  model list (with an `active` flag and AI-credit `price_category`), and
+  response `model` fields report what the runtime *actually* ran — a pin
+  silently overridden by org policy shows up as the override, not the wish.
+- `"reasoning_effort"` — same vocabulary as `-ReasoningEffort` above.
+
+One caveat: model/effort are **session-scoped, not request-isolated**.
+Concurrent clients that ask for different models take turns switching the
+shared session (last write wins) — pin one model per agentry instance if you
+need strict isolation.
+
+The web UI exposes both: a model picker fed by `/v1/models` (labeled with
+each model's price band) and the full reasoning-effort dropdown.
 
 ### Console
 
@@ -203,26 +236,37 @@ line — the streamed reasoning summary while it thinks, then the response as it
 writes — restarting whenever the model moves to a new line. Long high-effort
 turns show visible work instead of a silent console. On the `codex` backend it also drops
 a permanent quota line into scrollback when going idle and every ~10 min after —
-e.g. `codex go quota | weekly 22% left (resets 06 Jun 10:51)` — and appends the
-remaining quota to each turn's completion line. The figure is primed at startup
-(`account/rateLimits/read`) and kept fresh by the rate-limit snapshots codex
-pushes per turn, so there are no extra API calls during normal use. (Output
-redirected to a file suppresses the heartbeat; the permanent quota lines still
-appear.)
+e.g. `codex plus quota | weekly 99% left (resets 20 Aug 17:04)` (plus a
+pay-as-you-go credits balance when the account has one) — and appends each
+turn's exact token usage and rate-card cost estimate to its completion line:
+`tokens in=12677 (cached 9984) out=6  ~0.019 credits (session ~0.019)`.
+The quota figure is primed at startup (`account/rateLimits/read`) and kept
+fresh by the rate-limit snapshots codex pushes per turn; token counts come
+from `thread/tokenUsage/updated` — no extra API calls during normal use.
+(Output redirected to a file suppresses the heartbeat; the permanent quota
+lines still appear.)
 
-#### copilot quota
+#### copilot quota (AI credits)
 
-The `copilot` backend shows no quota line. An earlier opt-in feature metered
-monthly **premium-request** billing via a GitHub PAT and the user billing API,
-but it was removed: base models like `gpt-5-mini` never consume premium
-requests (the readout was a permanent `0/N`), the footer's live rolling-window
-rate limit isn't exposed by any public API, and org/enterprise-managed (SSO)
-accounts return HTTP 400/403 from user-level billing altogether. The startup
-ready-line does print the authenticated login (`user=...`, via the SDK's
-`auth.getStatus`) so you can always see which account is serving requests.
-If a real meter is ever wanted, the SDK's per-turn `assistant.usage` events
-carry quota snapshots (entitlement/used/remaining %) for the logged-in account
-— internal SDK fields today, but the right source when they stabilize.
+Since June 2026 Copilot bills **AI credits per token** (1 credit = $0.01,
+priced per model), and the `copilot` backend meters that live:
+
+- every turn's completion logs its exact cost — `turn cost 0.011 credits
+  (session total 1.455)` — from the SDK's per-turn `AssistantUsageData`
+  events (`copilotUsage.totalNanoAiu`, 10⁹ nanoAIU = 1 credit);
+- the periodic idle snapshot adds this machine's calendar-month total, read
+  from the Copilot runtime's own ledger (`~/.copilot/session-store.db`,
+  which agentry's SDK sessions update directly — no interactive copilot-cli
+  needed): `session 1.46 AIC · machine 36 AIC this month`.
+
+The **account-wide plan meter** (the `1,234/5,000`-style readout) counts every
+device and surface and is not exposed by any public API, so the machine
+figure is a floor, not the plan readout. (An earlier opt-in feature metered
+the pre-June-2026 premium-request billing via a GitHub PAT; it was removed
+because base models then read a permanent `0/N` and SSO accounts returned
+HTTP 400/403 from user-level billing.) The startup ready-line prints the
+authenticated login (`user=...`) so you can always see which account is
+serving — and paying for — requests.
 
 #### claude quota
 
