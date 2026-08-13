@@ -71,12 +71,24 @@ class Backend(abc.ABC):
     auth_login: Optional[str] = None
 
     @abc.abstractmethod
-    def new_session(self, cwd: Optional[str] = None) -> str:
-        """Start a fresh conversation; returns its id."""
+    def new_session(self, cwd: Optional[str] = None,
+                    model: Optional[str] = None,
+                    effort: Optional[str] = None) -> str:
+        """Start a fresh conversation; returns its id. model/effort seed the
+        session where the runtime scopes them per session (copilot); backends
+        whose runtime scopes them per turn ignore them here."""
 
     @abc.abstractmethod
-    def prompt(self, text: str, images=None, timeout: int = 180) -> Iterator[str]:
+    def prompt(self, text: str, images=None, timeout: int = 180,
+               model: Optional[str] = None,
+               effort: Optional[str] = None) -> Iterator[str]:
         """Generator yielding assistant text deltas for one turn.
+
+        model/effort are this turn's selection; None means the backend's
+        launcher default. They are request fields, OpenAI-style — never
+        mutable server state: the backend applies them inside its turn lock,
+        so concurrent requests with different selections cannot run on each
+        other's model.
 
         images: optional list of (mime_type, base64_data) tuples to attach to
         the user turn. Backends that can't forward them must drop them loudly
@@ -90,20 +102,11 @@ class Backend(abc.ABC):
     def cancel(self) -> bool:
         """Cancel the in-flight turn, if any. Returns whether a cancel was sent."""
 
-    @abc.abstractmethod
-    def update_reasoning_effort(self, value: str) -> bool:
-        """Set reasoning effort; returns True if the value actually changed."""
-
     def current_model(self) -> Optional[str]:
-        """Model actually serving turns right now, when knowable. Falls back
-        to the configured pin; None means unknown (the HTTP layer then labels
-        responses '<backend>-default')."""
-        return getattr(self, "model", None)
-
-    def update_model(self, value: str) -> bool:
-        """Switch the model for subsequent turns; returns True if it changed.
-        Raises BackendError when the backend/runtime rejects the model."""
-        raise BackendError("per-request model switching not supported on this backend")
+        """Model a request that omits `model` runs on, when knowable: the
+        launcher default, refined by runtime truth where the backend has it.
+        None means unknown (the HTTP layer then labels '<backend>-default')."""
+        return getattr(self, "default_model", None)
 
     def list_models(self):
         """Available models as a list of dicts (at minimum {'id': ...}), or
@@ -178,14 +181,17 @@ class CopilotSDKBackend(Backend):
         self._Reject = PermissionDecisionReject
         self._ModelsListRequest = ModelsListRequest
 
-        self.model = model
+        # Launcher defaults — immutable after construction. Per-request
+        # selection never lands here; it rides through prompt(model=, effort=).
+        self.default_model = model
+        self.default_effort = reasoning_effort
         self._current_model = None        # what the runtime says is active (get_current)
+        self._current_effort = None       # effort the live session was last set to
         self._models_cache = None         # models.list result, fetched once on demand
         # AI-credit accounting from per-turn AssistantUsageData events
         # (copilotUsage.totalNanoAiu; 1e9 nanoAIU = 1 credit = $0.01).
         self._turn_credits = 0.0          # accumulates across a turn's model calls
         self._session_credits = 0.0       # running total since client start
-        self.reasoning_effort = reasoning_effort
         self._cwd = cwd or os.path.dirname(os.path.abspath(__file__))
         self._session = None
         self.session_id = None
@@ -309,7 +315,15 @@ class CopilotSDKBackend(Backend):
         # wait itself so the silence doesn't read as a hang.
         return f"thinking · {int(time.monotonic() - self._turn_t0)}s"
 
-    def new_session(self, cwd=None):
+    def new_session(self, cwd=None, model=None, effort=None):
+        # Under the turn lock: replacing the session DISCONNECTS the old one,
+        # which would kill a concurrent in-flight turn mid-stream (seen live
+        # 2026-08-13: two parallel new-chat requests, the second's new_session
+        # orphaned the first's turn). Swap only between turns.
+        with self.turn_lock:
+            return self._new_session_locked(cwd, model, effort)
+
+    def _new_session_locked(self, cwd, model, effort):
         old, self._session = self._session, None
         if old is not None:
             try:
@@ -326,10 +340,12 @@ class CopilotSDKBackend(Backend):
             # stretches (and act as inactivity-timeout keepalives).
             "reasoning_summary": "concise",
         }
-        if self.model:
-            kwargs["model"] = self.model
-        if self.reasoning_effort:
-            kwargs["reasoning_effort"] = self.reasoning_effort
+        pin = model or self.default_model
+        eff = effort or self.default_effort
+        if pin:
+            kwargs["model"] = pin
+        if eff:
+            kwargs["reasoning_effort"] = eff
         try:
             session = self._call(self._client.create_session(**kwargs), timeout=120)
         except BackendError as e:
@@ -346,17 +362,18 @@ class CopilotSDKBackend(Backend):
         self._session = session
         self.session_id = session.session_id
         self.session_fresh = True
+        self._current_effort = eff
         _log(f"SDK session: {self.session_id}"
-             + (f" (reasoning_effort={self.reasoning_effort})" if self.reasoning_effort else ""))
+             + (f" (reasoning_effort={eff})" if eff else ""))
         # Org model policy (e.g. a Business plan restricted to "Auto") does not
         # fail a pinned create_session — it silently overrides the pin. Always
         # ask the runtime what it actually selected: current_model() must be
-        # truthful (responses and /v1/models report it), so shout on mismatch.
+        # truthful (/health and /v1/models report it), so shout on mismatch.
         try:
             current = self._call(session.rpc.model.get_current(), timeout=15)
-            self._current_model = current.model_id or self.model
-            if self.model and current.model_id and current.model_id != self.model:
-                _log(f"WARN: requested model {self.model!r} but session runs "
+            self._current_model = current.model_id or pin
+            if pin and current.model_id and current.model_id != pin:
+                _log(f"WARN: requested model {pin!r} but session runs "
                      f"{current.model_id!r} — likely an org model-policy override")
         except BackendError as e:
             self._current_model = None
@@ -364,44 +381,33 @@ class CopilotSDKBackend(Backend):
         return self.session_id
 
     def current_model(self):
-        return self._current_model or self.model
+        return self._current_model or self.default_model
 
-    def update_model(self, value):
-        """Switch the live session's model (session.model/switchTo) and pin it
-        for future sessions. Returns True if it changed; raises BackendError
-        when the runtime rejects the model id."""
-        if value == self.current_model():
-            self.model = value
-            return False
-        # Validate against models.list BEFORE switching: session.model/switchTo
-        # accepts arbitrary ids without error — get_current even parrots them
-        # back — while the turn silently runs on a fallback model (verified
-        # 2026-08-13 with a bogus id). Only create_session hard-rejects.
-        try:
-            known = {m.get("id") for m in self.list_models()}
-        except BackendError as e:
-            known = None
-            _log(f"WARN: cannot validate model {value!r} (models.list failed: {e})")
-        if known is not None and value not in known:
-            raise BackendError(
-                f"model {value!r} is not in this account's models.list")
-        self.model = value
-        if not self._session:
-            return True     # applies when the next session is created
-        kw = {"reasoning_effort": self.reasoning_effort} if self.reasoning_effort else {}
-        self._call(self._session.set_model(value, **kw), timeout=30)
-        # switchTo doesn't error on a policy override either — verify.
-        actual = value
+    def _apply_selection(self, model_id, effort):
+        """Converge the live session onto (model_id, effort) via
+        session.model/switchTo. Called only inside the turn lock, so selection
+        and turn are atomic — the runtime scopes model/effort per session,
+        agentry's API scopes them per request; this is the impedance match.
+
+        switchTo accepts arbitrary ids without error — get_current even
+        parrots them back — while the turn silently runs on a fallback model
+        (verified 2026-08-13 with a bogus id), so ids must be validated
+        against models.list upstream (the HTTP layer does). get_current still
+        catches org-policy overrides of valid ids."""
+        kw = {"reasoning_effort": effort} if effort else {}
+        self._call(self._session.set_model(model_id, **kw), timeout=30)
+        actual = model_id
         try:
             current = self._call(self._session.rpc.model.get_current(), timeout=15)
-            actual = current.model_id or value
+            actual = current.model_id or model_id
         except BackendError as e:
             _log(f"WARN: could not verify model switch: {e}")
-        if actual != value:
-            _log(f"WARN: requested model {value!r} but session runs {actual!r}")
+        if actual != model_id:
+            _log(f"WARN: requested model {model_id!r} but session runs {actual!r}")
         self._current_model = actual
-        _log(f"SDK model -> {actual}")
-        return True
+        if effort:
+            self._current_effort = effort
+        _log(f"SDK model -> {actual}" + (f" @ {effort}" if effort else ""))
 
     def list_models(self):
         """Models available to this account from the runtime's models.list,
@@ -442,34 +448,15 @@ class CopilotSDKBackend(Backend):
             pass    # ledger missing/locked/schema drift -> just omit
         return " · ".join(parts) or None
 
-    def update_reasoning_effort(self, value):
-        """Idempotent: applies to the live session via model/switchTo only on
-        change. Updates the stored intent so future sessions also start at
-        this value."""
-        if value == self.reasoning_effort:
-            return False
-        self.reasoning_effort = value
-        if self._session:
-            try:
-                # switchTo needs a model id; ask the runtime which one is
-                # active rather than trusting our (possibly unset) default.
-                current = self._call(self._session.rpc.model.get_current(), timeout=15)
-                model_id = current.model_id or self.model
-                if not model_id:
-                    _log("WARN: active model unknown; reasoning effort applies from next session")
-                    return False
-                self._call(self._session.set_model(model_id, reasoning_effort=value), timeout=15)
-                _log(f"SDK reasoning_effort -> {value}")
-                return True
-            except BackendError as e:
-                _log(f"WARN: update reasoning_effort failed: {e}")
-        return False
-
     _IMAGE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
                   "image/gif": ".gif", "application/pdf": ".pdf"}
 
-    def prompt(self, text, images=None, timeout=900):
+    def prompt(self, text, images=None, timeout=900, model=None, effort=None):
         """Generator yielding text deltas for one turn. Requires an active session.
+
+        model/effort: this turn's selection. The Copilot runtime scopes both
+        per SESSION, so the session is switched under the turn lock when they
+        differ from its current state — selection and turn are atomic.
 
         Images ride as SDK *file* attachments via temp files: that is the
         runtime's native vision path. Blob attachments are accepted by the
@@ -493,45 +480,61 @@ class CopilotSDKBackend(Backend):
                 tmp_paths.append(f.name)
             attachments.append({"type": "file", "path": tmp_paths[-1],
                                 "displayName": f"image-{i}{ext}"})
-        with self.turn_lock:
-            q = queue.Queue()
-            self._ticker_buf = ""
-            self._ticker_kind = None
-            self._turn_t0 = time.monotonic()
-            self._turn_credits = 0.0
-            self.active_turn_queue = q
-            try:
-                self._call(self._session.send(text, attachments=attachments or None),
-                           timeout=30)
-                self.session_fresh = False
-                while True:
-                    try:
-                        kind, payload = q.get(timeout=timeout)
-                    except queue.Empty:
-                        self.cancel()   # stop the server-side turn we're abandoning
-                        yield f"\n[copilot timeout after {timeout}s]"
-                        return
-                    if kind == "delta":
-                        yield payload
-                    elif kind == "reasoning":
-                        yield ("reasoning", payload)
-                    elif kind == "keepalive":
-                        continue    # activity tick; resets the q.get() window
-                    elif kind == "error":
-                        yield f"\n[copilot error] {payload}"
-                        return
-                    elif kind == "idle":
-                        if self._turn_credits:
-                            _log(f"turn cost {self._turn_credits:.3f} credits"
-                                 f"  (session total {self._session_credits:.3f})")
-                        return
-            finally:
-                self.active_turn_queue = None
-                for p in tmp_paths:       # turn is over; the runtime has read them
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
+        try:
+            with self.turn_lock:
+                want_model = model or self.default_model
+                want_effort = effort or self.default_effort
+                if ((want_model and want_model != self._current_model)
+                        or (want_effort and want_effort != self._current_effort)):
+                    target = want_model or self._current_model
+                    if target:
+                        try:
+                            self._apply_selection(target, want_effort)
+                        except BackendError as e:
+                            yield f"\n[copilot error] model/effort switch failed: {e}"
+                            return
+                    else:
+                        _log("WARN: effort requested but active model unknown; "
+                             "keeping session defaults")
+                q = queue.Queue()
+                self._ticker_buf = ""
+                self._ticker_kind = None
+                self._turn_t0 = time.monotonic()
+                self._turn_credits = 0.0
+                self.active_turn_queue = q
+                try:
+                    self._call(self._session.send(text, attachments=attachments or None),
+                               timeout=30)
+                    self.session_fresh = False
+                    while True:
+                        try:
+                            kind, payload = q.get(timeout=timeout)
+                        except queue.Empty:
+                            self.cancel()   # stop the server-side turn we're abandoning
+                            yield f"\n[copilot timeout after {timeout}s]"
+                            return
+                        if kind == "delta":
+                            yield payload
+                        elif kind == "reasoning":
+                            yield ("reasoning", payload)
+                        elif kind == "keepalive":
+                            continue    # activity tick; resets the q.get() window
+                        elif kind == "error":
+                            yield f"\n[copilot error] {payload}"
+                            return
+                        elif kind == "idle":
+                            if self._turn_credits:
+                                _log(f"turn cost {self._turn_credits:.3f} credits"
+                                     f"  (session total {self._session_credits:.3f})")
+                            return
+                finally:
+                    self.active_turn_queue = None
+        finally:
+            for p in tmp_paths:       # turn is over; the runtime has read them
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     def cancel(self):
         if not self._session:
@@ -584,8 +587,8 @@ class CodexAppServerBackend(Backend):
       client -> server  turn/interrupt           cancel in-flight turn
 
     Unlike the Copilot backend, model and reasoning effort are TURN-level
-    params (turn/start), not session config — so update_reasoning_effort()
-    just stores the value and the next turn carries it. Auth is the ChatGPT account login
+    params (turn/start), not session config — prompt() simply stamps each
+    turn with its request's selection. Auth is the ChatGPT account login
     (`codex login`); no OPENAI_API_KEY needed.
 
     Reference: https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md
@@ -616,16 +619,17 @@ class CodexAppServerBackend(Backend):
 
     def __init__(self, codex_path="codex", cwd=None, model=None,
                  reasoning_effort="low", developer_instructions=None, log_path=None):
-        # model=None omits the turn-level override, so each thread runs on
-        # codex's own configured default (~/.codex/config.toml, i.e. whatever
-        # was last selected in the codex TUI). This tracks OpenAI's model
-        # migrations (e.g. gpt-5.4-mini -> gpt-5.6-luna) without a code change;
-        # the thread/start log line below shows what each thread resolved to.
-        self.model = model
+        # Launcher defaults — immutable after construction; per-request
+        # selection rides through prompt(model=, effort=). default_model=None
+        # omits the turn-level override, so each thread runs on codex's own
+        # configured default (~/.codex/config.toml, i.e. whatever was last
+        # selected in the codex TUI). This tracks OpenAI's model migrations
+        # (e.g. gpt-5.4-mini -> gpt-5.6-luna) without a code change; the
+        # thread/start log line below shows what each thread resolved to.
+        self.default_model = model
+        self.default_effort = reasoning_effort
         self._default_model = None   # resolved by thread/start; see new_session
-        # codex calls it "effort"; we keep agentry's "reasoning_effort" name on
-        # the public interface for parity with the Copilot backend.
-        self.reasoning_effort = reasoning_effort
+        self._turn_model = None      # the in-flight turn's model, for the rate card
         self.developer_instructions = (
             self.CHAT_ONLY_INSTRUCTIONS if developer_instructions is None
             else developer_instructions)
@@ -784,9 +788,13 @@ class CodexAppServerBackend(Backend):
         except Exception as e:
             _log(f"codex quota prime skipped: {e}")
 
-    def new_session(self, cwd=None):
+    def new_session(self, cwd=None, model=None, effort=None):
         # model/effort are turn-level overrides (TurnStartParams), so thread/start
-        # only carries session-scoped policy. We pin an empty cwd and inject
+        # only carries session-scoped policy — the model/effort params exist
+        # for Backend-interface parity and are deliberately unused here.
+        # Serialized with turns so a concurrent new-chat can't swap session_id
+        # out from under an in-flight turn (same guard as the copilot backend).
+        # We pin an empty cwd and inject
         # chat-only developer instructions so codex behaves as a plain answerer
         # rather than an agent exploring the filesystem.
         params = {"approvalPolicy": "never", "sandbox": "read-only",
@@ -798,34 +806,18 @@ class CodexAppServerBackend(Backend):
                   "config": {"model_reasoning_summary": "detailed"}}
         if self.developer_instructions:
             params["developerInstructions"] = self.developer_instructions
-        result = self._request("thread/start", params)
-        self.session_id = result["thread"]["id"]
-        self.session_fresh = True
-        # Remember what the thread resolved to so current_model() is truthful
-        # when no explicit pin is set (the label used to lie: "codex-default").
-        self._default_model = result.get("model")
-        _log(f"codex thread: {self.session_id} (default model={self._default_model!r})")
-        return self.session_id
+        with self.turn_lock:
+            result = self._request("thread/start", params)
+            self.session_id = result["thread"]["id"]
+            self.session_fresh = True
+            # Remember what the thread resolved to so current_model() is truthful
+            # when no explicit pin is set (the label used to lie: "codex-default").
+            self._default_model = result.get("model")
+            _log(f"codex thread: {self.session_id} (default model={self._default_model!r})")
+            return self.session_id
 
     def current_model(self):
-        return self.model or getattr(self, "_default_model", None)
-
-    def update_model(self, value):
-        """Model is a turn-level param (turn/start), so this just records the
-        pin for the next turn, after validating against model/list. Returns
-        True if the value changed."""
-        if value == self.model:
-            return False
-        try:
-            known = {m.get("id") for m in (self.list_models() or [])}
-        except Exception as e:
-            known = None
-            _log(f"WARN: cannot validate codex model {value!r} (model/list: {e})")
-        if known and value not in known:
-            raise BackendError(f"model {value!r} is not in codex's model/list")
-        self.model = value
-        _log(f"codex model -> {value} (applies next turn)")
-        return True
+        return self.default_model or self._default_model
 
     def list_models(self):
         """Models from the app-server's model/list (id, displayName,
@@ -835,20 +827,11 @@ class CodexAppServerBackend(Backend):
             self._models_cache = result.get("data") or []
         return self._models_cache or None
 
-    def update_reasoning_effort(self, value):
-        """Codex applies effort per turn, so this just records the intent for
-        the next turn/start. Returns True if the value changed."""
-        if value not in self.EFFORTS:
-            _log(f"WARN: ignoring unsupported codex effort={value!r}")
-            return False
-        if value == self.reasoning_effort:
-            return False
-        self.reasoning_effort = value
-        _log(f"codex effort -> {value} (applies next turn)")
-        return True
-
-    def prompt(self, text, images=None, timeout=900):
+    def prompt(self, text, images=None, timeout=900, model=None, effort=None):
         """Generator yielding text deltas for one turn. Requires an active thread.
+
+        model/effort: this turn's selection — codex scopes both per turn
+        natively (TurnStartParams), so they map straight onto turn/start.
 
         Images ride as ImageUserInput items ({type:"image", url}) with a data:
         URI — the UserInput schema (generate-json-schema) also offers
@@ -870,12 +853,15 @@ class CodexAppServerBackend(Backend):
                 ack = queue.Queue(maxsize=1)
                 self.pending[msg_id] = ack
                 self._turn_tokens = None
+                turn_model = model or self.default_model
+                turn_effort = effort or self.default_effort
+                self._turn_model = turn_model or self._default_model
                 tparams = {"threadId": self.session_id,
                            "input": input_items}
-                if self.model:
-                    tparams["model"] = self.model
-                if self.reasoning_effort:
-                    tparams["effort"] = self.reasoning_effort
+                if turn_model:
+                    tparams["model"] = turn_model
+                if turn_effort:
+                    tparams["effort"] = turn_effort
                 self._write({"jsonrpc": "2.0", "id": msg_id,
                              "method": "turn/start", "params": tparams})
                 self.session_fresh = False
@@ -1030,7 +1016,8 @@ class CodexAppServerBackend(Backend):
     def _estimate_credits(self, last):
         """Rate-card estimate for one turn's tokenUsage 'last' block, in Codex
         credits; None when the model is unknown or no usage arrived."""
-        rates = self._CREDITS_PER_MTOK.get((self.current_model() or "").lower())
+        rates = self._CREDITS_PER_MTOK.get(
+            ((self._turn_model or self.current_model()) or "").lower())
         if not rates or not last:
             return None
         cached = last.get("cachedInputTokens") or 0
@@ -1146,10 +1133,10 @@ class ClaudeCodeBackend(Backend):
     def __init__(self, claude_path="claude", cwd=None, model=None,
                  reasoning_effort=None, log_path=None):
         self.claude_path = claude_path
-        self.model = model or self.DEFAULT_MODEL
-        # claude-code (-p) has no reasoning-effort flag; we store the intent for
-        # parity with the other backends but it is a no-op on the wire.
-        self.reasoning_effort = reasoning_effort
+        self.default_model = model or self.DEFAULT_MODEL
+        # claude-code (-p) has no reasoning-effort flag; stored for interface
+        # parity but a no-op on the wire.
+        self.default_effort = reasoning_effort
         # Run claude in a dedicated EMPTY scratch dir, NEVER the agentry repo, so
         # there is nothing to find even if a tool slipped through, and agentry's
         # own CLAUDE.md / settings are not auto-loaded. Mirrors the codex backend.
@@ -1179,9 +1166,10 @@ class ClaudeCodeBackend(Backend):
             except Exception:
                 pass
 
-    def new_session(self, cwd=None):
+    def new_session(self, cwd=None, model=None, effort=None):
         # No server-side session exists for cold-start; mint a local id so the
         # HTTP layer's session bookkeeping (session_id/session_fresh) works.
+        # model/effort are per-spawn (see prompt) — ignored here.
         if cwd:
             self.cwd = os.path.abspath(cwd)
             os.makedirs(self.cwd, exist_ok=True)
@@ -1189,25 +1177,6 @@ class ClaudeCodeBackend(Backend):
         self.session_fresh = True
         _log(f"claude session (cold-start, local id): {self.session_id}")
         return self.session_id
-
-    def update_reasoning_effort(self, value):
-        """claude-code (-p) exposes no reasoning-effort knob — thinking is model-
-        and prompt-driven, not a CLI flag. Store the intent for future use but
-        report no change, since nothing is applied on the wire."""
-        if value != self.reasoning_effort:
-            self.reasoning_effort = value
-            _log(f"claude: reasoning_effort={value!r} stored but not applied (no CLI knob)")
-        return False
-
-    def update_model(self, value):
-        """Cold-start spawns a fresh process per turn, so the model is simply
-        the --model flag of the next spawn. An invalid model surfaces as that
-        turn's process error. Returns True if the value changed."""
-        if value == self.model:
-            return False
-        self.model = value
-        _log(f"claude model -> {value} (next spawn)")
-        return True
 
     def _drain_stderr(self, proc):
         try:
@@ -1217,10 +1186,11 @@ class ClaudeCodeBackend(Backend):
         except Exception:
             pass
 
-    def prompt(self, text, images=None, timeout=900):
+    def prompt(self, text, images=None, timeout=900, model=None, effort=None):
         """Generator yielding text deltas for one turn. Spawns a fresh `claude -p`
         process, feeds the prompt on stdin (robust for large enrichment prompts —
         no cmdline-length limit), and streams stream-json output back.
+        model is per-spawn (--model); effort is ignored (no CLI knob).
 
         Images are NOT supported yet (deferred): the text stdin path can't carry
         them; supporting them means switching to --input-format stream-json and
@@ -1235,7 +1205,7 @@ class ClaudeCodeBackend(Backend):
                    "--output-format", "stream-json",
                    "--include-partial-messages",   # emit content_block_delta for streaming
                    "--verbose",                     # required with stream-json output
-                   "--model", self.model, *self.LEAN_FLAGS]
+                   "--model", model or self.default_model, *self.LEAN_FLAGS]
             _log(f"claude spawn: {' '.join(cmd)}  (cwd={self.cwd})")
             # claude is a real claude.exe (not a .cmd shim), so NO shell wrapper:
             # cmd.exe wrapping mangles the stdout pipe (verified). This differs

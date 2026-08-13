@@ -238,62 +238,64 @@ def chat_completions():
         _REQ_T0.pop(tid, None)
         return jsonify({"error": {"message": f"backend init failed: {e}"}}), 500
 
-    # Per-request model, OpenAI-style — BEFORE session handling, so a new
-    # chat's session is created with the right pin instead of created-then-
-    # switched. Accepts bare ids and the legacy "<id>@<backend>" form
-    # /v1/models used to expose; the synthetic "<backend>-default"
-    # placeholder means "leave as configured". Model and effort are
-    # session-scoped, not request-isolated: concurrent clients asking for
-    # different models take turns switching (last write wins).
+    # Per-request model/effort, OpenAI-style: request fields, never server
+    # state. Validated here (read-only, against the backend's cached model
+    # list); APPLIED by the backend inside its turn lock, so concurrent
+    # requests with different selections cannot run on each other's model.
+    # Accepts bare ids and the legacy "<id>@<backend>" form /v1/models used
+    # to expose; the synthetic "<backend>-default" placeholder and omission
+    # both mean "the launcher default".
+    want_model = None
     if isinstance(req_model, str) and req_model:
         want = req_model.split("@", 1)[0]
-        if want not in ("", f"{BACKEND_KIND}-default") \
-                and want != backend.current_model():
+        if want not in ("", f"{BACKEND_KIND}-default"):
             try:
-                backend.update_model(want)
+                known = {m.get("id") for m in (backend.list_models() or [])}
             except Exception as e:
+                known = None
+                _log(f"WARN: cannot validate model {want!r} (list_models: {e})")
+            if known and want not in known:
                 _REQ_T0.pop(tid, None)
                 return jsonify({"error": {
                     "message": f"model {want!r} is not available on the "
-                               f"{BACKEND_KIND} backend: {e}",
+                               f"{BACKEND_KIND} backend",
                     "type": "invalid_request_error",
                     "param": "model",
                     "code": "model_not_found",
                 }}), 404
+            want_model = want
+
+    want_effort = None
+    if req_reasoning in EFFORTS:
+        want_effort = req_reasoning
+    elif req_reasoning:
+        _log(f"WARN: ignoring unknown reasoning_effort={req_reasoning!r}")
 
     # New chat from UI -> need a fresh session, unless the eager startup
     # session has not been used yet (in which case reuse it and avoid waste).
-    if backend.session_id is None:
+    # Seeded with this request's selection where the runtime wants it at
+    # session scope (copilot).
+    if backend.session_id is None or (
+            _is_new_chat(messages) and not backend.session_fresh):
         try:
-            backend.new_session()
+            backend.new_session(model=want_model, effort=want_effort)
         except Exception as e:
             _REQ_T0.pop(tid, None)
             return jsonify({"error": {"message": f"new_session failed: {e}"}}), 500
-    elif _is_new_chat(messages) and not backend.session_fresh:
-        try:
-            backend.new_session()
-        except Exception as e:
-            _REQ_T0.pop(tid, None)
-            return jsonify({"error": {"message": f"new_session failed: {e}"}}), 500
-
-    # Forward the full effort vocabulary; each backend validates or no-ops
-    # what its runtime can't apply (a model that rejects a level keeps the
-    # previous one and logs a WARN — see the backend implementations).
-    if req_reasoning in EFFORTS:
-        backend.update_reasoning_effort(req_reasoning)
-    elif req_reasoning:
-        _log(f"WARN: ignoring unknown reasoning_effort={req_reasoning!r}")
 
     img_note = f" images={len(images)}" if images else ""
     _log(f"prompt: session={backend.session_id}{img_note} text={prompt_text[:60]!r}")
 
-    headers = {"X-Device": BACKEND_KIND, "X-Model": _model_label()}
-    model = _model_label()
+    # Attribution is per-request: the label is this request's own selection,
+    # falling back to what a selection-less request runs on.
+    model = want_model or _model_label()
+    headers = {"X-Device": BACKEND_KIND, "X-Model": model}
 
     if stream:
         def generate():
             try:
-                for delta in backend.prompt(prompt_text, images=images):
+                for delta in backend.prompt(prompt_text, images=images,
+                                            model=want_model, effort=want_effort):
                     if isinstance(delta, tuple):    # ("reasoning", text)
                         yield _sse(delta[1], model, reasoning=True)
                     else:
@@ -305,7 +307,8 @@ def chat_completions():
 
     try:
         # Non-streaming: reasoning tuples are dropped; only answer text joins.
-        full = "".join(d for d in backend.prompt(prompt_text, images=images)
+        full = "".join(d for d in backend.prompt(prompt_text, images=images,
+                                                 model=want_model, effort=want_effort)
                        if isinstance(d, str))
     finally:
         _REQ_T0.pop(tid, None)
