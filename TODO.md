@@ -170,6 +170,15 @@ would prefer them already has paid tooling.
 
 ## Polish (lower priority)
 
+- [ ] Purge `.claude/memory/` from git HISTORY (sober-morning job). 435c53f
+      untracked the session memories and gitignored the directory, but every
+      version committed between 945a201 and 3bb161c is still readable at
+      those revisions in the public repo. If any content genuinely shouldn't
+      be public: `git filter-repo --path .claude/memory --invert-paths`
+      (or BFG), then force-push. Solo repo, no other clones to coordinate —
+      just re-clone/reset the other machines afterwards. If it's all
+      brag-tier, close as won't-fix.
+
 - [ ] (claude, LOW priority — claude-code stays a second-tier client until a
       better integration exists) Proper quota/cost for the claude backend by
       borrowing from `C:\devel\aweussom\python\claude-code-quota`
