@@ -342,6 +342,14 @@ class CopilotSDKBackend(Backend):
         }
         pin = model or self.default_model
         eff = effort or self.default_effort
+        # "auto" is a models.list entry now (2026-08), and get_current reports
+        # it as the live model — so clients read it off /v1/models and echo it
+        # back as a pin. The runtime hard-rejects that pin together with an
+        # effort ("Reasoning effort is not supported when using the `auto`
+        # model"), while an UNPINNED session — which is auto — accepts one.
+        # Same session either way, so drop the pin, never the effort.
+        if pin and pin.lower() == "auto":
+            pin = None
         if pin:
             kwargs["model"] = pin
         if eff:
