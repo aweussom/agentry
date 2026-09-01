@@ -163,7 +163,8 @@ class CopilotSDKBackend(Backend):
                  log_path=None):
         try:
             from copilot import CopilotClient
-            from copilot.rpc import ModelsListRequest, PermissionDecisionReject
+            from copilot.rpc import (AccountGetQuotaRequest, ModelsListRequest,
+                                     PermissionDecisionReject)
             from copilot.session_events import (
                 AssistantMessageDeltaData, AssistantReasoningDeltaData,
                 AssistantUsageData, SessionErrorData, SessionIdleData)
@@ -180,6 +181,7 @@ class CopilotSDKBackend(Backend):
         self._IdleData = SessionIdleData
         self._Reject = PermissionDecisionReject
         self._ModelsListRequest = ModelsListRequest
+        self._AccountGetQuotaRequest = AccountGetQuotaRequest
 
         # Launcher defaults — immutable after construction. Per-request
         # selection never lands here; it rides through prompt(model=, effort=).
@@ -192,6 +194,10 @@ class CopilotSDKBackend(Backend):
         # (copilotUsage.totalNanoAiu; 1e9 nanoAIU = 1 credit = $0.01).
         self._turn_credits = 0.0          # accumulates across a turn's model calls
         self._session_credits = 0.0       # running total since client start
+        # Account-wide premium-request plan quota (account/getQuota), the
+        # same figure copilot-cli's statusline shows ("Plan: N/M"). Refreshed
+        # once per turn in prompt(); None until the first successful refresh.
+        self._plan_quota = None
         self._cwd = cwd or os.path.dirname(os.path.abspath(__file__))
         self._session = None
         self.session_id = None
@@ -432,13 +438,37 @@ class CopilotSDKBackend(Backend):
     # no interactive copilot-cli needed).
     _USAGE_DB = Path.home() / ".copilot" / "session-store.db"
 
+    def _refresh_plan_quota(self):
+        """Re-fetch the account-wide premium-request plan quota via
+        account/getQuota and cache it in self._plan_quota. Called once per
+        turn from prompt() (short timeout; best-effort — a failure here must
+        never block the actual chat turn). The same figure copilot-cli's
+        statusline shows, e.g. 'Plan: 2690/5000 (53% used)'."""
+        try:
+            res = self._call(
+                self._client.rpc.account.get_quota(self._AccountGetQuotaRequest()),
+                timeout=10)
+            snap = res.quota_snapshots.get("premium_interactions")
+            if snap is None:
+                self._plan_quota = None
+            elif snap.is_unlimited_entitlement:
+                self._plan_quota = "plan unlimited"
+            else:
+                used_pct = 100 - snap.remaining_percentage
+                self._plan_quota = (
+                    f"plan {snap.used_requests}/{snap.entitlement_requests} "
+                    f"({used_pct:.0f}% used)")
+        except Exception as e:
+            _log(f"plan quota refresh failed (keeping last known value): {e}")
+
     def quota_status(self):
         """AI-credit spend (1 credit = $0.01): this process's running total
         (from AssistantUsageData events) plus this machine's calendar-month
-        total from the runtime ledger. The account-wide plan meter counts
-        every device/surface and is not in any public API, so the machine
-        figure is a floor, not the plan readout."""
+        total from the runtime ledger, plus the account-wide plan quota
+        (account/getQuota, refreshed once per turn — see _refresh_plan_quota)."""
         parts = []
+        if self._plan_quota:
+            parts.append(self._plan_quota)
         if self._session_credits:
             parts.append(f"session {self._session_credits:.2f} AIC")
         try:
@@ -490,6 +520,10 @@ class CopilotSDKBackend(Backend):
                                 "displayName": f"image-{i}{ext}"})
         try:
             with self.turn_lock:
+                # Fire-and-forget: refresh the plan-quota display every turn
+                # without adding a network round trip to this turn's latency.
+                threading.Thread(target=self._refresh_plan_quota, daemon=True,
+                                 name="copilot-quota-refresh").start()
                 want_model = model or self.default_model
                 want_effort = effort or self.default_effort
                 if ((want_model and want_model != self._current_model)

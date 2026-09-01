@@ -60,6 +60,14 @@
       session spend + this machine's month total from
       `~/.copilot/session-store.db` (agentry's SDK turns update that ledger
       directly — no interactive copilot-cli needed).
+    - Account-wide plan quota (2026-09-01): turns out `account/getQuota` IS
+      in the SDK (`client.rpc.account.get_quota`), returning `premium_interactions`
+      entitlement/used/remaining_percentage — the same "Plan: N/M (X% used)"
+      figure copilot-cli's own statusline shows. Wired into
+      `CopilotSDKBackend`: refreshed via a fire-and-forget thread once per
+      turn (`_refresh_plan_quota()`, called from `prompt()`) so it never adds
+      latency to the turn itself, cached in `self._plan_quota`, and prefixed
+      onto `quota_status()`'s output. See `_bench/quota_probe.py`.
     - Copilot default model: gpt-5-mini → `gpt-5.6-luna` (cheapest band,
       $0.20/M in; prompt caching verified working on 5.6 — turn 2+ bills
       ~10× less; see `_bench/copilot_sdk_probe.py`, which replaces the
