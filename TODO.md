@@ -56,18 +56,34 @@
     - Full reasoning-effort vocabulary forwarded (none..max); UI dropdown +
       model picker expanded to match.
     - AI-credit cost tracking: per-turn credits from `AssistantUsageData`
-      (`totalNanoAiu`, 1e9 = 1 credit) logged per turn; `quota_status()` shows
-      session spend + this machine's month total from
-      `~/.copilot/session-store.db` (agentry's SDK turns update that ledger
-      directly — no interactive copilot-cli needed).
-    - Account-wide plan quota (2026-09-01): turns out `account/getQuota` IS
-      in the SDK (`client.rpc.account.get_quota`), returning `premium_interactions`
-      entitlement/used/remaining_percentage — the same "Plan: N/M (X% used)"
-      figure copilot-cli's own statusline shows. Wired into
-      `CopilotSDKBackend`: refreshed via a fire-and-forget thread once per
-      turn (`_refresh_plan_quota()`, called from `prompt()`) so it never adds
-      latency to the turn itself, cached in `self._plan_quota`, and prefixed
-      onto `quota_status()`'s output. See `_bench/quota_probe.py`.
+      (`totalNanoAiu`, 1e9 = 1 credit) logged per turn and shown as
+      `this run N.NN`. NB: copilot-cli's exit banner prints a *session* total
+      that can span a month boundary (its 123.23 was 58.89 on Aug 31 plus 64.34
+      on Sep 1), so it will not match the month figure — hence the deliberate
+      `this run` wording.
+    - Account-wide credit allowance (2026-09-01): `account/getQuota` IS in the
+      SDK (`client.rpc.account.get_quota`). Field names mislead —
+      `premium_interactions.used_requests` is **AI credits**, not a request
+      count (read 65 against both the local ledger's 65.44 and
+      github.com/billing's own "65 / 5,000 AI credits"), and `reset_date` is
+      **useless**: it echoes the request timestamp, not a reset instant (two
+      probes 20s apart each came back stamped with their own call time). The
+      period is the **calendar month**, resetting on the 1st. Don't misread the
+      billing page's "resets in 30 days on Sep 30, 2026" as a rolling window:
+      September just has 30 days, and Sep 30 is the last covered day. Proof it
+      isn't rolling — a window ending Sep 30 would start Aug 31 and include
+      that evening's 58.89 credits, so `used` would read ~124, not 65. See
+      `_bench/quota_probe.py`.
+    - Heartbeat legibility (2026-09-01): the first cut printed
+      `plan 65/5000 (1% used) · machine 65 AIC this month` — two labels for the
+      same credits over the same window, in a unit ("machine AIC") that means
+      nothing to a reader. Now one authoritative line,
+      `Copilot credits 70/5,000 used this month · 4,930 left`, with the local
+      ledger demoted to a clearly-worded fallback for when the RPC is silent.
+      Refresh moved off `prompt()` onto a 120s TTL driven from
+      `quota_status()` (`_plan_quota_line()`) plus a startup prime, because the
+      heartbeat is an *idle* display: the per-turn refresh left it blank until
+      the first turn ever ran, which is when it is most looked at.
     - Copilot default model: gpt-5-mini → `gpt-5.6-luna` (cheapest band,
       $0.20/M in; prompt caching verified working on 5.6 — turn 2+ bills
       ~10× less; see `_bench/copilot_sdk_probe.py`, which replaces the

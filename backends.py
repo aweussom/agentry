@@ -194,10 +194,12 @@ class CopilotSDKBackend(Backend):
         # (copilotUsage.totalNanoAiu; 1e9 nanoAIU = 1 credit = $0.01).
         self._turn_credits = 0.0          # accumulates across a turn's model calls
         self._session_credits = 0.0       # running total since client start
-        # Account-wide premium-request plan quota (account/getQuota), the
-        # same figure copilot-cli's statusline shows ("Plan: N/M"). Refreshed
-        # once per turn in prompt(); None until the first successful refresh.
+        # Account-wide credit allowance (account/getQuota). Refreshed on a TTL
+        # from quota_status() by a background thread; None until the first
+        # successful refresh. See _refresh_plan_quota for the field semantics.
         self._plan_quota = None
+        self._plan_quota_at = 0.0         # monotonic time of the last refresh
+        self._plan_quota_busy = False     # a refresh thread is already in flight
         self._cwd = cwd or os.path.dirname(os.path.abspath(__file__))
         self._session = None
         self.session_id = None
@@ -240,6 +242,12 @@ class CopilotSDKBackend(Backend):
             _log(f"SDK auth: login={st.login} type={st.authType} host={st.host}")
         except Exception as e:
             _log(f"SDK auth status unavailable: {e}")
+        # Prime the credit allowance now: the heartbeat prints its first status
+        # line seconds from here, and the value is otherwise absent until the
+        # TTL expires or the first turn runs.
+        self._plan_quota_busy = True
+        threading.Thread(target=self._refresh_plan_quota, daemon=True,
+                         name="copilot-quota-prime").start()
 
     def _call(self, coro, timeout=60):
         """Run a coroutine on the SDK loop from sync code; block for the result."""
@@ -438,12 +446,44 @@ class CopilotSDKBackend(Backend):
     # no interactive copilot-cli needed).
     _USAGE_DB = Path.home() / ".copilot" / "session-store.db"
 
+    # How stale the account-wide figure may get before quota_status() kicks
+    # off a background re-fetch. The heartbeat asks for status once a second,
+    # so this must never be an RPC-per-call.
+    _PLAN_QUOTA_TTL = 120.0
+
     def _refresh_plan_quota(self):
-        """Re-fetch the account-wide premium-request plan quota via
-        account/getQuota and cache it in self._plan_quota. Called once per
-        turn from prompt() (short timeout; best-effort — a failure here must
-        never block the actual chat turn). The same figure copilot-cli's
-        statusline shows, e.g. 'Plan: 2690/5000 (53% used)'."""
+        """Re-fetch the account-wide credit allowance via account/getQuota and
+        cache the display string in self._plan_quota. Runs on a background
+        thread (see _plan_quota_line); best-effort — on failure the last known
+        value stands rather than the line going blank.
+
+        Field semantics, established empirically 2026-09-01 against a live
+        account — the names are misleading:
+          used_requests        AI CREDITS used this calendar month, account-wide
+                               (not a request count: it read 65 against a local
+                               ledger sum of 65.44 credits for the same period,
+                               and against github.com/billing's own '65 / 5,000
+                               AI credits'). Live; moves within seconds of a turn.
+          entitlement_requests the month's credit allowance (5000 here).
+        The period is the CALENDAR MONTH, resetting on the 1st. The billing
+        page's 'resets in 30 days on Sep 30, 2026' is not a rolling window —
+        September simply has 30 days, and Sep 30 is the period's last covered
+        day (the reset fires at the end of it). Confirmed two ways: the reset
+        landed on Sep 1, and a rolling window ending Sep 30 would have started
+        Aug 31 and included that evening's 58.89 credits, putting used near 124
+        instead of the 65 observed. So the ledger fallback below spans the same
+        window as this figure, and under-reports only by surface, not by date.
+          reset_date           USELESS — it echoes the request timestamp, not a
+                               reset instant (two probes 20s apart each came
+                               back stamped with their own call time). Never
+                               render a reset horizon from it.
+          overage              credits billed past the allowance; only non-zero
+                               once used > entitlement, and only meaningful
+                               because this plan sets usage/overage-allowed-
+                               with-exhausted-quota, i.e. the allowance is a
+                               billing threshold, not a hard stop.
+        The 'chat' and 'completions' snapshots are unlimited/zero here and
+        carry no signal, so only premium_interactions is read."""
         try:
             res = self._call(
                 self._client.rpc.account.get_quota(self._AccountGetQuotaRequest()),
@@ -452,25 +492,66 @@ class CopilotSDKBackend(Backend):
             if snap is None:
                 self._plan_quota = None
             elif snap.is_unlimited_entitlement:
-                self._plan_quota = "plan unlimited"
+                self._plan_quota = "Copilot credits unlimited"
             else:
-                used_pct = 100 - snap.remaining_percentage
-                self._plan_quota = (
-                    f"plan {snap.used_requests}/{snap.entitlement_requests} "
-                    f"({used_pct:.0f}% used)")
+                used, cap = snap.used_requests, snap.entitlement_requests
+                if used >= cap:
+                    over = snap.overage or (used - cap)
+                    self._plan_quota = (
+                        f"Copilot credits {used:,}/{cap:,} used this month "
+                        f"· {over:,.0f} over, billed as overage")
+                else:
+                    self._plan_quota = (
+                        f"Copilot credits {used:,}/{cap:,} used this month "
+                        f"· {cap - used:,} left")
         except Exception as e:
             _log(f"plan quota refresh failed (keeping last known value): {e}")
+        finally:
+            self._plan_quota_at = time.monotonic()
+            self._plan_quota_busy = False
+
+    def _plan_quota_line(self):
+        """The cached account-wide line, re-fetched in the background once it
+        is older than _PLAN_QUOTA_TTL. Never blocks: the caller (the heartbeat,
+        once a second) always gets the current cached value immediately."""
+        if (not self._plan_quota_busy
+                and time.monotonic() - self._plan_quota_at >= self._PLAN_QUOTA_TTL):
+            self._plan_quota_busy = True
+            threading.Thread(target=self._refresh_plan_quota, daemon=True,
+                             name="copilot-quota-refresh").start()
+        return self._plan_quota
 
     def quota_status(self):
-        """AI-credit spend (1 credit = $0.01): this process's running total
-        (from AssistantUsageData events) plus this machine's calendar-month
-        total from the runtime ledger, plus the account-wide plan quota
-        (account/getQuota, refreshed once per turn — see _refresh_plan_quota)."""
+        """One line for the console heartbeat, in AI credits (1 credit = $0.01).
+
+        Leads with the account-wide allowance from account/getQuota — the same
+        '65 / 5,000 AI credits' github.com/billing shows — because that is the
+        number worth watching. The local runtime ledger is only a FALLBACK for
+        when that RPC has not answered yet or fails: it sums the same calendar
+        month on this machine alone, so it under-reports the account (other
+        devices and surfaces bill to the same allowance). Showing both at once
+        was pure duplication — same credits, same window, two labels.
+
+        The per-turn credits accumulated by this agentry process are appended as
+        'this run', deliberately not 'session': copilot-cli's exit banner prints
+        a SESSION total that can span a month boundary (its 123.23 was 58.89 on
+        Aug 31 plus 64.34 on Sep 1), and the two must not look like the same
+        quantity."""
         parts = []
-        if self._plan_quota:
-            parts.append(self._plan_quota)
+        plan = self._plan_quota_line()
+        if plan:
+            parts.append(plan)
+        else:
+            parts.append(self._ledger_fallback()
+                         or "Copilot credits: allowance unavailable")
         if self._session_credits:
-            parts.append(f"session {self._session_credits:.2f} AIC")
+            parts.append(f"this run {self._session_credits:.2f}")
+        return " · ".join(parts) or None
+
+    def _ledger_fallback(self):
+        """Calendar-month credit total from this machine's runtime ledger, worded
+        so it cannot be mistaken for the account allowance. Used only when
+        account/getQuota has not answered."""
         try:
             start = datetime.date.today().replace(day=1).isoformat()
             db = sqlite3.connect(f"file:{self._USAGE_DB}?mode=ro", uri=True)
@@ -481,10 +562,10 @@ class CopilotSDKBackend(Backend):
                     (start,)).fetchone()[0]
             finally:
                 db.close()
-            parts.append(f"machine {nano / 1e9:.0f} AIC this month")
+            return (f"Copilot credits {nano / 1e9:,.0f} used this month "
+                    f"on this PC (account allowance unavailable)")
         except Exception:
-            pass    # ledger missing/locked/schema drift -> just omit
-        return " · ".join(parts) or None
+            return None     # ledger missing/locked/schema drift
 
     _IMAGE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
                   "image/gif": ".gif", "application/pdf": ".pdf"}
@@ -520,10 +601,6 @@ class CopilotSDKBackend(Backend):
                                 "displayName": f"image-{i}{ext}"})
         try:
             with self.turn_lock:
-                # Fire-and-forget: refresh the plan-quota display every turn
-                # without adding a network round trip to this turn's latency.
-                threading.Thread(target=self._refresh_plan_quota, daemon=True,
-                                 name="copilot-quota-refresh").start()
                 want_model = model or self.default_model
                 want_effort = effort or self.default_effort
                 if ((want_model and want_model != self._current_model)
