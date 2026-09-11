@@ -114,6 +114,12 @@ Launcher params (`start.ps1 -Flag` / `start.sh --flag`):
     pin for prod. The startup log's `codex thread: ... (default model=...)`
     line shows what each thread resolved to.
   - `claude`: passed to `claude --model`.
+  - A pinned model is validated at startup against the backend's model list
+    (copilot `models.list`, codex `model/list`); an unknown id exits with
+    code 2 and prints what *is* available, instead of coming up "ready" and
+    failing every turn. Codex's ids are OpenAI's (`gpt-5.6-sol` /
+    `-terra` / `-luna`, `gpt-5.5` as of 2026-09) — there is no Claude on
+    codex.
 - **ReasoningEffort** —
   `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`. What applies
   is per model: copilot's gpt-5.6 models advertise `none`→`max`, codex takes

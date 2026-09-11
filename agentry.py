@@ -25,6 +25,7 @@ Auth:
 import argparse
 import atexit
 import json
+import sys
 import threading
 import time
 import uuid
@@ -327,6 +328,33 @@ def chat_completions():
 
 # --- Entry point --------------------------------------------------------
 
+def _check_pinned_model(backend):
+    """Exit at startup if --model names something the backend cannot run.
+
+    Codex only rejects an unknown model at turn/start, so without this a
+    `-Backend codex -Model claude-sonnet-5` launch comes up "ready" and then
+    fails every request. Same check the per-request path does, applied to the
+    launcher pin; backends that cannot enumerate models (claude) are skipped."""
+    if not BACKEND_MODEL:
+        return
+    try:
+        models = backend.list_models() or []
+    except Exception as e:
+        _log(f"WARN: cannot validate --model {BACKEND_MODEL!r} (list_models: {e})")
+        return
+    if not models or BACKEND_MODEL in {m.get("id") for m in models}:
+        return
+    print(f"  ERROR: model {BACKEND_MODEL!r} is not available on the {BACKEND_KIND} "
+          f"backend. Available:", flush=True)
+    for m in models:
+        efforts = [e.get("reasoningEffort") for e in m.get("supportedReasoningEfforts") or []
+                   if isinstance(e, dict)]
+        tail = f"  ({'/'.join(efforts)})" if efforts else ""
+        mark = "  [default]" if m.get("isDefault") else ""
+        print(f"    {m.get('id')}{mark}{tail}", flush=True)
+    sys.exit(2)
+
+
 def main():
     global BACKEND_KIND, BACKEND_MODEL, REASONING_EFFORT
     p = argparse.ArgumentParser()
@@ -373,6 +401,7 @@ def main():
     # pay the handshake/session-new cost (~2-4s typically).
     try:
         backend = _get_backend()
+        _check_pinned_model(backend)
         backend.new_session()
         user_note = f"user={backend.auth_login}  " if backend.auth_login else ""
         print(f"  {BACKEND_KIND} ready  ({user_note}session={backend.session_id})", flush=True)
