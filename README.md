@@ -227,27 +227,55 @@ context hints into prompts.
 - **Reasoning trace depends on backend.** Copilot's summaries reach the
   console ticker and the web UI think-block; codex also streams reasoning
   but it is not forwarded yet.
-- **Auth is session-bound** (Windows): the credential-store entry from
-  `copilot login` is only reachable from the same interactive logon session.
+- **Auth is inherited, not configured.** There is no token setting: agentry
+  uses whatever login the backend CLI already has for the user running it
+  (`copilot login`, `codex login`, Claude Code's own login). Start it from
+  that user's own shell. Running it as a Windows service or under another
+  account will not find the Copilot credential, which lives in the
+  per-logon credential store.
 - **Single user, single session.** Concurrent clients share one backend
   session and serialize through one turn lock — personal use, not
   multi-tenant.
 - **Codex carries a fixed ~24.8k-token harness per turn** (its agent system
   prompt + tool schemas). Not reducible, cached server-side, not separately
-  billed on a flat subscription.
+  billed on a flat subscription. Beyond cost, that prefix is agent
+  scaffolding the model reads before your prompt, so it can colour
+  responses. Copilot is not free of this either, just ~5x lighter: the
+  runtime's ledger shows a 22-byte prompt billed at ~5.3k input tokens on
+  `gpt-5.6-luna` (~2.9k on `gpt-5-mini` in July), and about 900 of those
+  are agentry's own `.github/copilot-instructions.md`, which is the one
+  lever we do hold — it asks for terse, chat-only replies.
 
 ## Related work
 
-[`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) (and its
-maintained fork
-[`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api)) expose
-Copilot by reverse-engineering its internal HTTP endpoints — wider scope,
-lower overhead, permanent exposure to upstream breakage. Agentry instead
-drives the official runtimes through their supported surfaces (Copilot SDK,
-`codex app-server`) for one narrow case: killing the per-call startup cost
-when a single developer uses these agents as an automation backend. Want a
-broad multi-client gateway? Pick a maintained copilot-api fork. Want a thin
-local wrapper with no reverse-engineering? That's agentry.
+The same itch — "I already pay for this agent, let my own code call the
+model" — has been scratched once per vendor, many times over. Ordered by
+maintenance activity as of 2026-09-11 (most recently pushed first); stars
+are from the same day and will drift.
+
+| Project | Wraps | How | Status 2026-09-11 |
+|---|---|---|---|
+| [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api) | Copilot, codex, third-party APIs | reverse-engineered HTTP; Chat Completions + Responses + Anthropic Messages; Electron desktop app | very active — releases several times a week; ~1k★ |
+| [`icebear0828/codex-proxy`](https://github.com/icebear0828/codex-proxy) | codex | ChatGPT backend API with the OAuth token; OpenAI/Anthropic/Gemini protocols; non-commercial license | very active; ~1.7k★ |
+| [`messense/copilot-api-proxy`](https://github.com/messense/copilot-api-proxy) | Copilot | Rust reverse proxy, OpenAI + Anthropic endpoints | active; small |
+| [`hotchpotch/openai-api-server-via-codex`](https://github.com/hotchpotch/openai-api-server-via-codex) | codex | Go server on the codex login token; PyPI/binaries | active; ~50★ |
+| [`wende/claude-max-api-proxy`](https://github.com/wende/claude-max-api-proxy) | Claude Code | spawns `claude -p` per request (same cold-start trade as agentry's `claude` backend); OpenClaw integration | active; ~130★ |
+| [`theblixguy/copilot-sdk-proxy`](https://github.com/theblixguy/copilot-sdk-proxy) | Copilot | the **official Copilot SDK** (TypeScript); Chat Completions + Anthropic + Responses; npm; the core of [`xcode-copilot-server`](https://github.com/theblixguy/xcode-copilot-server) | dependabot-only since 2026-07; ~10★ |
+| [`rezrov/copilot-proxy`](https://github.com/rezrov/copilot-proxy) | Copilot | the official Copilot SDK (Node); client-owned tool loop; proposed in [copilot-sdk discussion #218](https://github.com/github/copilot-sdk/discussions/218), unanswered by GitHub staff | quiet since 2026-07; ~10★ |
+| [`vkop007/codex-app-proxy`](https://github.com/vkop007/codex-app-proxy) | codex | persistent `codex app-server` — the same surface agentry's `codex` backend uses | abandoned 2026-02 |
+| [`anshulpatel25/copilot-sdk-gateway`](https://github.com/anshulpatel25/copilot-sdk-gateway) | Copilot | Python Copilot SDK, one client per request | archived 2026-05 (author cites the move to usage-based billing) |
+| [`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) | Copilot | reverse-engineered HTTP; the original | dormant since 2025-11, 130+ open issues; ~4k★ — use the caozhiyuan fork |
+
+Where agentry sits: every project above wraps **one** vendor; agentry puts
+Copilot, codex and Claude Code behind the same endpoint, and drives each
+through its supported surface (Copilot SDK, `codex app-server`, `claude -p`)
+rather than reverse-engineered HTTP. It is also the only one that
+**strips the tools** — the others expose tool execution as a feature, agentry
+serves the bare model (see *reverse MCP* above) — and the only one with a
+live credit/quota line in the console, which matters once a batch can drain
+a month's allowance overnight. Want a broad multi-client gateway with a GUI?
+Pick caozhiyuan or icebear0828. Want a thin local wrapper over the official
+surfaces, with backend choice per launch? That's agentry.
 
 ## Acknowledgments
 
