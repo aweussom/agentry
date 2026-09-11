@@ -43,6 +43,8 @@
       Default model `claude-sonnet-4-6`. Persistent mode (~1.3s/turn) deferred —
       see `archive/CLAUDE-PLAN.md` for why prompting can't cleanly fix its
       cross-turn leakage. `_bench/claude_probe.py`.
+      **2026-09-11:** leakage objection removed — `/clear` over stream-json
+      resets the conversation in place; see the open persistent-claude item.
 - [x] OpenAI-like model handling (2026-08-13, after the GitHub AI-credits
       billing switch made model choice a per-token cost decision):
     - Per-request `model` honored on `/v1/chat/completions` (copilot switches
@@ -186,6 +188,29 @@
       runtime, which is brand new at that point. Hard-stop plans now read
       `exhausted, turns blocked until the 1st` instead of the wrong `billed
       as overage` (`usageAllowedWithExhaustedQuota` is false here).
+      Filed upstream as [copilot-sdk#2619](https://github.com/github/copilot-sdk/issues/2619); repro
+      `_bench/quota_cache_probe.py`. If it lands a TTL/force-refresh, drop the
+      throwaway-runtime re-fetch and call the main client again.
+
+## Backends
+
+- [ ] **Persistent `claude` backend with `/clear` per task** (unblocked
+      2026-09-11). Hold one `claude -p --input-format stream-json
+      --output-format stream-json --verbose` process (lean flags), and
+      instead of respawning per turn send `/clear` as a user message: Claude
+      Code 2.1.268 answers with a `conversation_reset` frame in ~125 ms at
+      $0.00 and the next turn has no memory of prior turns
+      (`_bench/claude_clear_probe.py`, haiku-4-5). Saves the ~2.5 s cold start
+      per turn that `archive/CLAUDE-PLAN.md` accepted for isolation. Design:
+      keep the structural guarantees — `new_session()` = `/clear`, and if the
+      reset frame does not arrive within a short timeout, fall back to a
+      respawn so isolation is never silently lost. Watch for: does `/clear`
+      drop the API prompt cache for the system prefix (measure first-turn
+      cost after reset vs. a fresh spawn); does `--session-id` change per
+      conversation (the frame carries `new_conversation_id`); ticker/quota
+      code assumes one process per turn today. Bench before switching the
+      default — for 40–90 s enrichment turns the saving is still noise;
+      the win is short-turn batches and the web UI's snappiness.
 
 ## Research / evaluation
 

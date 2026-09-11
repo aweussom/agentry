@@ -58,6 +58,17 @@ second backend justified it.
 - `claude-code` (Anthropic) — `--output-format stream-json` is still
   `-p`-per-turn, NOT a persistent protocol. Wrapping it gives no spawn-cost
   win, which was the whole point of the persistent backend. Skip.
+  **Update 2026-09-11:** REVERSED on the isolation point. `claude -p
+  --input-format stream-json` is a persistent process, and sending `/clear`
+  as a user message resets the conversation on that process: Claude Code
+  2.1.268 emits a `conversation_reset` frame (added ~2.1.224), the reset
+  took 125 ms at $0.00, and the next turn had no memory of a planted
+  codeword (`_bench/claude_clear_probe.py`). That is the "new session on
+  the same process" primitive `archive/CLAUDE-PLAN.md` said was missing, so
+  per-task isolation no longer requires a ~2.5 s respawn. Still no native
+  ACP or app-server; the Zed adapter (`agentclientprotocol/claude-agent-acp`,
+  2.5k★) is the Agent SDK, one claude process per ACP session, so it adds
+  nothing agentry can't do directly. See TODO for the persistent-claude item.
 - `qwen3-code` — DECLINED (2026-07-28), not merely deferred. Qwen's models
   are sold as a plain OpenAI-compatible API (DashScope / qwen.ai) that any
   client can call directly with a subscription — there is no
@@ -129,3 +140,5 @@ What landed instead (2026-09-11): the snapshot is a baseline and the local
 ledger supplies everything billed since its fetch stamp; the periodic re-fetch
 spawns a throwaway runtime so it observes the account for real. See TODO
 ("Copilot plan quota went stale") and `_plan_quota_line` in `backends.py`.
+Reported upstream as [github/copilot-sdk#2619](https://github.com/github/copilot-sdk/issues/2619) (2026-09-11); repro in
+`_bench/quota_cache_probe.py`.

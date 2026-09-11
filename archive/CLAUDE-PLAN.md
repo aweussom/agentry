@@ -37,6 +37,12 @@ answerer — the same defense-in-depth posture the codex backend uses.
 
 ## Persistent mode — deferred, reconsider if startup ever dominates
 
+> **Update 2026-09-11:** the premise below ("no new-session message in the
+> stream-json input protocol") no longer holds. Sending `/clear` as a user
+> message resets the conversation on the same process (`conversation_reset`
+> frame, 125 ms, $0). Verified with `_bench/claude_clear_probe.py`; open item
+> in TODO.md. The rest of this section is kept as the historical reasoning.
+
 A persistent claude could be driven via the Agent-SDK transport:
 `claude -p --input-format stream-json --output-format stream-json --verbose`,
 fed newline-delimited user messages over stdin. Node boot + MCP load are paid
