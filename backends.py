@@ -182,6 +182,7 @@ class CopilotSDKBackend(Backend):
         self._Reject = PermissionDecisionReject
         self._ModelsListRequest = ModelsListRequest
         self._AccountGetQuotaRequest = AccountGetQuotaRequest
+        self._CopilotClient = CopilotClient   # for throwaway quota-refresh runtimes
 
         # Launcher defaults — immutable after construction. Per-request
         # selection never lands here; it rides through prompt(model=, effort=).
@@ -194,12 +195,14 @@ class CopilotSDKBackend(Backend):
         # (copilotUsage.totalNanoAiu; 1e9 nanoAIU = 1 credit = $0.01).
         self._turn_credits = 0.0          # accumulates across a turn's model calls
         self._session_credits = 0.0       # running total since client start
-        # Account-wide credit allowance (account/getQuota). Refreshed on a TTL
-        # from quota_status() by a background thread; None until the first
-        # successful refresh. See _refresh_plan_quota for the field semantics.
+        # Account-wide credit allowance (account/getQuota) as a BASELINE dict
+        # {used, cap, unlimited, overage, overage_ok, fetched_at}; None until
+        # the first successful fetch. Refreshed on a TTL from quota_status() by
+        # a background thread. See _refresh_plan_quota / _plan_quota_line.
         self._plan_quota = None
         self._plan_quota_at = 0.0         # monotonic time of the last refresh
         self._plan_quota_busy = False     # a refresh thread is already in flight
+        self._ledger_cache = None         # (since, monotonic, credits|None)
         self._cwd = cwd or os.path.dirname(os.path.abspath(__file__))
         self._session = None
         self.session_id = None
@@ -246,8 +249,8 @@ class CopilotSDKBackend(Backend):
         # line seconds from here, and the value is otherwise absent until the
         # TTL expires or the first turn runs.
         self._plan_quota_busy = True
-        threading.Thread(target=self._refresh_plan_quota, daemon=True,
-                         name="copilot-quota-prime").start()
+        threading.Thread(target=self._refresh_plan_quota, args=(self._client,),
+                         daemon=True, name="copilot-quota-prime").start()
 
     def _call(self, coro, timeout=60):
         """Run a coroutine on the SDK loop from sync code; block for the result."""
@@ -446,16 +449,30 @@ class CopilotSDKBackend(Backend):
     # no interactive copilot-cli needed).
     _USAGE_DB = Path.home() / ".copilot" / "session-store.db"
 
-    # How stale the account-wide figure may get before quota_status() kicks
-    # off a background re-fetch. The heartbeat asks for status once a second,
-    # so this must never be an RPC-per-call.
-    _PLAN_QUOTA_TTL = 120.0
+    # How often to re-fetch the account-wide baseline. The heartbeat asks for
+    # status once a second, so this must never be an RPC-per-call — and the
+    # re-fetch spawns a throwaway runtime (see _refresh_plan_quota), so it is
+    # a process launch, not just an RPC. Between fetches the local ledger
+    # keeps the figure live.
+    _PLAN_QUOTA_TTL = 900.0
+    # How often the heartbeat may re-sum the local ledger (full scan of a
+    # few-thousand-row table: cheap, but not once a second).
+    _LEDGER_TTL = 10.0
 
-    def _refresh_plan_quota(self):
-        """Re-fetch the account-wide credit allowance via account/getQuota and
-        cache the display string in self._plan_quota. Runs on a background
-        thread (see _plan_quota_line); best-effort — on failure the last known
-        value stands rather than the line going blank.
+    def _refresh_plan_quota(self, client=None):
+        """Fetch the account-wide credit allowance via account/getQuota and
+        cache it as a baseline in self._plan_quota. Runs on a background thread
+        (see _plan_quota_line); best-effort — on failure the last known value
+        stands rather than the line going blank.
+
+        THE RUNTIME CACHES THIS ANSWER FOR ITS WHOLE PROCESS LIFETIME (found
+        2026-09-11: the console's runtime, up since 09-08, still answered
+        190/5,000 while a fresh process answered 5,000/5,000; two calls 40 s
+        apart in one process returned byte-identical reset_date stamps). So
+        asking our own long-lived self._client again is pointless after the
+        first time. `client=None` therefore spawns a THROWAWAY CopilotClient
+        (its own runtime process, ~2-3 s), reads, and stops it; the startup
+        prime passes self._client because that runtime is brand new anyway.
 
         Field semantics, established empirically 2026-09-01 against a live
         account — the names are misleading:
@@ -463,74 +480,146 @@ class CopilotSDKBackend(Backend):
                                (not a request count: it read 65 against a local
                                ledger sum of 65.44 credits for the same period,
                                and against github.com/billing's own '65 / 5,000
-                               AI credits'). Live; moves within seconds of a turn.
+                               AI credits').
           entitlement_requests the month's credit allowance (5000 here).
         The period is the CALENDAR MONTH, resetting on the 1st. The billing
         page's 'resets in 30 days on Sep 30, 2026' is not a rolling window —
         September simply has 30 days, and Sep 30 is the period's last covered
-        day (the reset fires at the end of it). Confirmed two ways: the reset
-        landed on Sep 1, and a rolling window ending Sep 30 would have started
-        Aug 31 and included that evening's 58.89 credits, putting used near 124
-        instead of the 65 observed. So the ledger fallback below spans the same
-        window as this figure, and under-reports only by surface, not by date.
-          reset_date           USELESS — it echoes the request timestamp, not a
-                               reset instant (two probes 20s apart each came
-                               back stamped with their own call time). Never
-                               render a reset horizon from it.
+        day. Confirmed two ways: the reset landed on Sep 1, and a rolling
+        window ending Sep 30 would have started Aug 31 and included that
+        evening's 58.89 credits, putting used near 124 instead of the 65
+        observed.
+          reset_date           NOT a reset instant: it is the runtime's FETCH
+                               timestamp (ISO UTC, same format as the ledger's
+                               created_at). Useless as a horizon, but exactly
+                               the baseline instant the ledger delta needs.
           overage              credits billed past the allowance; only non-zero
-                               once used > entitlement, and only meaningful
-                               because this plan sets usage/overage-allowed-
-                               with-exhausted-quota, i.e. the allowance is a
-                               billing threshold, not a hard stop.
+                               once used > entitlement.
+          usage_allowed_with_exhausted_quota / overage_allowed_with_exhausted_quota
+                               whether the allowance is a billing threshold
+                               (overage) or a hard stop. This plan: hard stop —
+                               turns fail until the 1st.
         The 'chat' and 'completions' snapshots are unlimited/zero here and
         carry no signal, so only premium_interactions is read."""
         try:
-            res = self._call(
-                self._client.rpc.account.get_quota(self._AccountGetQuotaRequest()),
-                timeout=10)
+            if client is not None:
+                res = self._call(
+                    client.rpc.account.get_quota(self._AccountGetQuotaRequest()),
+                    timeout=10)
+            else:
+                res = asyncio.run(self._fetch_quota_fresh())
             snap = res.quota_snapshots.get("premium_interactions")
             if snap is None:
                 self._plan_quota = None
-            elif snap.is_unlimited_entitlement:
-                self._plan_quota = "Copilot credits unlimited"
             else:
-                used, cap = snap.used_requests, snap.entitlement_requests
-                if used >= cap:
-                    over = snap.overage or (used - cap)
-                    self._plan_quota = (
-                        f"Copilot credits {used:,}/{cap:,} used this month "
-                        f"· {over:,.0f} over, billed as overage")
-                else:
-                    self._plan_quota = (
-                        f"Copilot credits {used:,}/{cap:,} used this month "
-                        f"· {cap - used:,} left")
+                self._plan_quota = {
+                    "unlimited": bool(snap.is_unlimited_entitlement),
+                    "used": snap.used_requests,
+                    "cap": snap.entitlement_requests,
+                    "overage": snap.overage or 0,
+                    "overage_ok": bool(snap.overage_allowed_with_exhausted_quota
+                                       or snap.usage_allowed_with_exhausted_quota),
+                    "fetched_at": snap.reset_date or "",
+                }
         except Exception as e:
             _log(f"plan quota refresh failed (keeping last known value): {e}")
         finally:
             self._plan_quota_at = time.monotonic()
             self._plan_quota_busy = False
 
+    async def _fetch_quota_fresh(self):
+        """account/getQuota from a throwaway runtime, so the answer is not the
+        long-lived runtime's process-lifetime cache. Always stops the process."""
+        client = self._CopilotClient(working_directory=self._cwd)
+        await asyncio.wait_for(client.start(), 60)
+        try:
+            return await asyncio.wait_for(
+                client.rpc.account.get_quota(self._AccountGetQuotaRequest()), 15)
+        finally:
+            try:
+                await asyncio.wait_for(client.stop(), 15)
+            except Exception:
+                pass
+
+    def _month_start_utc(self):
+        return datetime.datetime.now(datetime.timezone.utc).date().replace(day=1).isoformat()
+
+    def _ledger_credits_since(self, since):
+        """Credits this machine's runtime ledger has recorded at or after the ISO
+        UTC instant `since`. Cached for _LEDGER_TTL. None if the ledger is
+        missing/locked/has drifted."""
+        now = time.monotonic()
+        c = self._ledger_cache
+        if c and c[0] == since and now - c[1] < self._LEDGER_TTL:
+            return c[2]
+        try:
+            db = sqlite3.connect(f"file:{self._USAGE_DB}?mode=ro", uri=True)
+            try:
+                nano = db.execute(
+                    "select coalesce(sum(total_nano_aiu), 0) from "
+                    "assistant_usage_events where created_at >= ?",
+                    (since,)).fetchone()[0]
+            finally:
+                db.close()
+            val = nano / 1e9
+        except Exception:
+            val = None
+        self._ledger_cache = (since, now, val)
+        return val
+
     def _plan_quota_line(self):
-        """The cached account-wide line, re-fetched in the background once it
-        is older than _PLAN_QUOTA_TTL. Never blocks: the caller (the heartbeat,
-        once a second) always gets the current cached value immediately."""
+        """The account-wide line: baseline snapshot + everything this machine's
+        ledger has billed since the snapshot was fetched. Kicks off a background
+        re-fetch once the baseline is older than _PLAN_QUOTA_TTL. Never blocks:
+        the caller (the heartbeat, once a second) always gets an answer from
+        cached state.
+
+        Why the sum: the snapshot alone goes stale (runtime cache, see
+        _refresh_plan_quota) and the ledger alone misses other devices and
+        surfaces billing to the same allowance. Baseline + local delta is live
+        for this PC and only under-reports other devices' usage since the last
+        fetch, which the next fetch corrects. A '~' marks the figure as
+        estimated whenever the delta is non-zero."""
         if (not self._plan_quota_busy
                 and time.monotonic() - self._plan_quota_at >= self._PLAN_QUOTA_TTL):
             self._plan_quota_busy = True
             threading.Thread(target=self._refresh_plan_quota, daemon=True,
                              name="copilot-quota-refresh").start()
-        return self._plan_quota
+        snap = self._plan_quota
+        if not snap:
+            return None
+        if snap["unlimited"]:
+            return "Copilot credits unlimited"
+        month_start = self._month_start_utc()
+        since, base = snap["fetched_at"], snap["used"]
+        if not since or since < month_start:
+            # Baseline predates this month's reset: only the ledger's
+            # month-to-date counts until a fresh fetch lands.
+            since, base = month_start, 0
+        delta = self._ledger_credits_since(since)
+        if delta is None:
+            used, approx = base, ""
+            note = f" (as of {since[11:16]}Z; ledger unavailable)"
+        else:
+            used, approx, note = base + delta, ("~" if delta else ""), ""
+        cap = snap["cap"]
+        head = f"Copilot credits {approx}{used:,.0f}/{cap:,} used this month"
+        if used >= cap:
+            over = used - cap
+            if snap["overage_ok"]:
+                return f"{head} · {over:,.0f} over, billed as overage{note}"
+            return f"{head} · exhausted, turns blocked until the 1st{note}"
+        return f"{head} · {approx}{cap - used:,.0f} left{note}"
 
     def quota_status(self):
         """One line for the console heartbeat, in AI credits (1 credit = $0.01).
 
-        Leads with the account-wide allowance from account/getQuota — the same
-        '65 / 5,000 AI credits' github.com/billing shows — because that is the
-        number worth watching. The local runtime ledger is only a FALLBACK for
-        when that RPC has not answered yet or fails: it sums the same calendar
-        month on this machine alone, so it under-reports the account (other
-        devices and surfaces bill to the same allowance). Showing both at once
-        was pure duplication — same credits, same window, two labels.
+        Leads with the account-wide figure — the same '65 / 5,000 AI credits'
+        github.com/billing shows — because that is the number worth watching:
+        a fetched baseline plus this machine's ledger since (_plan_quota_line).
+        The ledger ALONE is only a FALLBACK for when no fetch has answered yet:
+        it sums the same calendar month on this machine, so it under-reports
+        the account (other devices and surfaces bill to the same allowance).
 
         The per-turn credits accumulated by this agentry process are appended as
         'this run', deliberately not 'session': copilot-cli's exit banner prints
@@ -552,20 +641,11 @@ class CopilotSDKBackend(Backend):
         """Calendar-month credit total from this machine's runtime ledger, worded
         so it cannot be mistaken for the account allowance. Used only when
         account/getQuota has not answered."""
-        try:
-            start = datetime.date.today().replace(day=1).isoformat()
-            db = sqlite3.connect(f"file:{self._USAGE_DB}?mode=ro", uri=True)
-            try:
-                nano = db.execute(
-                    "select coalesce(sum(total_nano_aiu), 0) from "
-                    "assistant_usage_events where created_at >= ?",
-                    (start,)).fetchone()[0]
-            finally:
-                db.close()
-            return (f"Copilot credits {nano / 1e9:,.0f} used this month "
-                    f"on this PC (account allowance unavailable)")
-        except Exception:
-            return None     # ledger missing/locked/schema drift
+        credits = self._ledger_credits_since(self._month_start_utc())
+        if credits is None:
+            return None
+        return (f"Copilot credits {credits:,.0f} used this month "
+                f"on this PC (account allowance unavailable)")
 
     _IMAGE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
                   "image/gif": ".gif", "application/pdf": ".pdf"}

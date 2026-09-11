@@ -171,6 +171,22 @@
   run interactively once to authenticate, then the same commands
   work non-interactively. There's no `agy login` subcommand.
 
+- [x] **Copilot plan quota went stale** (found 2026-09-11 after a 1,485-call
+      enrichment batch drained the month's 5,000 credits overnight; fixed same
+      day). The heartbeat kept saying `190/5,000 used · 4,810 left` next to
+      `this run 4809.53` because the runtime caches `account/getQuota` for its
+      process lifetime — see TODONT. Fix: the snapshot is now a *baseline*,
+      not a live figure. Its `resetDate` is the runtime's fetch timestamp, so
+      `used_now = snapshot.used + ledger credits with created_at >= resetDate`
+      (`_plan_quota_line`; `~` marks the estimate whenever the delta is
+      non-zero; a baseline from a previous month is discarded in favour of the
+      ledger's month-to-date). The periodic re-fetch (`_PLAN_QUOTA_TTL`, 15
+      min) now spawns a *throwaway* runtime (`_fetch_quota_fresh`, ~4 s) so it
+      actually observes other devices; the startup prime still uses the main
+      runtime, which is brand new at that point. Hard-stop plans now read
+      `exhausted, turns blocked until the 1st` instead of the wrong `billed
+      as overage` (`usageAllowedWithExhaustedQuota` is false here).
+
 ## Research / evaluation
 
 **Updated 2026-05-30** — codex landed as backend #2 (see "Done"). The
