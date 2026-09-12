@@ -26,6 +26,8 @@ import argparse
 import atexit
 import base64
 import json
+import re
+import struct
 import sys
 import threading
 import time
@@ -365,6 +367,43 @@ def chat_completions():
 _MAX_EDIT_IMAGES = 5
 
 
+def _size_wording(size):
+    """OpenAI `size` ("1536x1024", "auto", ...) -> (aspect sentence for the
+    prompt, (w, h) or None).
+
+    codex hardcodes gpt-image-2 at size=auto, and auto reads the PROMPT: in
+    six trials (`_bench/codex_image_aspect_probe.py`) explicit orientation
+    words pinned the aspect every time, while the subject alone decided it
+    otherwise (a standing figure -> portrait). The pixel count is not ours to
+    choose — outputs are normalized to ~1.57 MP (1536x1024, 1254^2, 1672x941)
+    — so this asks for the RATIO and names the orientation, and the response
+    reports what actually came back."""
+    if not size or str(size).lower() == "auto":
+        return "", None
+    m = re.fullmatch(r"\s*(\d{2,5})\s*[xX×]\s*(\d{2,5})\s*", str(size))
+    if not m:
+        _log(f"WARN: images ignoring unparsable size={size!r}")
+        return "", None
+    w, h = int(m.group(1)), int(m.group(2))
+    orient = ("square" if w == h else "landscape (wider than tall)" if w > h
+              else "portrait (taller than wide)")
+    return (f" The image MUST be {orient}, aspect ratio {w}:{h}, "
+            f"i.e. {w} pixels wide by {h} pixels tall."), (w, h)
+
+
+def _png_size(b64):
+    """(w, h) from a base64 PNG's IHDR, or None. Decodes only the header —
+    the prose codex returns claims whatever size was asked for, the IHDR
+    says what was delivered."""
+    try:
+        head = base64.b64decode(b64[:64])
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            return struct.unpack(">II", head[16:24])
+    except Exception:
+        pass
+    return None
+
+
 def _image_request():
     """Normalize an Images API request to (fields, images).
 
@@ -439,10 +478,11 @@ def _run_image_turn(route, wrapper):
         return fail(501, f"image generation is not available on the "
                          f"{BACKEND_KIND} backend (codex only)",
                     code="unsupported_backend")
-    for k in ("size", "quality", "style", "background", "output_format"):
+    for k in ("quality", "style", "background", "output_format"):
         if fields.get(k) not in (None, "auto"):
             _log(f"WARN: images/{route} ignoring {k}={fields[k]!r} "
                  f"(codex pins gpt-image-2 @ auto)")
+    size_text, want_size = _size_wording(fields.get("size"))
 
     try:
         backend = _get_backend()
@@ -458,9 +498,21 @@ def _run_image_turn(route, wrapper):
     _log(f"image/{route}: thread={thread_id}{img_note} prompt={prompt[:60]!r}")
     # Serialized with chat turns by the backend's turn lock. The wrapper text
     # makes the tool call unambiguous.
+    # "exactly once": a wordy dimensions instruction made the model call the
+    # tool twice in one turn during the aspect trials (double cost). The size
+    # sentence goes INSIDE the prompt body: the wrapper says "verbatim", and
+    # the model obeys — a size requirement placed in the wrapper never
+    # reached the tool (both test cases came back flipped, WARN fired).
+    # Same paragraph, not a trailing one: with "verbatim" in play the model
+    # forwarded only the first paragraph and dropped a size paragraph after
+    # a blank line (generations test, WARN fired).
+    body = prompt.rstrip() + (" " + size_text.strip() if size_text else "")
+    text = (f"{wrapper} Call the image generation tool exactly once, passing "
+            f"the complete text below as its prompt, verbatim, including any "
+            f"size requirement. Then reply with one short sentence:\n\n{body}")
     imgs, notes = [], []
     try:
-        for d in backend.prompt(wrapper + prompt, images=images, thread_id=thread_id):
+        for d in backend.prompt(text, images=images, thread_id=thread_id):
             if isinstance(d, tuple) and d[0] == "image":
                 imgs.append(d)
             elif isinstance(d, str) and d.lstrip().startswith("["):
@@ -470,19 +522,27 @@ def _run_image_turn(route, wrapper):
     if not imgs:
         return fail(502, "backend returned no image" +
                     (": " + "; ".join(notes) if notes else ""), code="server_error")
-    return jsonify({
-        "created": int(time.time()),
-        "data": [{"b64_json": img[2], "revised_prompt": img[3]} for img in imgs],
-    }), 200, {"X-Device": BACKEND_KIND, "X-Model": _model_label()}
+    data = []
+    for img in imgs:
+        entry = {"b64_json": img[2], "revised_prompt": img[3]}
+        got = _png_size(img[2])
+        if got:
+            entry["size"] = f"{got[0]}x{got[1]}"
+            if want_size and abs(got[0] / got[1] - want_size[0] / want_size[1]) > 0.05:
+                _log(f"WARN: images/{route} asked {want_size[0]}x{want_size[1]}, "
+                     f"got {entry['size']} (aspect not honored)")
+        data.append(entry)
+    return jsonify({"created": int(time.time()), "data": data}), 200, {
+        "X-Device": BACKEND_KIND, "X-Model": _model_label()}
 
 
 @app.route("/v1/images/generations", methods=["POST"])
 def images_generations():
-    """POST {"prompt": ...} -> {"data": [{"b64_json", "revised_prompt"}]}."""
+    """POST {"prompt": ..., "size"?: "WxH"} ->
+    {"data": [{"b64_json", "revised_prompt", "size"}]}."""
     return _run_image_turn(
         "generations",
-        "Generate exactly one image with the image generation tool using "
-        "this prompt verbatim, then reply with one short sentence:\n\n")
+        "Generate exactly one image with the image generation tool.")
 
 
 @app.route("/v1/images/edits", methods=["POST"])
@@ -490,16 +550,15 @@ def images_edits():
     """Reference-anchored generation: the attached image(s) ride the turn as
     ImageUserInput and codex's tool picks them up as recent conversation
     images (`num_last_images_to_include`; no file on disk needed — probed
-    2026-09-12). The output takes the reference's proportions (1536x1024 in
-    gave 1536x1024 out) but a prompt implying the other orientation flips
-    them (a 16:9 reference gave 941x1672 for a standing figure) — the only
-    aspect lever this surface has, and it is advisory."""
+    2026-09-12). Without `size` the output takes the reference's proportions
+    but the prompt decides orientation (a 16:9 reference gave 941x1672 for
+    "a standing figure filling the frame"); `size` pins it — see
+    _size_wording."""
     return _run_image_turn(
         "edits",
-        "Edit the attached image(s) with the image generation tool using this "
-        "prompt verbatim. Use every attached image as reference. Keep the "
-        "composition, dimensions and aspect ratio of the attached image unless "
-        "the prompt says otherwise. Then reply with one short sentence:\n\n")
+        "Edit the attached image(s) with the image generation tool. Use every "
+        "attached image as reference. Keep the composition and aspect ratio of "
+        "the attached image unless the text below says otherwise.")
 
 
 # --- Entry point --------------------------------------------------------

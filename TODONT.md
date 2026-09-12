@@ -148,7 +148,9 @@ Reported upstream as [github/copilot-sdk#2619](https://github.com/github/copilot
 Idea: make agentry's Images endpoint a faithful OpenAI Images API — pass
 `size`, `quality`, `background`, `n` through to codex's image tool.
 
-**Verdict:** impossible on the codex surface; don't fake it.
+**Verdict:** the *tool parameters* are unreachable; the *aspect ratio* is
+steerable through the prompt and agentry now does that (see the final
+update). Exact pixel dimensions and quality remain out of reach.
 
 **Why not** (2026-09-12, codex-cli 0.154.0, `codex-rs/ext/image-generation/src/tool.rs`):
 - The tool's model-facing arguments are exactly `prompt`,
@@ -177,6 +179,26 @@ panel-shaped" holds for `/generations` outright and for `/edits` whenever
 the prompt implies a different orientation than the reference. Anyone who
 needs an exact size still resizes/crops downstream, or uses the API.
 Quality/size *values* remain uncontrollable.
+
+**Update 2026-09-12 (evening) — REVERSED on aspect, held on size/quality.**
+Tommy suspected the "not controllable" verdict was too quick, and it was.
+Six controlled trials (`_bench/codex_image_aspect_probe.py`): a standing
+knight, prompt-only, comes out 1024×1536; the same prompt with "landscape,
+3:2, 1536 by 1024" comes out 1536×1024; "16:9, 1280 by 720" → 1672×941;
+"square 800 by 800" → 1254×1254; a landscape reference held 1536×1024 with
+and without wording. So `size: auto` in gpt-image-2 reads the prompt, and
+explicit orientation words win over the subject — which is what flipped the
+downstream 16:9 reference to portrait: the prompt said "standing figure
+filling the frame" and nothing about orientation. What is NOT controllable:
+the pixel count. Every output is ~1.57 megapixels (1254², 1536×1024 and
+1672×941 are all 1.573 MP) — gpt-image-2 normalizes to a fixed budget, and
+the assistant's prose then claims the requested size anyway ("Generated a
+1280×720 …" for a 1672×941 PNG). Quality is still hardcoded `auto`, and a
+wordy "keep exact dimensions" instruction made the model call the tool
+twice in one turn (double cost). What landed: `size` on both Images routes
+is translated into aspect wording in the wrapper, each `data[]` entry
+reports the PNG's real `size`, a WARN is logged when the ratio misses, and
+the wrappers say "exactly once".
 
 ## Deleting codex's on-disk image copies after forwarding
 

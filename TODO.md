@@ -230,6 +230,18 @@
       `POST /v1/images/edits`: OpenAI multipart (`image`/`image[]` + form
       fields) or JSON with `image` as data: URI(s), ≤5 references, `mask`
       rejected 400. Shares `_run_image_turn` with `/generations`.
+- [x] **Images `size` honored as aspect ratio** (2026-09-12, evening; Tommy
+      doubted the "not controllable" verdict). Six trials
+      (`_bench/codex_image_aspect_probe.py`): explicit orientation wording in
+      the prompt pins the aspect every time under codex's hardcoded
+      `size=auto`; the subject decides only when the prompt is silent (which
+      is what flipped the downstream 16:9 reference to portrait). Pixel count
+      is fixed at ~1.57 MP (1536×1024, 1254², 1672×941 for 16:9), and the
+      assistant's prose claims the asked-for size regardless. Landed: `size`
+      → aspect sentence in the wrapper, `data[].size` from the PNG IHDR, WARN
+      on a >5% ratio miss, "call the tool exactly once" (a wordy dimensions
+      instruction had made it call twice). TODONT entry updated (REVERSED on
+      aspect, held on pixels/quality).
 
 ## Backends
 

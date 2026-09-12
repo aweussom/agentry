@@ -192,19 +192,23 @@ also meters spend live:
   reply is unaffected.
 - `POST /v1/images/generations` — OpenAI Images API shape over codex's
   built-in image tool: `{"prompt": ...}` → `{"data": [{"b64_json",
-  "revised_prompt"}]}`. One image per call; `size`/`quality` are accepted
-  and ignored (codex pins `gpt-image-2` at `auto`/`auto` and exposes no
-  knobs — the model picks the aspect, 1254² or 1536×1024 in probes). Other
+  "revised_prompt", "size"}]}`. One image per call. `size` is honored as an
+  **aspect ratio**, not a pixel count: codex pins `gpt-image-2` at
+  `size=auto`, which reads the prompt, so agentry turns `1536x1024`,
+  `1024x1536`, `1024x1024` or any `WxH` into explicit orientation wording,
+  and the output lands at that ratio inside a fixed ~1.57-megapixel budget
+  (1536×1024, 1024×1536, 1254², 1672×941 for 16:9). Each `data[]` entry
+  carries the PNG's real `size`; resize downstream if you need exact
+  pixels. `quality` is accepted and ignored (hardcoded `auto`). Other
   backends answer 501.
 - `POST /v1/images/edits` — the same, anchored on reference images: OpenAI's
   multipart form (`image` / `image[]` file parts + `prompt`), or JSON with
   `image` as a data: URI (or a list of up to 5). The references ride the
-  codex turn as attached images and its tool edits against them; the
-  output takes the reference's *proportions* but not necessarily its
-  orientation (1536×1024 in → 1536×1024 out in probes; a downstream user's
-  16:9 reference gave 1672×941, and 941×1672 when the prompt implied a
-  standing figure) — the only aspect lever this surface has, and it is
-  advisory. `mask` is rejected (400):
+  codex turn as attached images and its tool edits against them. Without
+  `size`, the output takes the reference's proportions but the *prompt*
+  decides orientation (a downstream 16:9 reference came back 941×1672 for
+  "a standing figure filling the frame"); pass `size` to pin it. `mask` is
+  rejected (400):
   codex's tool takes whole-image references only. Both Images routes run
   each call on a throwaway codex thread, so a batch of edits never
   accumulates old references in one context and never disturbs the chat
