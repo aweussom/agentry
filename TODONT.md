@@ -142,3 +142,52 @@ spawns a throwaway runtime so it observes the account for real. See TODO
 ("Copilot plan quota went stale") and `_plan_quota_line` in `backends.py`.
 Reported upstream as [github/copilot-sdk#2619](https://github.com/github/copilot-sdk/issues/2619) (2026-09-11); repro in
 `_bench/quota_cache_probe.py`.
+
+## Honoring `size` / `quality` / `n` on `/v1/images/generations`
+
+Idea: make agentry's Images endpoint a faithful OpenAI Images API — pass
+`size`, `quality`, `background`, `n` through to codex's image tool.
+
+**Verdict:** impossible on the codex surface; don't fake it.
+
+**Why not** (2026-09-12, codex-cli 0.154.0, `codex-rs/ext/image-generation/src/tool.rs`):
+- The tool's model-facing arguments are exactly `prompt`,
+  `referenced_image_paths` (≤5) and `num_last_images_to_include` (1–5).
+  Model, quality and size are hardcoded: `IMAGE_MODEL = "gpt-image-2"`,
+  `quality: Some(ImageQuality::Auto)`, `size: Some("auto")`. There is no
+  config.toml key and no app-server param that reaches them.
+- "auto" means the model picks: the same prompt shape gave 1254×1254 for a
+  circle/square and 1536×1024 for a triangle in the probes. Wording the
+  aspect into the prompt is the only lever, and it is advisory.
+- `n>1` would be N sequential turns at ~15–20 s and one plan-window charge
+  each; a client that wants that can loop and see each cost.
+
+What landed instead: the endpoint accepts those fields, logs a WARN that it
+ignored them, rejects `n≠1` and `response_format≠b64_json` with a 400, and
+the README says so. Re-evaluate if the tool's `ImagegenArgs` grows
+size/quality fields (check `parse_args`/`request_for_call_args` in tool.rs).
+
+**Update 2026-09-12 (same day):** the *aspect* half is narrowed, then
+re-widened a little. A reference image carries the proportions:
+`/v1/images/edits` with a 1536×1024 reference returned 1536×1024 (probe
+`edit` mode). But a downstream user's acceptance run showed it does NOT pin
+orientation: a 16:9 `canonical.png` gave 1672×941, and 941×1672 (the inverse)
+when the prompt described a standing figure filling the frame. So "not
+panel-shaped" holds for `/generations` outright and for `/edits` whenever
+the prompt implies a different orientation than the reference. Anyone who
+needs an exact size still resizes/crops downstream, or uses the API.
+Quality/size *values* remain uncontrollable.
+
+## Deleting codex's on-disk image copies after forwarding
+
+Idea: agentry already has the PNG as base64 in the `imageGeneration` item's
+`result`, so the ~0.7–1 MB copy codex writes to
+`~/.codex/generated_images/<thread>/<item>.png` is dead weight; delete it.
+
+**Verdict:** not agentry's file to delete.
+
+**Why not:** codex writes it via its own extension sandbox into `codex_home`,
+not into agentry's scratch cwd, and codex's TUI / `thread/resume` reference
+those paths (`imageView`, `referenced_image_paths` for edits). Reaching into
+`~/.codex` from a wrapper is the same class of thing the copilot-keyring
+entry above declined. Left as a documented limit; it is the user's cache.

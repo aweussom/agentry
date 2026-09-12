@@ -226,6 +226,13 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// A generated image arrives as a data: URL from our own server; anything
+// else (or a non-image scheme) is dropped rather than rendered.
+function generatedImageHtml(url) {
+    if (!/^data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/i.test(url)) return '';
+    return `<img class="generated" src="${url}" alt="generated image">`;
+}
+
 function copyCode(btn) {
     const code = btn.parentElement.querySelector('code').textContent;
     navigator.clipboard.writeText(code);
@@ -401,6 +408,7 @@ async function sendMessage() {
         if (contentType.includes('text/event-stream')) {
             let fullText = '';
             let reasoningText = '';
+            const imageUrls = [];
             // Fold streamed reasoning into the <think> convention the
             // renderer already speaks: open while only reasoning has
             // arrived, closed once (or when) the answer starts.
@@ -408,6 +416,10 @@ async function sendMessage() {
                 if (!reasoningText) return fullText;
                 const closed = fullText || !streaming;
                 return `<think>${reasoningText}${closed ? '</think>' : ''}${fullText}`;
+            };
+            const render = (streaming) => {
+                assistantDiv.innerHTML = renderMarkdown(displayText(streaming), streaming)
+                    + imageUrls.map(generatedImageHtml).join('');
             };
             const reader = resp.body.getReader();
             const decoder = new TextDecoder();
@@ -428,15 +440,22 @@ async function sendMessage() {
                         const d = chunk.choices?.[0]?.delta || {};
                         if (d.content) fullText += d.content;
                         if (d.reasoning_content) reasoningText += d.reasoning_content;
-                        if (d.content || d.reasoning_content) {
-                            assistantDiv.innerHTML = renderMarkdown(displayText(true), true);
+                        // Generated images (codex): OpenRouter-style
+                        // delta.images, each a data: URL. Rendered below
+                        // the text, never mixed into the markdown source.
+                        for (const im of d.images || []) {
+                            const url = im.image_url?.url;
+                            if (url) imageUrls.push(url);
+                        }
+                        if (d.content || d.reasoning_content || d.images) {
+                            render(true);
                             scrollToBottom();
                         }
                     } catch {}
                 }
             }
 
-            assistantDiv.innerHTML = renderMarkdown(displayText(false), false);
+            render(false);
             const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
             const metaDiv = document.createElement('div');
             metaDiv.className = 'meta';
@@ -448,7 +467,10 @@ async function sendMessage() {
         } else {
             const data = await resp.json();
             const replyText = data.choices?.[0]?.message?.content || '';
-            assistantDiv.innerHTML = renderMarkdown(replyText);
+            const replyImages = (data.choices?.[0]?.message?.images || [])
+                .map(im => im.image_url?.url).filter(Boolean);
+            assistantDiv.innerHTML = renderMarkdown(replyText)
+                + replyImages.map(generatedImageHtml).join('');
             const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
             const metaDiv = document.createElement('div');
             metaDiv.className = 'meta';

@@ -24,6 +24,7 @@ Auth:
 
 import argparse
 import atexit
+import base64
 import json
 import sys
 import threading
@@ -123,11 +124,22 @@ def _latest_user_content(messages):
     return "", []
 
 
-def _sse(delta, model, done=False, reasoning=False):
+def _image_part(img):
+    """("image", mime, b64, revised) backend tuple -> the OpenRouter-style
+    `images` entry (what Open WebUI / LibreChat render for image-out models)."""
+    return {"type": "image_url",
+            "image_url": {"url": f"data:{img[1]};base64,{img[2]}"}}
+
+
+def _sse(delta, model, done=False, reasoning=False, images=None):
     # reasoning deltas ride in "reasoning_content" (the de-facto extension
     # DeepSeek popularized); standard OpenAI clients ignore the unknown key.
+    # Generated images ride in "images" (OpenRouter's convention) — never in
+    # content, so a JSON-expecting enrichment client is unaffected.
     if done:
         d = {}
+    elif images:
+        d = {"images": images}
     elif reasoning:
         d = {"reasoning_content": delta}
     else:
@@ -297,7 +309,9 @@ def chat_completions():
             try:
                 for delta in backend.prompt(prompt_text, images=images,
                                             model=want_model, effort=want_effort):
-                    if isinstance(delta, tuple):    # ("reasoning", text)
+                    if isinstance(delta, tuple) and delta[0] == "image":
+                        yield _sse("", model, images=[_image_part(delta)])
+                    elif isinstance(delta, tuple):    # ("reasoning", text)
                         yield _sse(delta[1], model, reasoning=True)
                     else:
                         yield _sse(delta, model)
@@ -307,12 +321,21 @@ def chat_completions():
         return Response(generate(), mimetype="text/event-stream", headers=headers)
 
     try:
-        # Non-streaming: reasoning tuples are dropped; only answer text joins.
-        full = "".join(d for d in backend.prompt(prompt_text, images=images,
-                                                 model=want_model, effort=want_effort)
-                       if isinstance(d, str))
+        # Non-streaming: reasoning tuples are dropped; answer text joins and
+        # generated images collect into message.images.
+        parts, imgs = [], []
+        for d in backend.prompt(prompt_text, images=images,
+                                model=want_model, effort=want_effort):
+            if isinstance(d, str):
+                parts.append(d)
+            elif d[0] == "image":
+                imgs.append(_image_part(d))
+        full = "".join(parts)
     finally:
         _REQ_T0.pop(tid, None)
+    message = {"role": "assistant", "content": full}
+    if imgs:
+        message["images"] = imgs
     return jsonify({
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -320,10 +343,163 @@ def chat_completions():
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": full},
+            "message": message,
             "finish_reason": "stop",
         }],
     }), 200, headers
+
+
+# --- Images API (codex's built-in image tool) --------------------------------
+#
+# OpenAI Images API shape over codex's built-in image generation. codex only
+# (copilot/claude have no image tool -> 501). One image per call, returned as
+# b64_json: codex pins gpt-image-2 at quality=auto / size=auto and exposes no
+# knobs, so `size`/`quality` are accepted and ignored (logged) rather than
+# faked. Cost lands on the ChatGPT-plan window like any turn, not on API
+# billing: three probe images on 2026-09-12 moved a Plus 5h window by at most
+# one integer percentage point in total. NB the per-turn credits estimate in
+# the log counts tokens only (an image turn reports ~10-50 output tokens), so
+# it understates image turns.
+
+# codex's tool accepts at most 5 reference images (ImagegenArgs, tool.rs).
+_MAX_EDIT_IMAGES = 5
+
+
+def _image_request():
+    """Normalize an Images API request to (fields, images).
+
+    OpenAI's /images/edits is multipart/form-data (`image` / `image[]` file
+    parts, plus form fields); /generations is JSON. We take either encoding
+    on both routes, and in JSON also accept `image` as a data: URI string or
+    a list of them (the same shape chat clients already send). images is a
+    list of (mime, base64) like _latest_user_content() produces."""
+    images = []
+    if request.content_type and request.content_type.startswith("multipart/"):
+        fields = request.form.to_dict()
+        for key in ("image", "image[]"):
+            for f in request.files.getlist(key):
+                data = f.read()
+                mime = f.mimetype or "image/png"
+                if not mime.startswith("image/"):
+                    mime = "image/png"
+                images.append((mime, base64.b64encode(data).decode("ascii")))
+        for key in ("mask", "mask[]"):
+            if request.files.getlist(key):
+                fields["mask"] = "present"
+        return fields, images
+    fields = request.get_json(force=True, silent=True) or {}
+    raw = fields.get("image")
+    for item in ([raw] if isinstance(raw, str) else (raw or [])):
+        url = item.get("image_url", {}).get("url") if isinstance(item, dict) else item
+        parsed = _parse_data_uri(url or "")
+        if parsed:
+            images.append(parsed)
+        else:
+            _log(f"WARN: images/edits skipping image (not a base64 data: URI): "
+                 f"{str(url)[:60]!r}")
+    return fields, images
+
+
+def _run_image_turn(route, wrapper):
+    """Shared body of the two Images routes: validate, run one codex turn that
+    calls the image tool, return the OpenAI Images response. `wrapper` is the
+    instruction text prefixed to the user's prompt so the tool call is
+    unambiguous for the route."""
+    tid = threading.get_ident()
+    _REQ_T0[tid] = _now()
+
+    def fail(status, message, code="invalid_request_error", param=None):
+        _REQ_T0.pop(tid, None)
+        err = {"message": message, "type": code}
+        if param:
+            err["param"] = param
+        return jsonify({"error": err}), status
+
+    fields, images = _image_request()
+    prompt = (fields.get("prompt") or "").strip()
+    if not prompt:
+        return fail(400, "prompt is required", param="prompt")
+    if str(fields.get("n", 1)) != "1":
+        return fail(400, "only n=1 is supported", param="n")
+    if fields.get("response_format", "b64_json") != "b64_json":
+        return fail(400, "only response_format=b64_json is supported",
+                    param="response_format")
+    if route == "edits":
+        if not images:
+            return fail(400, "at least one reference image is required "
+                             "(multipart `image` file, or a data: URI in JSON)",
+                        param="image")
+        if len(images) > _MAX_EDIT_IMAGES:
+            return fail(400, f"at most {_MAX_EDIT_IMAGES} reference images",
+                        param="image")
+        if fields.get("mask"):
+            return fail(400, "mask is not supported (codex's image tool takes "
+                             "whole-image references only)", param="mask")
+    if BACKEND_KIND != "codex":
+        return fail(501, f"image generation is not available on the "
+                         f"{BACKEND_KIND} backend (codex only)",
+                    code="unsupported_backend")
+    for k in ("size", "quality", "style", "background", "output_format"):
+        if fields.get(k) not in (None, "auto"):
+            _log(f"WARN: images/{route} ignoring {k}={fields[k]!r} "
+                 f"(codex pins gpt-image-2 @ auto)")
+
+    try:
+        backend = _get_backend()
+        # Every Images call gets its own throwaway thread: it never touches
+        # the chat session, and a batch caller doesn't build up a context of
+        # old references the tool could mistake for this call's (see
+        # CodexAppServerBackend.scratch_thread).
+        thread_id = backend.scratch_thread()
+    except Exception as e:
+        return fail(500, f"backend init failed: {e}", code="server_error")
+
+    img_note = f" images={len(images)}" if images else ""
+    _log(f"image/{route}: thread={thread_id}{img_note} prompt={prompt[:60]!r}")
+    # Serialized with chat turns by the backend's turn lock. The wrapper text
+    # makes the tool call unambiguous.
+    imgs, notes = [], []
+    try:
+        for d in backend.prompt(wrapper + prompt, images=images, thread_id=thread_id):
+            if isinstance(d, tuple) and d[0] == "image":
+                imgs.append(d)
+            elif isinstance(d, str) and d.lstrip().startswith("["):
+                notes.append(d.strip())
+    finally:
+        _REQ_T0.pop(tid, None)
+    if not imgs:
+        return fail(502, "backend returned no image" +
+                    (": " + "; ".join(notes) if notes else ""), code="server_error")
+    return jsonify({
+        "created": int(time.time()),
+        "data": [{"b64_json": img[2], "revised_prompt": img[3]} for img in imgs],
+    }), 200, {"X-Device": BACKEND_KIND, "X-Model": _model_label()}
+
+
+@app.route("/v1/images/generations", methods=["POST"])
+def images_generations():
+    """POST {"prompt": ...} -> {"data": [{"b64_json", "revised_prompt"}]}."""
+    return _run_image_turn(
+        "generations",
+        "Generate exactly one image with the image generation tool using "
+        "this prompt verbatim, then reply with one short sentence:\n\n")
+
+
+@app.route("/v1/images/edits", methods=["POST"])
+def images_edits():
+    """Reference-anchored generation: the attached image(s) ride the turn as
+    ImageUserInput and codex's tool picks them up as recent conversation
+    images (`num_last_images_to_include`; no file on disk needed — probed
+    2026-09-12). The output takes the reference's proportions (1536x1024 in
+    gave 1536x1024 out) but a prompt implying the other orientation flips
+    them (a 16:9 reference gave 941x1672 for a standing figure) — the only
+    aspect lever this surface has, and it is advisory."""
+    return _run_image_turn(
+        "edits",
+        "Edit the attached image(s) with the image generation tool using this "
+        "prompt verbatim. Use every attached image as reference. Keep the "
+        "composition, dimensions and aspect ratio of the attached image unless "
+        "the prompt says otherwise. Then reply with one short sentence:\n\n")
 
 
 # --- Entry point --------------------------------------------------------

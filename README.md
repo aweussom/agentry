@@ -18,7 +18,10 @@ is here](https://dev.to/tommy_leonhardsen_81d1f4e/i-built-an-openai-compatible-p
 A minimal chat **web UI** ships with the proxy — markdown with code-copy,
 image attach, live collapsible thinking blocks, a model picker fed by
 `/v1/models`, and an artifact side panel that renders fenced `html`/`svg`/
-`markdown` blocks. It is not the point of the project, just proof the API
+`markdown` blocks. On the `codex` backend it also **generates and edits
+images** through codex's built-in `gpt-image-2` tool, billed to the ChatGPT
+plan rather than the API — inline in chat, and as OpenAI-shaped
+`/v1/images/generations` and `/v1/images/edits` routes (see *API*). It is not the point of the project, just proof the API
 works end-to-end. The launcher prints the URL (`http://localhost:8765`).
 
 ![Bundled chat UI talking to the proxy as a regular OpenAI endpoint: markdown answer with a copy button on the code block, a collapsible thinking block above it, a per-turn backend + latency tag, image attach, and a header showing the active model and reasoning effort](./images/web-ui.png)
@@ -182,9 +185,55 @@ also meters spend live:
 - `POST /v1/chat/completions` — SSE streaming in standard OpenAI delta
   format; images ride as `image_url` data: URIs; copilot's streamed reasoning
   summaries are forwarded as `delta.reasoning_content` (the
-  DeepSeek-popularized extension; standard clients ignore it).
+  DeepSeek-popularized extension; standard clients ignore it). Images the
+  backend *generates* (codex, see below) arrive as `delta.images` /
+  `message.images` — OpenRouter's convention, a list of `image_url` data:
+  URIs — never inline in `content`, so a client parsing JSON out of the
+  reply is unaffected.
+- `POST /v1/images/generations` — OpenAI Images API shape over codex's
+  built-in image tool: `{"prompt": ...}` → `{"data": [{"b64_json",
+  "revised_prompt"}]}`. One image per call; `size`/`quality` are accepted
+  and ignored (codex pins `gpt-image-2` at `auto`/`auto` and exposes no
+  knobs — the model picks the aspect, 1254² or 1536×1024 in probes). Other
+  backends answer 501.
+- `POST /v1/images/edits` — the same, anchored on reference images: OpenAI's
+  multipart form (`image` / `image[]` file parts + `prompt`), or JSON with
+  `image` as a data: URI (or a list of up to 5). The references ride the
+  codex turn as attached images and its tool edits against them; the
+  output takes the reference's *proportions* but not necessarily its
+  orientation (1536×1024 in → 1536×1024 out in probes; a downstream user's
+  16:9 reference gave 1672×941, and 941×1672 when the prompt implied a
+  standing figure) — the only aspect lever this surface has, and it is
+  advisory. `mask` is rejected (400):
+  codex's tool takes whole-image references only. Both Images routes run
+  each call on a throwaway codex thread, so a batch of edits never
+  accumulates old references in one context and never disturbs the chat
+  session; they still serialize with chat turns through the one turn lock.
 - `POST /v1/cancel` — cancels the in-flight turn (copilot `session.abort()`,
   codex `turn/interrupt`, claude kills the process).
+
+### Image generation (codex)
+
+codex-cli ≥ 0.149 ships image generation as a stable, on-by-default
+built-in tool, and it works over `app-server` under agentry's locked-down
+thread (no approvals, read-only sandbox, empty cwd — probed on 0.154.0,
+`_bench/codex_imagegen_probe.py`). agentry's chat-only developer
+instructions carve it out as the one permitted tool, *only when the user
+explicitly asks for an image*, so enrichment prompts stay image-free. Ask
+for a picture in the web UI and it renders under the reply; ~15–20 s per
+image with a short prompt, ~45 s with a long prompt plus a 0.7 MB reference
+(downstream measurement), calls serialize through the one turn lock, so a
+batch of 30 is ~20 min of wall clock. ~0.7–1.4 MB PNG; a copy is also left in
+`~/.codex/generated_images/<thread>/` by codex itself.
+
+Cost is the point: the image bills against the **ChatGPT-plan window**
+(three probe images moved a Plus 5-hour window by at most one integer
+percentage point in total), not against API pricing, where the same
+image on `gpt-image-*` is ~1 US cent. OpenAI's own guidance is that
+image turns consume included usage "3–5× faster" than text turns — that is
+a server-side weighting, not extra tokens: an image turn reports ~10
+output tokens, so agentry's per-turn credits estimate understates it.
+For batch generation OpenAI points at `OPENAI_API_KEY` billing instead.
 
 ## Architecture
 
@@ -222,11 +271,14 @@ context hints into prompts.
 
 ## Known limits
 
-- **Tool requests are always denied** — by design. A prompt that genuinely
-  needs a tool degrades or errors rather than working around it.
-- **Reasoning trace depends on backend.** Copilot's summaries reach the
-  console ticker and the web UI think-block; codex also streams reasoning
-  but it is not forwarded yet.
+- **Tool requests are always denied** — by design, with one carve-out:
+  codex's built-in image generation, and only when a message explicitly
+  asks for an image (see *Image generation*). Everything else — shell,
+  file reads, MCP — is refused, so a prompt that genuinely needs a tool
+  degrades or errors rather than working around it.
+- **Reasoning trace depends on backend.** Copilot's and codex's streamed
+  summaries reach the console ticker and the web UI think-block; claude
+  forwards none.
 - **Auth is inherited, not configured.** There is no token setting: agentry
   uses whatever login the backend CLI already has for the user running it
   (`copilot login`, `codex login`, Claude Code's own login). Start it from

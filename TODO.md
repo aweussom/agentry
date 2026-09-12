@@ -192,6 +192,45 @@
       `_bench/quota_cache_probe.py`. If it lands a TTL/force-refresh, drop the
       throwaway-runtime re-fetch and call the main client again.
 
+- [x] **Codex image generation** (2026-09-12, codex-cli 0.154.0). codex ships
+      it as a stable, default-on built-in tool (`image_generation` in
+      `codex features list`), and it fires over `app-server` inside agentry's
+      locked-down thread — approvalPolicy=never, sandbox=read-only, empty
+      scratch cwd — with no approval round-trip (`_bench/codex_imagegen_probe.py`).
+      The completed `imageGeneration` item carries the whole PNG as base64 in
+      `result` (~0.7–1 MB) plus `revisedPrompt` and a `savedPath` under
+      `~/.codex/generated_images/`. Landed:
+    - `CHAT_ONLY_INSTRUCTIONS` carve-out: the flat "Do not use any tools"
+      made codex refuse ("I'm unable to generate images in this chat");
+      now image generation is the one permitted tool, "only when the user
+      explicitly asks for an image", so enrichment prompts are unchanged.
+    - Backend contract: `prompt()` yields `("image", mime, b64, revised)`;
+      `/v1/chat/completions` emits it as `delta.images` / `message.images`
+      (OpenRouter's convention, never in `content`); the web UI renders it
+      under the reply. New `POST /v1/images/generations` in OpenAI Images
+      shape (codex only, `n=1`, `b64_json`; size/quality ignored with a WARN
+      — codex hardcodes gpt-image-2 @ auto/auto, see TODONT).
+    - Measured: ~15–20 s per image; an image turn reports ~10 output tokens,
+      so the "3–5× faster usage" OpenAI documents is a server-side weighting
+      on the plan window, invisible to the token-based credits estimate.
+      Three images moved a Plus 5h window ≤1 integer percentage point.
+- [x] **Codex image edits** (2026-09-12, same day, prompted by a downstream
+      user whose training-data pipeline needs every frame anchored on a
+      reference image — "the reference carries the register, not the model").
+      Probe `edit` mode: a 1536×1024 PNG attached as `ImageUserInput` + "recolor
+      the shape to blue" → codex's tool fired in edit mode against the
+      conversation image (no file on disk, no `imageView` step), returned a
+      faithful recolor at **1536×1024** — the reference carries the
+      proportions (not the orientation: a downstream 16:9 reference came back
+      941×1672 when the prompt implied a standing figure), which narrows the
+      size/quality TODONT. ~30 s, 1.3 MB here; ~45 s downstream with a long
+      prompt and a 0.7 MB reference. That user's acceptance run also
+      confirmed the register follows the reference (manga linework held with
+      `canonical.png` attached, went semi-realistic without it). Landed
+      `POST /v1/images/edits`: OpenAI multipart (`image`/`image[]` + form
+      fields) or JSON with `image` as data: URI(s), ≤5 references, `mask`
+      rejected 400. Shares `_run_image_turn` with `/generations`.
+
 ## Backends
 
 - [ ] **Persistent `claude` backend with `/clear` per task** (unblocked

@@ -96,7 +96,10 @@ class Backend(abc.ABC):
 
         Backends that stream reasoning may additionally yield tagged tuples
         ("reasoning", str) interleaved with the plain-str answer deltas;
-        consumers that only want the answer must filter for str items."""
+        consumers that only want the answer must filter for str items.
+        Backends whose runtime can generate images yield each finished image
+        as ("image", mime_type, base64_data, revised_prompt_or_None) — never
+        inline in the text, so JSON-expecting clients keep a clean content."""
 
     @abc.abstractmethod
     def cancel(self) -> bool:
@@ -805,11 +808,20 @@ class CodexAppServerBackend(Backend):
     # to behave as a stateless answerer. (Necessary but not sufficient — see
     # the empty-scratch cwd below; sandbox=read-only alone does NOT stop reads,
     # because read-only commands are auto-approved regardless of approvalPolicy.)
+    # Image generation is the ONE carve-out (codex-cli >= 0.149 ships it as a
+    # built-in tool, stable, on by default). Probed 2026-09-12 on 0.154.0
+    # (`_bench/codex_imagegen_probe.py`): with the flat "Do not use any tools"
+    # wording codex refuses ("I'm unable to generate images in this chat");
+    # with this carve-out it generates, under the same approvalPolicy=never /
+    # sandbox=read-only / empty-cwd setup, with no approval round-trip. The
+    # "only when explicitly asked" clause keeps enrichment prompts image-free.
     CHAT_ONLY_INSTRUCTIONS = (
         "You are a stateless question-answering assistant exposed over an HTTP "
         "chat API. Answer each user message directly and completely using only "
         "your own knowledge and the content of the message itself. "
-        "Do not use any tools. Do not run shell commands. Do not read, list, "
+        "The ONLY tool you may use is image generation, and only when the user "
+        "explicitly asks for an image; never use any other tool. "
+        "Do not run shell commands. Do not read, list, "
         "search, or otherwise inspect files or directories. There is no relevant "
         "codebase, repository, or workspace — ignore the working directory "
         "entirely. If the message asks for a specific output format (e.g. a JSON "
@@ -857,6 +869,7 @@ class CodexAppServerBackend(Backend):
         self.pending = {}              # id -> Queue (for initialize, thread/start, turn/start ack)
         self.active_turn_queue = None  # Queue for the active turn's notifications: (method, params)
         self._active_turn_id = None    # turn id from the turn/start ack, for turn/interrupt
+        self._active_thread_id = None  # thread the in-flight turn runs on (may be a scratch thread)
         self._rate_limits = None       # latest RateLimitSnapshot from notifications
         self._rl_lock = threading.Lock()
         self._turn_tokens = None       # thread/tokenUsage/updated "last" for the in-flight turn
@@ -996,6 +1009,15 @@ class CodexAppServerBackend(Backend):
         # We pin an empty cwd and inject
         # chat-only developer instructions so codex behaves as a plain answerer
         # rather than an agent exploring the filesystem.
+        with self.turn_lock:
+            self.session_id, self._default_model = self._start_thread(cwd)
+            self.session_fresh = True
+            _log(f"codex thread: {self.session_id} (default model={self._default_model!r})")
+            return self.session_id
+
+    def _start_thread(self, cwd=None):
+        """thread/start with agentry's locked-down policy; returns (thread id,
+        the model the thread resolved to). Does NOT touch session_id."""
         params = {"approvalPolicy": "never", "sandbox": "read-only",
                   "cwd": os.path.abspath(cwd) if cwd else self.cwd,
                   # Without this config override codex emits NO reasoning
@@ -1005,15 +1027,22 @@ class CodexAppServerBackend(Backend):
                   "config": {"model_reasoning_summary": "detailed"}}
         if self.developer_instructions:
             params["developerInstructions"] = self.developer_instructions
-        with self.turn_lock:
-            result = self._request("thread/start", params)
-            self.session_id = result["thread"]["id"]
-            self.session_fresh = True
-            # Remember what the thread resolved to so current_model() is truthful
-            # when no explicit pin is set (the label used to lie: "codex-default").
-            self._default_model = result.get("model")
-            _log(f"codex thread: {self.session_id} (default model={self._default_model!r})")
-            return self.session_id
+        result = self._request("thread/start", params)
+        # Remember what the thread resolved to so current_model() is truthful
+        # when no explicit pin is set (the label used to lie: "codex-default").
+        return result["thread"]["id"], result.get("model")
+
+    def scratch_thread(self):
+        """A throwaway thread for one-shot work (the Images routes), separate
+        from the chat session: a shared thread would accumulate every
+        reference and result image in its context (probe: input tokens grew
+        15.7k -> 24k over three image calls) and the tool's
+        `num_last_images_to_include` could then pick a stale image as the
+        reference. The id is passed back via prompt(thread_id=) and simply
+        dropped afterwards; codex keeps its rollout under ~/.codex/sessions."""
+        tid, _ = self._start_thread()
+        _log(f"codex scratch thread: {tid}")
+        return tid
 
     def current_model(self):
         return self.default_model or self._default_model
@@ -1026,7 +1055,8 @@ class CodexAppServerBackend(Backend):
             self._models_cache = result.get("data") or []
         return self._models_cache or None
 
-    def prompt(self, text, images=None, timeout=900, model=None, effort=None):
+    def prompt(self, text, images=None, timeout=900, model=None, effort=None,
+               thread_id=None):
         """Generator yielding text deltas for one turn. Requires an active thread.
 
         model/effort: this turn's selection — codex scopes both per turn
@@ -1034,8 +1064,13 @@ class CodexAppServerBackend(Backend):
 
         Images ride as ImageUserInput items ({type:"image", url}) with a data:
         URI — the UserInput schema (generate-json-schema) also offers
-        localImage{path} as a fallback if data: URLs turn out unsupported."""
-        if not self.session_id:
+        localImage{path} as a fallback if data: URLs turn out unsupported.
+
+        thread_id (codex-only extension): run the turn on that thread instead
+        of the chat session — see scratch_thread(). Serialized by the same
+        turn lock either way."""
+        thread_id = thread_id or self.session_id
+        if not thread_id:
             raise BackendError("no active session (call new_session first)")
         input_items = []
         if text:
@@ -1055,7 +1090,8 @@ class CodexAppServerBackend(Backend):
                 turn_model = model or self.default_model
                 turn_effort = effort or self.default_effort
                 self._turn_model = turn_model or self._default_model
-                tparams = {"threadId": self.session_id,
+                self._active_thread_id = thread_id   # for turn/interrupt
+                tparams = {"threadId": thread_id,
                            "input": input_items}
                 if turn_model:
                     tparams["model"] = turn_model
@@ -1063,7 +1099,8 @@ class CodexAppServerBackend(Backend):
                     tparams["effort"] = turn_effort
                 self._write({"jsonrpc": "2.0", "id": msg_id,
                              "method": "turn/start", "params": tparams})
-                self.session_fresh = False
+                if thread_id == self.session_id:
+                    self.session_fresh = False
                 # The ack normally arrives at once (notifications buffer in q
                 # meanwhile). An error response (bad model, dead thread) means
                 # no turn ever starts — surface it now instead of stalling
@@ -1109,6 +1146,22 @@ class CodexAppServerBackend(Backend):
                         t = params.get("delta")
                         if t:
                             yield ("reasoning", t)
+                    elif method in ("item/started", "item/completed"):
+                        # Built-in image generation (gpt-image-2, pinned by
+                        # codex at quality=auto/size=auto; not client-tunable).
+                        # The finished item carries the whole PNG as base64 in
+                        # `result` (~1 MB for a 1254x1254) plus a copy on disk
+                        # under ~/.codex/generated_images/<thread>/<item>.png.
+                        item = params.get("item") or {}
+                        if item.get("type") != "imageGeneration":
+                            continue
+                        if turn_id and params.get("turnId") not in (None, turn_id):
+                            continue
+                        if method == "item/started":
+                            self._image_t0 = time.time()
+                            _log("codex image generation started")
+                            continue
+                        yield self._image_from_item(item)
                     elif method == "thread/tokenUsage/updated":
                         # Per-turn token accounting; "last" is this turn's call.
                         self._turn_tokens = (params.get("tokenUsage")
@@ -1126,18 +1179,47 @@ class CodexAppServerBackend(Backend):
             finally:
                 self.active_turn_queue = None
                 self._active_turn_id = None
+                self._active_thread_id = None
                 self.pending.pop(msg_id, None)
+
+    # PNG / JPEG / WebP base64 prefixes; codex's image tool emits PNG today.
+    _IMAGE_MAGIC = (("iVBORw0KGgo", "image/png"), ("/9j/", "image/jpeg"),
+                    ("UklGR", "image/webp"))
+
+    def _image_from_item(self, item):
+        """Turn a completed imageGeneration item into the Backend contract's
+        ("image", mime, b64, revised_prompt) tuple, or a visible error note
+        when codex reports a failure (usage-limit) or an empty result."""
+        dt = time.time() - (getattr(self, "_image_t0", None) or time.time())
+        failure = item.get("failure") or {}
+        b64 = item.get("result") or ""
+        if failure.get("type") == "usageLimitExceeded" or not b64:
+            reason = ("image usage limit reached"
+                      if failure.get("type") == "usageLimitExceeded"
+                      else f"status={item.get('status')!r}, empty result")
+            resets = failure.get("resetsAt")
+            if resets:
+                reason += f" (resets {self._fmt_reset(resets)})"
+            _log(f"codex image failed after {dt:.1f}s: {reason}")
+            return f"\n[codex image error] {reason}"
+        mime = next((m for magic, m in self._IMAGE_MAGIC if b64.startswith(magic)),
+                    "image/png")
+        # Size + wall time only — the prompt itself stays out of the log.
+        _log(f"codex image: {len(b64) * 3 // 4 / 1024:.0f} KB {mime} in {dt:.1f}s"
+             + (f" (saved {item['savedPath']})" if item.get("savedPath") else ""))
+        return ("image", mime, b64, item.get("revisedPrompt"))
 
     def _interrupt(self, turn_id):
         """Fire-and-forget turn/interrupt. Per the v2 schema it is a REQUEST
         requiring both threadId and turnId (a bare-threadId notification is
         silently ignored); we send a real id and drop the response unread."""
-        if not (self.session_id and turn_id):
+        thread_id = getattr(self, "_active_thread_id", None) or self.session_id
+        if not (thread_id and turn_id):
             return False
         try:
             self._write({"jsonrpc": "2.0", "id": self._next_id(),
                          "method": "turn/interrupt",
-                         "params": {"threadId": self.session_id,
+                         "params": {"threadId": thread_id,
                                     "turnId": turn_id}})
             return True
         except Exception:
