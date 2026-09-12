@@ -230,6 +230,18 @@ image with a short prompt, ~45 s with a long prompt plus a 0.7 MB reference
 batch of 30 is ~20 min of wall clock. ~0.7–1.4 MB PNG; a copy is also left in
 `~/.codex/generated_images/<thread>/` by codex itself.
 
+The chat model does not change the picture — every model on the account
+(`luna`, `terra`, `sol`, `gpt-6-astra`, `gpt-5.5`) gets the same
+`gpt-image-2` tool, honored the aspect, and took 40–58 s
+(`_bench/codex_image_model_probe.py`). What differs is the **rewrite**: the
+chat model rephrases your prompt before handing it to the image model.
+`luna` forwards it almost verbatim; the bigger models triple it with
+content you never asked for (`sol` added "no weapon required" and the
+knight lost his sword). For a pipeline that wants *its* prompt to reach the
+image model, the cheap default is the right choice. The tool is offered
+only on a paid ChatGPT plan with ChatGPT login — a Free plan or an
+`OPENAI_API_KEY` login does not get it (codex `spec_plan.rs`).
+
 Cost is the point: the image bills against the **ChatGPT-plan window**
 (three probe images moved a Plus 5-hour window by at most one integer
 percentage point in total), not against API pricing, where the same

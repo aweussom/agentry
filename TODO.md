@@ -242,6 +242,16 @@
       on a >5% ratio miss, "call the tool exactly once" (a wordy dimensions
       instruction had made it call twice). TODONT entry updated (REVERSED on
       aspect, held on pixels/quality).
+- [x] **Does the chat model matter for images?** (2026-09-12, Tommy asked.)
+      No, for the picture: all five account models get the same `gpt-image-2`
+      tool, all honored 1536×1024, 40–58 s each, one call each
+      (`_bench/codex_image_model_probe.py`). Yes, for the *prompt*: the chat
+      model rewrites it before the tool call — `luna` near-verbatim, `terra`/
+      `sol`/`astra` ~3× longer with invented constraints (`sol`: "no weapon
+      required" → sword gone). Keep `luna` (the default) for image work; it is
+      the cheapest and the most faithful. Gating from `spec_plan.rs`: feature
+      on, plan ≠ Free, model has image input, ChatGPT-login auth (API-key
+      login does not get the tool).
 
 ## Backends
 
