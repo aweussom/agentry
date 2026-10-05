@@ -42,13 +42,13 @@ is an MCP *client* — it exists to call tools. Agentry confiscates them and
 serves the bare model back out, so ordinary software consumes the model
 instead (`code ──▶ LLM`).
 
-The flip is enforced, not narrated: every backend runs with its tool surface
-switched off. The copilot session is created with an empty tool allowlist and
-a deny-all permission handler; codex and claude get every tool, permission,
-and filesystem request refused at the wire (JSON-RPC `-32601`), and codex
-threads additionally run `approvalPolicy: never` + `sandbox: read-only`.
-Stripped of its ability to consume tools, the agent is left as a pure
-language service behind an OpenAI-shaped API.
+Copilot sessions use an empty tool allowlist and a deny-all permission handler.
+Claude disables built-in tools and MCP servers at launch. Codex refuses
+client-side requests at the wire (JSON-RPC `-32601`) and uses
+`approvalPolicy: never`, a read-only sandbox, an empty working directory and
+chat-only instructions, with an explicit image-generation exception. Those
+Codex settings do not establish that every runtime-internal tool is disabled.
+The intended result is a language service behind an OpenAI-shaped API.
 
 ## Backends
 
@@ -57,15 +57,48 @@ class in `backends.py`.
 
 | Backend | Wraps | Cost tier | Defaults |
 |---|---|---|---|
-| `copilot` (default) | the official [Copilot SDK](https://github.com/github/copilot-sdk) | Copilot AI credits per token (1 credit = $0.01); `gpt-5.6-luna` is the cheap band ($0.20/M in), ~10× under `terra`, ~25× under `sol` | `gpt-5.6-luna` @ `low` |
+| `copilot` (default) | the official [Copilot SDK](https://github.com/github/copilot-sdk) | Copilot AI credits per token (1 credit = $0.01); `gpt-5.6-luna` is the cheap band ($0.20/M in), ~10× under `gpt-5.6-terra`, ~20× under `gpt-5.6-sol` (live rate card 2026-09) | `gpt-5.6-luna` @ `low` |
 | `codex` | `codex app-server` (persistent JSON-RPC stdio) | ChatGPT Go $8 / Plus $20; Codex credits per token, `luna` 25× cheaper than `sol` | codex's own configured model @ `low` |
-| `claude` | `claude -p`, one fresh process per turn | Claude subscription (premium) | `claude-sonnet-4-6` |
+| `claude` | persistent `claude -p` stream-JSON, conversation cleared per request | Claude subscription (premium) | `claude-sonnet-4-6` |
+| `grok` | `grok agent stdio` ([Grok Build](https://github.com/xai-org/grok-build), Agent Client Protocol over stdio) | SuperGrok / X Premium+ subscription via `grok login`; no quota readout in the CLI | `grok-4.7` @ `high` |
 
-`copilot` and `codex` hold one persistent runtime process, so turns cost only
-model latency. Claude Code has no server mode, making `claude` a
-**cold-start** backend (~2.5 s spawn per turn) — built for long single-shot
-tasks (40–90 s enrichment turns) where the spawn is noise and per-turn
-isolation is a feature.
+All four backends reuse a runtime process. Claude clears its conversation
+before every subsequent request, preserving independent tasks without paying
+startup each time. Both the reset acknowledgement and its completion must
+arrive; otherwise agentry falls back to fresh workers for the rest of that
+backend's lifetime. Model changes restart the worker. Cancellation, timeouts,
+failed turns and disconnected streams retire it so the next request starts clean.
+
+Claude uses `--safe-mode`, `--strict-mcp-config`, `--tools ""`, and
+`--no-session-persistence` to skip customizations, MCP, tools and saved
+transcripts while retaining subscription authentication. Use a current Claude
+Code CLI supporting these flags (validated on **2.1.281**). `--bare` is not
+used because its authentication behavior differs. Startup measurements and
+reproduction commands are in [the benchmark record](archive/CLAUDE-STARTUP-2026-09-23.md).
+
+Grok opens one ACP session per chat (`session/new` is ~0.6 s) and switches
+model and reasoning effort as session state before each turn. Its tools are
+removed by the shipped agent profile `grok-agent-profile.md`: `grok agent`
+accepts none of the headless `--tools` / `--deny` flags, an empty `tools:`
+list is ignored, and permission prompts never reach the client, so a
+non-empty allowlist is the only thing that works (validated on **1.0.46**,
+[plan and probes](archive/GROK-PLAN.md)). Three tools stay in: `image_gen`
+and `image_edit` (same carve-out as codex) and `read_file`, which is how
+grok sees attachments. The ACP prompt takes no image content, so an
+`image_url` attachment is written under the scratch cwd's `refs/<session>/`
+and the message names the path; grok's `read_file` returns it as an image
+block, so "what is in this picture" works, and a follow-up "now make the
+collar blue" hands the same path to `image_edit`. Every tool call passes a
+**client hook** agentry registers on `session/new` (`_meta["x.ai/hooks"]`,
+reverse request `_x.ai/hooks/run`): `read_file` and `image_edit` are denied
+for any path outside that refs dir or grok's own image output dir, and any
+other tool is denied outright. Grok fails *open* if the hook reply is late or
+malformed, so the profile remains the first line and the hook the second.
+Grok also reads Claude Code's `~/.claude` skills and hooks by default; the
+profile keeps them from mattering. `XAI_API_KEY` is stripped from grok's
+environment so turns bill the subscription, not the metered API. Sessions
+and generated images persist under `~/.grok/sessions/` and are left for the
+user to clean up; attachment copies are removed when the chat ends.
 
 ## Quick start
 
@@ -73,9 +106,16 @@ Prerequisites: Python 3.11+ plus the CLI login for the backend you use:
 
 - `copilot` — `copilot login` once from any installed Copilot CLI. The SDK
   downloads its own pinned native runtime (Node.js not needed to *run*
-  agentry) and reads the same `~/.copilot` credential store.
+  agentry) and reads the same `~/.copilot` credential store. With a
+  Microsoft Store Python the runtime lands in `.copilot-runtime/` inside the
+  repo instead of `%LOCALAPPDATA%`, whose Store virtualization breaks the
+  native loader.
 - `codex` — Codex CLI on PATH, `codex login` (ChatGPT account, no API key).
 - `claude` — Claude Code CLI on PATH and logged in; `-p` never prompts.
+- `grok` — Grok Build CLI (`irm https://x.ai/cli/install.ps1 | iex` or
+  `curl -fsSL https://x.ai/cli/install.sh | bash`), `grok login` with the
+  grok.com account. `~/.grok/bin` is found even before PATH is refreshed.
+  Leave `XAI_API_KEY` unset.
 
 **Windows (PowerShell 7+)** — run from the same logon session as your
 interactive `copilot login`, or the credential-store token is unreachable:
@@ -84,15 +124,21 @@ interactive `copilot login`, or the credential-store token is unreachable:
 .\start.ps1                          # copilot, gpt-5.6-luna, effort=low
 .\start.ps1 -Backend codex           # model from codex config
 .\start.ps1 -Backend claude
+.\start.ps1 -Backend grok             # grok-4.7, effort=high
 .\start.ps1 -Port 9000
+.\start.ps1 -Model gpt-5.6-terra -ReasoningEffort high   # or --model/--reasoning-effort
 ```
+
+`start.ps1` takes PowerShell flags (case-insensitive, prefixes like
+`-Reasoning` work) and forwards GNU-style `--flags` to `agentry.py`
+unchanged, so the `start.sh` spelling works on Windows too.
 
 **Linux / WSL2** — log in inside your Linux environment (in WSL2: inside WSL,
 not via the Windows host; npm is only needed for this login step):
 
 ```bash
 npm install -g @github/copilot && copilot login     # one-time
-./start.sh                           # flags: --backend codex|claude, --port 9000
+./start.sh                           # flags: --backend codex|claude|grok, --port 9000
 ```
 
 Open `http://localhost:8765` and chat. From WSL2 the same URL works in a
@@ -102,14 +148,17 @@ Windows browser via automatic port forwarding.
 
 ## Configuration
 
-Launcher params (`start.ps1 -Flag` / `start.sh --flag`):
+Launcher params (`start.ps1 -Flag` / `start.sh --flag`; `start.ps1` accepts
+both spellings):
 
 - **Port** — HTTP port, default `8765`.
-- **Backend** — `copilot` (default), `codex`, or `claude`.
+- **Backend** — `copilot` (default), `codex`, `claude`, or `grok`.
 - **Model** — override the default.
   - `copilot`: set as the SDK session's model, validated against your plan's
     `models.list`. The available set tracks Copilot's plans — check your
-    model picker, not this README.
+    model picker, not this README. Nothing is hardcoded: a model that
+    appears in the Copilot CLI picker (e.g. `gpt-5.6-terra`) is usable
+    immediately, per request or via `-Model`.
   - `codex`: sent per `turn/start`. When unset, each thread runs whatever
     `~/.codex/config.toml` says — and the codex TUI *writes your last picked
     model there*, so agentry silently follows TUI switches unless you pin
@@ -117,8 +166,12 @@ Launcher params (`start.ps1 -Flag` / `start.sh --flag`):
     pin for prod. The startup log's `codex thread: ... (default model=...)`
     line shows what each thread resolved to.
   - `claude`: passed to `claude --model`.
+  - `grok`: `session/set_model` on the chat's ACP session. `grok-4.7`
+    (default), `grok-4.6`, `grok-4.5`; the CLI also lists
+    `grok-4.7-build-fast` ("2x the price"), which agentry hides.
   - A pinned model is validated at startup against the backend's model list
-    (copilot `models.list`, codex `model/list`); an unknown id exits with
+    (copilot `models.list`, codex `model/list`, grok's `initialize`
+    model state); an unknown id exits with
     code 2 and prints what *is* available, instead of coming up "ready" and
     failing every turn. Codex's ids are OpenAI's (`gpt-5.6-sol` /
     `-terra` / `-luna`, `gpt-5.5` as of 2026-09) — there is no Claude on
@@ -128,7 +181,11 @@ Launcher params (`start.ps1 -Flag` / `start.sh --flag`):
   is per model: copilot's gpt-5.6 models advertise `none`→`max`, codex takes
   `none`→`ultra` (`ultra` is codex-only: "maximum reasoning with automatic
   task delegation"); a model that rejects a level keeps its previous one
-  (WARN, not an error). **No-op on `claude`** — `-p` exposes no effort knob.
+  (WARN, not an error). grok takes `low`/`medium`/`high`/`xhigh` (`none` and
+  `minimal` map to `low`, `max` and `ultra` to `xhigh`, and `grok-4.5` has no
+  `xhigh` so it gets `high`); the launcher default is `high` there, `low`
+  elsewhere. **No-op on `claude`** — agentry does not yet forward the CLI's
+  `--effort` setting.
 
 ### Per-request model and effort
 
@@ -138,7 +195,10 @@ what its request asked for, applied atomically with the turn:
 
 - `"model"` — copilot: the live session is switched under the turn lock
   (conversation history preserved); codex: a `turn/start` param; claude: the
-  spawn's `--model`. Ids are validated against the account's model list;
+  worker's `--model` (restarted when it changes); grok: `session/set_model`
+  plus `session/set_config_option reasoning_effort` on the chat's session,
+  inside the turn lock, only when they differ from what the session already
+  runs. Ids are validated against the account's model list;
   unknown ids return an OpenAI-style `404 model_not_found` instead of
   silently running a fallback. Requests that omit `model` run the launcher
   default (or the backend's own default when unpinned) — selection is never
@@ -191,8 +251,8 @@ also meters spend live:
   URIs — never inline in `content`, so a client parsing JSON out of the
   reply is unaffected.
 - `POST /v1/images/generations` — OpenAI Images API shape over codex's
-  built-in image tool: `{"prompt": ...}` → `{"data": [{"b64_json",
-  "revised_prompt", "size"}]}`. One image per call. `size` is honored as an
+  (or grok's) built-in image tool: `{"prompt": ...}` → `{"data": [{"b64_json",
+  "revised_prompt", "size"}], "output_format": "png"|"jpeg"}`. One image per call. `size` is honored as an
   **aspect ratio**, not a pixel count: codex pins `gpt-image-2` at
   `size=auto`, which reads the prompt, so agentry turns `1536x1024`,
   `1024x1536`, `1024x1024` or any `WxH` into explicit orientation wording,
@@ -230,6 +290,18 @@ image with a short prompt, ~45 s with a long prompt plus a 0.7 MB reference
 batch of 30 is ~20 min of wall clock. ~0.7–1.4 MB PNG; a copy is also left in
 `~/.codex/generated_images/<thread>/` by codex itself.
 
+The time scales hard with input. A real comic pipeline on 2026-10-04
+(prompt 1,000–4,800 chars, 4–5 reference images, `size` 1024x1536,
+`gpt-6-sol` @ medium) took **2.5–3.5 min per image**: three edits/generations
+measured 3 min 23 s, 2 min 40 s and 3 min 32 s from the client, of which
+152–195 s was the single `imageGeneration` item itself. One tool call per
+turn, near-empty reasoning, agentry's own overhead ~5 s; dropping from 5 to 4
+references gained nothing measurable. The same prompt and references against
+OpenAI's Images API with `gpt-image-2.5-flare` took ~25 s. On the plus side,
+`/v1/images/edits` is a real edit: in both tests the strip came back
+pixel-close with only the requested change (two deer added to one panel, a
+pile of fur removed from another).
+
 The chat model does not change the picture — every model on the account
 (`luna`, `terra`, `sol`, `gpt-6-astra`, `gpt-5.5`) gets the same
 `gpt-image-2` tool, honored the aspect, and took 40–58 s
@@ -251,10 +323,44 @@ a server-side weighting, not extra tokens: an image turn reports ~10
 output tokens, so agentry's per-turn credits estimate understates it.
 For batch generation OpenAI points at `OPENAI_API_KEY` billing instead.
 
+### Image generation (grok)
+
+Grok Build ships `image_gen` (plus `image_edit`, `image_to_video`,
+`reference_to_video`) as built-in tools. The agent profile keeps only
+`image_gen`, under the same "only when explicitly asked" clause, so a chat
+request for a picture on the `grok` backend renders inline too: the tool
+writes a JPEG (1024×1024 for a square prompt, ~75 KB) under
+`~/.grok/sessions/<cwd>/<session>/images/` and reports the path; agentry
+reads it back into `delta.images` / `message.images` with the model's
+rewritten prompt as `revised_prompt`. Measured 2026-10-04 on 1.0.46: ~6 s
+from tool start to file, ~12–14 s for the whole turn with a short prompt.
+Grok's per-turn cost estimate does not include the image.
+
+`/v1/images/generations` and `/v1/images/edits` work on `grok` too. Each
+call runs on a throwaway ACP session; references for edits are written to
+the scratch cwd and handed to grok's `image_edit` tool as file paths (the
+ACP prompt itself takes no image content), then deleted. Differences from
+codex, all measured 2026-10-04 with a four-panel strip prompt of ~1.5k
+chars: output is **JPEG** (the response's top-level `output_format` says
+so), 832×1248 for a 2:3 request, 20–30 s per call including the model's
+rewrite, and **at most 3 reference images** — xAI's API rejects more
+("This model supports at most 3 input image(s)"), so agentry returns 400
+above that, as it does above 5 on codex. Style note from the first real
+strips: `image_gen` from canon text alone followed a "modern 3D cartoon"
+instruction well; `image_edit` with character cards kept the identities
+but drifted toward photorealistic rendering and was more erratic (a head
+on the wrong body, a character swapped for a deer), with or without
+reinforced style wording. The comic pipeline that drives agentry's edits
+route tried it the same day with combined character cards: style and
+lettering right, identities recognisable, but roles and figures swapped
+between panels, a dog changed breed, and a character was doubled. Its
+verdict was "not a candidate for strips today", at ~1.2 cents a call.
+Judge for your own material.
+
 ## Architecture
 
 `agentry.py` is the Flask layer (routes, OpenAI shape, session reuse);
-`backends.py` holds the `Backend` ABC and the three implementations. Flask
+`backends.py` holds the `Backend` ABC and the four implementations. Flask
 talks only to the interface (`new_session` / `prompt` / `cancel` /
 `is_alive` / `close`), so swapping backends is a flag; per-request model and
 effort ride as `prompt()` arguments, applied inside each backend's turn lock.
@@ -276,10 +382,12 @@ context hints into prompts.
 | Path | Purpose |
 |---|---|
 | `agentry.py` | Flask server + OpenAI surface + backend selection |
-| `backends.py` | `Backend` ABC + copilot / codex / claude implementations |
+| `backends.py` | `Backend` ABC + copilot / codex / claude / grok implementations |
 | `logutil.py` | Timestamped logging + idle heartbeat/ticker |
 | `templates/`, `static/` | Web UI |
-| `.github/copilot-instructions.md` | Per-project chat-only instructions |
+| `.github/copilot-instructions.md` | Per-project chat-only instructions (copilot) |
+| `grok-agent-profile.md` | Agent profile that strips grok's tools down to `image_gen` and sets its chat-only prompt |
+| `test_*.py` | Offline regression tests: HTTP selection race, Claude lifecycle, Grok ACP lifecycle |
 | `start.ps1` / `start.sh` | Launchers (create venv, run agentry) |
 | `TODO.md` / `TODONT.md` | Roadmap / paths intentionally not taken |
 | `archive/` | Backend design + validation records |
@@ -288,16 +396,20 @@ context hints into prompts.
 ## Known limits
 
 - **Tool requests are always denied** — by design, with one carve-out:
-  codex's built-in image generation, and only when a message explicitly
-  asks for an image (see *Image generation*). Everything else — shell,
-  file reads, MCP — is refused, so a prompt that genuinely needs a tool
-  degrades or errors rather than working around it.
+  codex's and grok's built-in image generation, and only when a message
+  explicitly asks for an image (see *Image generation*); on grok also
+  `read_file`, gated to the attachment folder, because that is its only way
+  to see an image. Everything else — shell, other file reads, MCP — is
+  refused, so a prompt that genuinely needs a tool degrades or errors rather
+  than working around it.
 - **Reasoning trace depends on backend.** Copilot's and codex's streamed
-  summaries reach the console ticker and the web UI think-block; claude
-  forwards none.
+  summaries reach the console ticker and the web UI think-block, grok's
+  thought chunks reach the web UI; claude forwards none.
 - **Auth is inherited, not configured.** There is no token setting: agentry
   uses whatever login the backend CLI already has for the user running it
-  (`copilot login`, `codex login`, Claude Code's own login). Start it from
+  (`copilot login`, `codex login`, `grok login`, Claude Code's own login).
+  Grok's token expires after 7 days without a refresh; a failing
+  `session/new` then surfaces as an error telling you to log in again. Start it from
   that user's own shell. Running it as a Windows service or under another
   account will not find the Copilot credential, which lives in the
   per-logon credential store.
@@ -312,7 +424,9 @@ context hints into prompts.
   runtime's ledger shows a 22-byte prompt billed at ~5.3k input tokens on
   `gpt-5.6-luna` (~2.9k on `gpt-5-mini` in July), and about 900 of those
   are agentry's own `.github/copilot-instructions.md`, which is the one
-  lever we do hold — it asks for terse, chat-only replies.
+  lever we do hold — it asks for terse, chat-only replies. Grok's default
+  harness is ~16.6k tokens (tool schemas plus every Claude Code skill it
+  finds under `~/.claude`); the agent profile cuts it to ~5.6k.
 
 ## Related work
 
@@ -327,7 +441,7 @@ are from the same day and will drift.
 | [`icebear0828/codex-proxy`](https://github.com/icebear0828/codex-proxy) | codex | ChatGPT backend API with the OAuth token; OpenAI/Anthropic/Gemini protocols; non-commercial license | very active; ~1.7k★ |
 | [`messense/copilot-api-proxy`](https://github.com/messense/copilot-api-proxy) | Copilot | Rust reverse proxy, OpenAI + Anthropic endpoints | active; small |
 | [`hotchpotch/openai-api-server-via-codex`](https://github.com/hotchpotch/openai-api-server-via-codex) | codex | Go server on the codex login token; PyPI/binaries | active; ~50★ |
-| [`wende/claude-max-api-proxy`](https://github.com/wende/claude-max-api-proxy) | Claude Code | spawns `claude -p` per request (same cold-start trade as agentry's `claude` backend); OpenClaw integration | active; ~130★ |
+| [`wende/claude-max-api-proxy`](https://github.com/wende/claude-max-api-proxy) | Claude Code | spawns `claude -p` per request; OpenClaw integration | active; ~130★ |
 | [`theblixguy/copilot-sdk-proxy`](https://github.com/theblixguy/copilot-sdk-proxy) | Copilot | the **official Copilot SDK** (TypeScript); Chat Completions + Anthropic + Responses; npm; the core of [`xcode-copilot-server`](https://github.com/theblixguy/xcode-copilot-server) | dependabot-only since 2026-07; ~10★ |
 | [`rezrov/copilot-proxy`](https://github.com/rezrov/copilot-proxy) | Copilot | the official Copilot SDK (Node); client-owned tool loop; proposed in [copilot-sdk discussion #218](https://github.com/github/copilot-sdk/discussions/218), unanswered by GitHub staff | quiet since 2026-07; ~10★ |
 | [`vkop007/codex-app-proxy`](https://github.com/vkop007/codex-app-proxy) | codex | persistent `codex app-server` — the same surface agentry's `codex` backend uses | abandoned 2026-02 |

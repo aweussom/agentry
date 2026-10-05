@@ -4,18 +4,33 @@
 #   copilot backend -> `copilot login` (cred-store token reachable to children)
 #   codex backend   -> `codex login`   (ChatGPT account)
 #   claude backend  -> Claude Code CLI already logged in (its own OAuth/API key)
+#   grok backend    -> `grok login`    (grok.com / SuperGrok account; keep XAI_API_KEY unset)
 #
 # Run a test instance on a different -Port than a running prod instance to
 # avoid an "address already in use" collision (agentry-vs-agentry).
+#
+# Flags: PowerShell style (-Model X -ReasoningEffort high; prefixes such as
+# -Reasoning work) or GNU style exactly as start.sh / agentry.py take them
+# (--model X --reasoning-effort high). GNU flags are forwarded to agentry.py
+# verbatim and win over the launcher defaults. A misspelt flag is never a
+# silent no-op: ValidateSet rejects a bad -Backend/-ReasoningEffort value
+# here, and anything else unrecognised is forwarded and exits 2 at argparse.
 
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [int]$Port = 8765,
-    [ValidateSet("copilot","codex","claude")]
+    [ValidateSet("copilot","codex","claude","grok")]
     [string]$Backend = "copilot",
     [string]$Model = "",
     [ValidateSet("none","minimal","low","medium","high","xhigh","max","ultra","")]
-    [string]$ReasoningEffort = "low"
+    [string]$ReasoningEffort = "",
+    [Parameter(ValueFromRemainingArguments)]
+    [string[]]$Rest = @()
 )
+
+# argparse's choices are case-sensitive; PowerShell's ValidateSet is not.
+$ReasoningEffort = $ReasoningEffort.ToLowerInvariant()
+$Backend = $Backend.ToLowerInvariant()
 
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
@@ -24,6 +39,9 @@ Set-Location -LiteralPath $PSScriptRoot
 # tier ($0.20/M input, ~10x below terra), benchmarked 2026-08; codex follows
 # its own configured model (last selected in the codex TUI) unless overridden.
 if (-not $Model -and $Backend -eq "copilot") { $Model = "gpt-5.6-luna" }
+# Effort default is per backend: low everywhere except grok, whose models are
+# weak enough that high (the CLI's own default) is the sensible floor.
+if (-not $ReasoningEffort) { $ReasoningEffort = if ($Backend -eq "grok") { "high" } else { "low" } }
 
 # github-copilot-sdk needs Python 3.11+. A venv left over from an older
 # interpreter silently skips the SDK, so validate the venv's version on every
@@ -86,8 +104,12 @@ if ($Backend -eq "copilot") {
         exit 1
     }
 } else {
-    $cli = switch ($Backend) { "codex" { "codex" } default { "claude" } }
-    if (-not (Get-Command $cli -ErrorAction SilentlyContinue)) {
+    $cli = switch ($Backend) { "codex" { "codex" } "grok" { "grok" } default { "claude" } }
+    # grok's installer drops the exe in ~/.grok/bin and adds it to PATH for new
+    # shells; accept that location directly so a fresh install works at once.
+    $grokHome = Join-Path $HOME ".grok\bin\grok.exe"
+    if (-not (Get-Command $cli -ErrorAction SilentlyContinue) -and
+        -not ($Backend -eq "grok" -and (Test-Path $grokHome))) {
         Write-Warning "$cli not found on PATH. Install and authenticate the $Backend backend first."
         exit 1
     }
@@ -107,4 +129,5 @@ if ($Backend -eq "claude" -and -not (Test-Path (Join-Path $HOME ".claude\quota-d
 $pyArgs = @('agentry.py', '--port', $Port, '--backend', $Backend)
 if ($Model)            { $pyArgs += @('--model', $Model) }
 if ($ReasoningEffort)  { $pyArgs += @('--reasoning-effort', $ReasoningEffort) }
+$pyArgs += $Rest   # GNU-style flags; argparse lets the last occurrence win
 .\venv\Scripts\python.exe @pyArgs

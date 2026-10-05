@@ -15,3 +15,7 @@ _bench/codex_schema/
 
 # Claude session memories: local context, not for publishing
 .claude/memory/
+
+# Copilot runtime bundle relocated out of %LOCALAPPDATA% for Microsoft Store
+# Pythons (see CopilotSDKBackend in backends.py)
+.copilot-runtime/

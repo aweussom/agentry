@@ -1,7 +1,7 @@
 """Pluggable chat backends for agentry.
 
 agentry is a thin OpenAI-compatible relay; each Backend wraps one persistent
-agent subprocess driven over stdio (JSON-RPC 2.0, newline-delimited) and
+agent subprocess driven through the SDK or structured stdio and
 exposes a uniform turn interface to the Flask layer.
 
 Backends:
@@ -14,12 +14,14 @@ Backends:
                        (ChatGPT Go $8 / Plus $20). Validated 2026-05-30;
                        inherits codex's own configured model (the one last
                        selected in the codex TUI) @ low effort.
-  ClaudeCodeBackend    Anthropic Claude Code (`claude -p`). The premium tier.
-                       Unlike the other two, claude-code has NO persistent
-                       stdio server mode, so this backend is COLD-START: one
-                       fresh `claude -p` process per turn. Measured ~2.5s
-                       startup overhead (Sonnet 4.6, lean config) — see
-                       archive/CLAUDE-PLAN.md and _bench/claude_probe.py.
+  ClaudeCodeBackend    Anthropic Claude Code (`claude -p`, stream-json input).
+                       A persistent lean worker with a confirmed /clear before
+                       each subsequent request; restart on model change or
+                       failure. See archive/CLAUDE-STARTUP-2026-09-23.md.
+  GrokACPBackend       xAI Grok Build (`grok agent stdio`, Agent Client
+                       Protocol). SuperGrok / X Premium+ subscription. One ACP
+                       session per chat; tools removed by an agent profile.
+                       Validated 2026-10-04; see archive/GROK-PLAN.md.
 
 The transports are deliberately NOT merged into a shared base: each backend
 owns its plumbing so a change to one carries zero regression risk for the
@@ -39,6 +41,7 @@ import queue
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -139,6 +142,36 @@ class Backend(abc.ABC):
 
 # --- Copilot SDK backend ---------------------------------------------------
 
+def _relocate_runtime_for_store_python():
+    """Keep the SDK's downloaded runtime out of %LOCALAPPDATA% when running on
+    a Microsoft Store Python.
+
+    Store-packaged Pythons virtualize writes under AppData: the SDK "caches"
+    its runtime bundle at %LOCALAPPDATA%/github-copilot-sdk/..., but the files
+    physically land in Packages/PythonSoftwareFoundation.../LocalCache. Python
+    itself sees them through the redirect, and so does CreateProcess on
+    copilot-runtime.exe, but the wrapper's LoadLibraryExW(runtime.node) does
+    not; the CLI dies at startup with "failed to load runtime cdylib ...
+    LoadLibraryExW failed". A project-local directory is not virtualized, so
+    point the SDK's COPILOT_CLI_EXTRACT_DIR override there (it replaces the
+    whole version-specific cache dir, hence the version suffix).
+
+    No-op off Windows, on a regular python.org/winget install, or when the
+    caller already set the override.
+    """
+    if sys.platform != "win32" or os.environ.get("COPILOT_CLI_EXTRACT_DIR"):
+        return
+    if "WindowsApps" not in sys.base_prefix:
+        return
+    try:
+        from copilot._cli_version import CLI_VERSION
+    except ImportError:
+        return
+    target = Path(__file__).parent / ".copilot-runtime" / (CLI_VERSION or "unpinned")
+    os.environ["COPILOT_CLI_EXTRACT_DIR"] = str(target)
+    _log(f"Store Python detected; Copilot runtime dir -> {target}")
+
+
 class CopilotSDKBackend(Backend):
     """GitHub Copilot via the official github-copilot-sdk (Python 3.11+).
 
@@ -157,7 +190,9 @@ class CopilotSDKBackend(Backend):
     Runtime binary: the SDK downloads and caches its own pinned CLI build on
     first start (one-time network fetch); it does NOT use the `copilot` on
     PATH. Auth is shared regardless: the runtime reads the same ~/.copilot
-    credential store, so an existing `copilot login` covers it.
+    credential store, so an existing `copilot login` covers it. On a
+    Microsoft Store Python the cache is relocated into the repo
+    (.copilot-runtime/, gitignored) — see _relocate_runtime_for_store_python.
 
     SDK: https://github.com/github/copilot-sdk  (pip install github-copilot-sdk)
     """
@@ -236,6 +271,7 @@ class CopilotSDKBackend(Backend):
         # skip_custom_instructions is left at its default (off): we have a
         # tailored .github/copilot-instructions.md in this directory and want
         # the runtime to load it.
+        _relocate_runtime_for_store_python()
         self._client = CopilotClient(working_directory=self._cwd)
         t0 = time.monotonic()
         _log("SDK client starting (first run downloads the pinned Copilot runtime)")
@@ -1366,72 +1402,50 @@ class CodexAppServerBackend(Backend):
                 pass
 
 
-# --- Claude Code backend (cold-start) -----------------------------------
+# --- Claude Code backend (persistent stream-json) -----------------------
 
 class ClaudeCodeBackend(Backend):
-    """Cold-start client for Anthropic's Claude Code CLI (`claude -p`).
+    """Reuse a lean Claude process, with a confirmed /clear before each task.
 
-    Unlike the Copilot (SDK) and Codex (`app-server`) backends, claude-code
-    exposes NO persistent JSON-RPC server over stdio. Its `-p` (print) mode runs
-    one request and exits. So this backend spawns a FRESH `claude -p` process for
-    every turn — there is no long-lived subprocess to reuse.
+    Conversation isolation is per prompt, not per HTTP new-chat heuristic.
+    Both conversation_reset and its successful result must arrive before the
+    next prompt is sent. A failed reset disables reuse for this backend and
+    falls back to fresh processes. Model changes also start a fresh worker.
+    Cancellation, disconnect, EOF and failed turns retire the worker; output
+    from an abandoned process can never feed its replacement's queue.
 
-    Why cold-start is acceptable here (measured 2026-05-31, _bench/claude_probe.py):
-    a trivial turn costs ~2.5s of startup overhead on Sonnet 4.6 with the lean
-    config below — small against the 40-90s enrichment turns this is built for,
-    and well inside the 5-10s budget. The win cold-start gives for free is
-    ISOLATION: every turn is a brand-new conversation with zero context bleed
-    from prior turns. A persistent mode would amortize startup to ~1.3s/turn but
-    share one conversation across turns, reintroducing the leakage problem.
-    See archive/CLAUDE-PLAN.md for the persistent-mode option.
-
-    "Session" here is a local bookkeeping id only (the HTTP layer reads
-    session_id/session_fresh); it does NOT map to any server-side claude session,
-    because each prompt() is independent. The conversation history the OpenAI
-    client sends is therefore NOT carried across turns — agentry already forwards
-    only the latest user message, which suits the single-shot enrichment use case.
-
-    Lean config: `claude` otherwise loads every configured MCP server (Atlassian,
-    chrome-devtools, ...) and the full tool set at startup — pure overhead and a
-    privacy risk for a chat-only relay. --strict-mcp-config (with no --mcp-config)
-    loads zero MCP servers; --disallowedTools forbids the agentic tools; and an
-    empty scratch cwd keeps agentry's own source/CLAUDE.md out of reach (the same
-    defense-in-depth the codex backend uses).
-
-    Auth: `claude` must already be logged in (the CLI's own OAuth / API key);
-    `-p` runs headless and will not prompt.
+    Requires Claude Code with --safe-mode (validated on 2.1.281). Unlike --bare,
+    safe mode retains normal subscription authentication. No MCP/tools/custom
+    hooks/plugins/memory discovery or saved sessions are needed by this relay.
     """
 
     DEFAULT_MODEL = "claude-sonnet-4-6"
-
-    # Turn claude into a stateless chat answerer: no MCP servers, no agentic
-    # tools. --strict-mcp-config alone (no inline --mcp-config JSON, which a
-    # Windows shell would mangle) loads zero servers.
-    LEAN_FLAGS = ["--strict-mcp-config",
-                  "--disallowedTools",
-                  "Task,Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit"]
+    RESET_TIMEOUT = 5.0
+    LEAN_FLAGS = ["--safe-mode", "--strict-mcp-config", "--tools", "",
+                  "--no-session-persistence"]
 
     def __init__(self, claude_path="claude", cwd=None, model=None,
                  reasoning_effort=None, log_path=None):
-        self.claude_path = claude_path
+        self.claude_path = shutil.which(claude_path) or claude_path
         self.default_model = model or self.DEFAULT_MODEL
-        # claude-code (-p) has no reasoning-effort flag; stored for interface
-        # parity but a no-op on the wire.
+        # Preserved behavior: agentry does not yet forward Claude effort.
+        # Recent CLIs do have --effort; wiring it is separate from process reuse.
         self.default_effort = reasoning_effort
-        # Run claude in a dedicated EMPTY scratch dir, NEVER the agentry repo, so
-        # there is nothing to find even if a tool slipped through, and agentry's
-        # own CLAUDE.md / settings are not auto-loaded. Mirrors the codex backend.
-        if cwd:
-            self.cwd = os.path.abspath(cwd)
-        else:
-            self.cwd = os.path.join(tempfile.gettempdir(), "agentry-claude-scratch")
+        self.cwd = os.path.abspath(cwd) if cwd else os.path.join(
+            tempfile.gettempdir(), "agentry-claude-scratch")
         os.makedirs(self.cwd, exist_ok=True)
         self.session_id = None
         self.session_fresh = False
         self.turn_lock = threading.Lock()
-        self._proc = None                 # in-flight cold-start process, for cancel()
         self._proc_lock = threading.Lock()
-        self._rate_limit = None           # latest rate_limit_event payload (quota)
+        self._proc = None
+        self._events = None
+        self._worker_model = None
+        self._dirty = False
+        self._reuse = True
+        self._closed = False
+        self._cancel_event = None
+        self._rate_limit = None
         self._rl_lock = threading.Lock()
         self.log_path = log_path
         self._logf = None
@@ -1447,146 +1461,236 @@ class ClaudeCodeBackend(Backend):
             except Exception:
                 pass
 
+    def _check_cancelled(self):
+        if self._closed:
+            raise BackendError("Claude backend is closed")
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise BackendError("Claude turn cancelled")
+
     def new_session(self, cwd=None, model=None, effort=None):
-        # No server-side session exists for cold-start; mint a local id so the
-        # HTTP layer's session bookkeeping (session_id/session_fresh) works.
-        # model/effort are per-spawn (see prompt) — ignored here.
-        if cwd:
-            self.cwd = os.path.abspath(cwd)
-            os.makedirs(self.cwd, exist_ok=True)
-        self.session_id = uuid.uuid4().hex
-        self.session_fresh = True
-        _log(f"claude session (cold-start, local id): {self.session_id}")
-        return self.session_id
+        # Logical HTTP session only. Reset is always inside prompt's lock,
+        # even if multiple requests race through the HTTP freshness check.
+        with self.turn_lock:
+            self._check_cancelled()
+            if cwd and os.path.abspath(cwd) != self.cwd:
+                self._stop_worker()
+                self.cwd = os.path.abspath(cwd)
+                os.makedirs(self.cwd, exist_ok=True)
+            self._ensure_worker(model or self.default_model)
+            self.session_id = uuid.uuid4().hex
+            self.session_fresh = True
+            return self.session_id
+
+    def _read_stdout(self, proc, events):
+        try:
+            for line in proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    _log(f"claude non-JSON line: {line[:120]!r}")
+                    continue
+                if isinstance(msg, dict):
+                    events.put(msg)
+        except (OSError, ValueError):
+            pass
+        finally:
+            events.put(None)
 
     def _drain_stderr(self, proc):
         try:
-            for line in iter(proc.stderr.readline, ""):
-                if line and line.strip():
+            for line in proc.stderr:
+                if line.strip():
                     _log(f"claude stderr: {line.rstrip()[:200]}")
-        except Exception:
+        except (OSError, ValueError):
             pass
 
-    def prompt(self, text, images=None, timeout=900, model=None, effort=None):
-        """Generator yielding text deltas for one turn. Spawns a fresh `claude -p`
-        process, feeds the prompt on stdin (robust for large enrichment prompts —
-        no cmdline-length limit), and streams stream-json output back.
-        model is per-spawn (--model); effort is ignored (no CLI knob).
-
-        Images are NOT supported yet (deferred): the text stdin path can't carry
-        them; supporting them means switching to --input-format stream-json and
-        sending API-style image content blocks. Dropped loudly, per Backend."""
-        if not self.session_id:
-            raise BackendError("no active session (call new_session first)")
-        if images:
-            _log(f"WARN: claude backend dropping {len(images)} image(s) (not supported yet)")
-            yield f"[agentry: {len(images)} image(s) dropped — claude backend is text-only for now]\n"
-        with self.turn_lock:
-            cmd = [self.claude_path, "-p",
-                   "--output-format", "stream-json",
-                   "--include-partial-messages",   # emit content_block_delta for streaming
-                   "--verbose",                     # required with stream-json output
-                   "--model", model or self.default_model, *self.LEAN_FLAGS]
-            _log(f"claude spawn: {' '.join(cmd)}  (cwd={self.cwd})")
-            # claude is a real claude.exe (not a .cmd shim), so NO shell wrapper:
-            # cmd.exe wrapping mangles the stdout pipe (verified). This differs
-            # from the bench scripts' shell=True, which is needed for copilot.
+    def _ensure_worker(self, model):
+        self._check_cancelled()
+        proc = self._proc
+        if (proc is not None and proc.poll() is None
+                and self._worker_model == model):
+            return
+        self._stop_worker()
+        cmd = [self.claude_path, "-p", "--input-format", "stream-json",
+               "--output-format", "stream-json", "--include-partial-messages",
+               "--verbose", "--model", model, *self.LEAN_FLAGS]
+        events = queue.Queue()
+        # Publish atomically with cancellation. Do not hold this lock while
+        # waiting on model output: /v1/cancel must remain responsive.
+        with self._proc_lock:
+            self._check_cancelled()
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, bufsize=1,
-                encoding="utf-8", errors="replace", cwd=self.cwd,
-            )
+                encoding="utf-8", errors="replace", cwd=self.cwd)
+            self._proc, self._events = proc, events
+            self._worker_model, self._dirty = model, False
+        threading.Thread(target=self._read_stdout, args=(proc, events),
+                         daemon=True).start()
+        threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True).start()
+        _log(f"claude worker started (model={model}, pid={proc.pid})")
+
+    def _stop_worker(self):
+        with self._proc_lock:
+            proc, self._proc = self._proc, None
+            self._events = None
+            self._worker_model, self._dirty = None, False
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass  # it may have exited between poll and terminate
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        finally:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except (OSError, ValueError):
+                        pass
+
+    def _send(self, text):
+        self._check_cancelled()
+        msg = {"type": "user", "message": {"role": "user", "content": text}}
+        proc = self._proc
+        if proc is None:
+            raise BackendError("Claude worker stopped")
+        try:
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
+        except ValueError as e:
+            raise BackendError("Claude input pipe closed") from e
+
+    def _next_event(self, timeout):
+        self._check_cancelled()
+        events = self._events
+        if events is None:
+            raise BackendError("Claude worker stopped")
+        try:
+            msg = events.get(timeout=max(0, timeout))
+        except queue.Empty:
+            raise BackendError("Claude response timed out")
+        self._check_cancelled()
+        if msg is None:
+            raise BackendError("Claude exited before completing the turn")
+        self._log_wire("<<", msg)
+        if msg.get("type") == "rate_limit_event":
+            with self._rl_lock:
+                self._rate_limit = msg.get("rate_limit_info")
+        return msg
+
+    @staticmethod
+    def _check_result(msg):
+        if msg.get("is_error") or msg.get("subtype") != "success":
+            raise BackendError(str(msg.get("result") or msg.get("subtype")
+                                   or "Claude returned an unsuccessful result"))
+
+    def _reset_worker(self):
+        self._send("/clear")
+        deadline = time.monotonic() + self.RESET_TIMEOUT
+        reset_seen = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BackendError("Claude reset timed out")
+            msg = self._next_event(remaining)
+            if msg.get("type") == "conversation_reset":
+                reset_seen = True
+            elif msg.get("type") == "result":
+                self._check_result(msg)
+                if not reset_seen:
+                    raise BackendError("Claude reset was not acknowledged")
+                # Consume the reset result too; otherwise it could be mistaken
+                # for the next task's successful completion.
+                self._dirty = False
+                return
+
+    def prompt(self, text, images=None, timeout=900, model=None, effort=None):
+        """Stream one independent task. Reuse only a confirmed clean worker."""
+        if not self.session_id:
+            raise BackendError("no active session (call new_session first)")
+        if images:
+            yield (f"[agentry: {len(images)} image(s) dropped — "
+                   "claude backend is text-only for now]\n")
+        with self.turn_lock:
             with self._proc_lock:
-                self._proc = proc
-            self.session_fresh = False
-
-            q = queue.Queue()
-            def _reader():
-                try:
-                    for line in iter(proc.stdout.readline, ""):
-                        q.put(line)
-                finally:
-                    q.put(None)   # EOF sentinel
-            threading.Thread(target=_reader, daemon=True).start()
-            threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True).start()
-
-            # Feed the prompt and close stdin so claude starts processing.
+                self._cancel_event = threading.Event()
+            complete = False
             try:
-                proc.stdin.write(text)
-                proc.stdin.close()
-            except Exception as e:
-                _log(f"claude stdin write failed: {e}")
-
-            got_text = False
-            try:
-                while True:
-                    try:
-                        line = q.get(timeout=timeout)
-                    except queue.Empty:
+                target = model or self.default_model
+                self._ensure_worker(target)
+                if self._dirty:
+                    if self._reuse:
                         try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                        yield f"\n[claude timeout after {timeout}s]"
-                        return
-                    if line is None:          # stdout closed without a result event
-                        return
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        _log(f"claude non-JSON line: {line[:120]!r}")
-                        continue
-                    self._log_wire("<<", msg)
-                    t = msg.get("type")
-                    if t == "rate_limit_event":
-                        with self._rl_lock:
-                            self._rate_limit = msg.get("rate_limit_info")
-                    elif t == "stream_event":
-                        ev = msg.get("event") or {}
-                        if ev.get("type") == "content_block_delta":
-                            d = (ev.get("delta") or {}).get("text")
-                            if d:
+                            self._reset_worker()
+                        except (BackendError, OSError) as e:
+                            self._check_cancelled()
+                            _log(f"WARN: {e}; using fresh Claude workers for isolation")
+                            self._reuse = False
+                            self._stop_worker()
+                            self._ensure_worker(target)
+                    else:
+                        self._stop_worker()
+                        self._ensure_worker(target)
+                self._check_cancelled()
+                self._dirty = True
+                self.session_fresh = False
+                self._send(text)
+                got_text = False
+                while True:
+                    msg = self._next_event(timeout)
+                    kind = msg.get("type")
+                    if kind == "stream_event":
+                        event = msg.get("event") or {}
+                        if event.get("type") == "content_block_delta":
+                            delta = (event.get("delta") or {}).get("text")
+                            if delta:
                                 got_text = True
-                                yield d
-                    elif t == "assistant" and not got_text:
-                        # Fallback when partial deltas weren't emitted: the whole
-                        # assistant message. Guarded so we never double-emit text
-                        # already streamed via stream_event.
-                        for blk in (msg.get("message") or {}).get("content", []):
-                            if blk.get("type") == "text" and blk.get("text"):
+                                yield delta
+                    elif kind == "assistant" and not got_text:
+                        for block in (msg.get("message") or {}).get("content", []):
+                            if block.get("type") == "text" and block.get("text"):
                                 got_text = True
-                                yield blk["text"]
-                    elif t == "result":
-                        if msg.get("is_error") or msg.get("subtype") not in (None, "success"):
-                            err = msg.get("result") or msg.get("subtype") or "unknown"
-                            if not got_text:
-                                yield f"\n[claude error] {err}"
-                        _log(f"turn result subtype={msg.get('subtype')!r} "
-                             f"dur={msg.get('duration_ms')}ms")
+                                yield block["text"]
+                    elif kind == "conversation_reset":
+                        raise BackendError("unexpected conversation reset during task")
+                    elif kind == "result":
+                        self._check_result(msg)
+                        complete = True
+                        _log(f"claude turn complete dur={msg.get('duration_ms')}ms")
                         return
+            except (BackendError, OSError) as e:
+                # Retire before yielding the error: even callers that pause
+                # iteration must not leave a failed model turn running.
+                self._stop_worker()
+                yield f"\n[claude error] {e}"
             finally:
+                if not complete:
+                    self._stop_worker()
                 with self._proc_lock:
-                    if self._proc is proc:
-                        self._proc = None
-                try:
-                    if proc.poll() is None:
-                        proc.terminate()
-                except Exception:
-                    pass
+                    self._cancel_event = None
 
     def cancel(self):
         with self._proc_lock:
-            p = self._proc
-        if p is not None and p.poll() is None:
-            try:
-                p.kill()
-                return True
-            except Exception:
+            if self._cancel_event is None:
                 return False
-        return False
+            self._cancel_event.set()
+            # Wake the waiter even if the process hasn't been published yet,
+            # or its stdout reader is delayed.
+            if self._events is not None:
+                self._events.put(None)
+            if self._proc is not None and self._proc.poll() is None:
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
+            return True
 
     # The claude-code-quota tool (github.com/aweussom/claude-code-quota) keeps
     # this cache fresh with the real OAuth usage %, refreshed off claude's own
@@ -1656,21 +1760,660 @@ class ClaudeCodeBackend(Backend):
         return s
 
     def is_alive(self):
-        # Cold-start has no persistent process to outlive; the backend can always
-        # spawn a fresh `claude -p`. Always alive so _get_backend never recreates it.
-        return True
+        # This reusable wrapper respawns a dead worker on the next task.
+        return not self._closed
 
     def close(self):
         with self._proc_lock:
-            p = self._proc
-        if p is not None:
+            self._closed = True
+        self.cancel()
+        # Do not acquire turn_lock: a generator can be suspended at yield
+        # while shutdown is requested from its own thread.
+        self._stop_worker()
+        if self._logf:
+            self._logf.close()
+            self._logf = None
+
+
+# --- Factory -------------------------------------------------------------
+
+# --- Grok Build backend (ACP over stdio) ---------------------------------
+
+class GrokACPBackend(Backend):
+    """xAI Grok Build (`grok agent stdio`) over the Agent Client Protocol.
+
+    One persistent process; one ACP session per chat (session/new is ~0.6 s,
+    so the HTTP new-chat heuristic maps straight onto it). Model and effort
+    are session state in ACP (`session/set_model`,
+    `session/set_config_option reasoning_effort`), so prompt() re-applies the
+    request's selection inside the turn lock before `session/prompt`.
+
+    Read-only enforcement is the agent profile (`grok-agent-profile.md`):
+    `grok agent` accepts none of the headless tool/permission flags, an empty
+    `tools:` list is ignored, and permission prompting never reaches the
+    client (validated 2026-10-04 on 1.0.46, archive/GROK-PLAN.md). The
+    profile's non-empty allowlist leaves only `image_gen` plus inert MCP
+    discovery stubs; agent->client requests are rejected anyway.
+
+    The ACP prompt takes no image content (`promptCapabilities.image: false`),
+    so attachments go to disk under <cwd>/refs/<session>/ and the message
+    names the paths; the model sees them through `read_file` (its result is
+    an image block) and can hand them to `image_edit`. Every tool call is
+    gated by a client hook registered on session/new (`_meta["x.ai/hooks"]`,
+    reverse request `_x.ai/hooks/run`): paths outside the refs dir and grok's
+    own image output dir are denied, as is any tool the profile should not
+    have left in. Image output rides `image_gen`/`image_edit`: grok writes a
+    JPEG under ~/.grok/sessions/<cwd>/<session>/images/ and reports the path;
+    we read it back into the ("image", ...) tuple. Sessions and images
+    persist there by design; the user cleans up.
+    """
+
+    DEFAULT_MODEL = "grok-4.7"
+    DEFAULT_EFFORT = "high"
+    # Listed by the CLI but not exposed: "Fast variant. 2x the price" buys
+    # nothing on a flat subscription except double quota burn.
+    HIDDEN_MODELS = {"grok-4.7-build-fast"}
+    # agentry's effort vocabulary -> grok's (xhigh/high/medium/low).
+    EFFORT_MAP = {"none": "low", "minimal": "low", "max": "xhigh", "ultra": "xhigh"}
+    EFFORT_LADDER = ["low", "medium", "high", "xhigh"]
+    PROFILE_PATH = Path(__file__).parent / "grok-agent-profile.md"
+    # Housekeeping pushed by grok that no turn needs to see.
+    _NOISE = {"_x.ai/models/update", "_x.ai/announcements/update",
+              "_x.ai/settings/update", "_x.ai/session/setup",
+              "_x.ai/queue/changed", "_x.ai/sessions/changed",
+              "_x.ai/mcp/servers_updated", "_x.ai/mcp_initialized"}
+    _IMAGE_MAGIC = ((b"\xff\xd8", "image/jpeg"), (b"\x89PNG", "image/png"),
+                    (b"RIFF", "image/webp"))
+
+    def __init__(self, grok_path="grok", cwd=None, model=None,
+                 reasoning_effort=None, log_path=None, profile_path=None):
+        self.default_model = model or self.DEFAULT_MODEL
+        self.default_effort = reasoning_effort or self.DEFAULT_EFFORT
+        self.profile_path = Path(profile_path) if profile_path else self.PROFILE_PATH
+        if not self.profile_path.is_file():
+            raise BackendError(f"grok agent profile missing: {self.profile_path}")
+        # Stable empty scratch cwd: grok persists every session under
+        # ~/.grok/sessions/<urlencoded cwd>/, so a fixed cwd keeps all of
+        # agentry's sessions in one folder.
+        self.cwd = os.path.abspath(cwd) if cwd else os.path.join(
+            tempfile.gettempdir(), "agentry-grok-scratch")
+        os.makedirs(self.cwd, exist_ok=True)
+        # Where attachments land, and the only places the hook lets tools
+        # read: our refs dir, and grok's own session store (so "edit the
+        # image you just made" can name its previous output).
+        self.refs_root = os.path.join(self.cwd, "refs")
+        # A fresh process has no live sessions: whatever a crashed or killed
+        # predecessor left here is garbage (copies of client uploads).
+        shutil.rmtree(self.refs_root, ignore_errors=True)
+        self._allowed_roots = [self._canon(self.refs_root),
+                               self._canon(os.path.join(Path.home(), ".grok", "sessions"))]
+        # XAI_API_KEY takes precedence over the grok.com login and bills the
+        # metered API instead of the subscription. Never let it through.
+        env = {k: v for k, v in os.environ.items() if k != "XAI_API_KEY"}
+        if "XAI_API_KEY" in os.environ:
+            _log("grok: XAI_API_KEY is set in the environment; NOT passing it "
+                 "to grok so turns bill the subscription, not the API")
+        exe = shutil.which(grok_path)
+        if not exe:
+            for cand in (Path.home() / ".grok" / "bin" / "grok.exe",
+                         Path.home() / ".grok" / "bin" / "grok"):
+                if cand.is_file():
+                    exe = str(cand)
+                    break
+        exe = exe or grok_path
+        # Flag order matters: --agent-profile belongs to `grok agent`, not to
+        # `stdio` (which takes nothing relevant).
+        cmd = [exe, "agent", "--agent-profile", str(self.profile_path), "stdio"]
+        _log(f"grok spawn: {' '.join(cmd)}  (cwd={self.cwd})")
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
+            cwd=self.cwd, env=env,
+        )
+        self.next_id = 1
+        self.id_lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.pending = {}               # id -> Queue for a response
+        self.active_turn_queue = None   # (method, params) notifications of the in-flight turn
+        self._turn_in_flight = False
+        self._active_sid = None         # session the in-flight turn runs on
+        self.session_id = None
+        self.session_fresh = False
+        self._sess_state = {}           # sessionId -> [model, effort] the session runs
+        self._models = []               # availableModels from initialize
+        self._cost_ticks = 0            # this-run sum of costUsdTicks (1e-10 USD)
+        self._turn_usage = None
+        self.turn_lock = threading.Lock()
+        self.log_path = log_path
+        self._logf = None
+        if self.log_path:
+            self.log_path.parent.mkdir(exist_ok=True)
+            self._logf = open(self.log_path, "w", encoding="utf-8")
+
+        threading.Thread(target=self._reader_loop, daemon=True).start()
+        threading.Thread(target=self._stderr_loop, daemon=True).start()
+        self._initialize()
+
+    # -- plumbing (same shape as the codex backend) --
+
+    def _log_wire(self, direction, msg):
+        if self._logf:
             try:
-                if p.poll() is None:
-                    p.terminate()
-                    p.wait(timeout=5)
+                self._logf.write(f"{direction} {json.dumps(msg)}\n")
+                self._logf.flush()
+            except Exception:
+                pass
+
+    def _next_id(self):
+        with self.id_lock:
+            i = self.next_id
+            self.next_id += 1
+            return i
+
+    def _write(self, msg):
+        line = json.dumps(msg) + "\n"
+        self._log_wire(">>", msg)
+        with self.write_lock:
+            self.proc.stdin.write(line)
+            self.proc.stdin.flush()
+
+    def _request(self, method, params, timeout=60):
+        msg_id = self._next_id()
+        q = queue.Queue(maxsize=1)
+        self.pending[msg_id] = q
+        self._write({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params})
+        try:
+            resp = q.get(timeout=timeout)
+        except queue.Empty:
+            raise BackendError(f"timeout waiting for {method}")
+        finally:
+            self.pending.pop(msg_id, None)
+        if "error" in resp:
+            err = resp["error"]
+            msg = err.get("message", err) if isinstance(err, dict) else err
+            raise BackendError(f"{method}: {msg}")
+        return resp.get("result") or {}
+
+    def _notify(self, method, params):
+        self._write({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _reader_loop(self):
+        try:
+            for line in iter(self.proc.stdout.readline, ""):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    _log(f"grok non-JSON line: {line[:120]!r}")
+                    continue
+                self._log_wire("<<", msg)
+                if "id" in msg and ("result" in msg or "error" in msg):
+                    q = self.pending.pop(msg["id"], None)
+                    if q is not None:
+                        q.put(msg)
+                elif "id" in msg and "method" in msg:
+                    if msg["method"] == self.HOOK_RUN_METHOD:
+                        # Our pre_tool_use gate (registered on session/new).
+                        # Answer here, on the reader thread: grok fails OPEN
+                        # on a timeout or a malformed reply, so be quick and
+                        # exact. (acp_session/hooks.rs: classify())
+                        self._write({"jsonrpc": "2.0", "id": msg["id"],
+                                     "result": self._hook_decision(msg.get("params") or {})})
+                        continue
+                    # Any other agent -> client request (permission, fs/*,
+                    # terminal). Never observed with the profile; refuse.
+                    _log(f"grok asked {msg['method']!r}; refused")
+                    self._write({
+                        "jsonrpc": "2.0", "id": msg["id"],
+                        "error": {"code": -32601,
+                                  "message": f"method '{msg['method']}' not supported by client"},
+                    })
+                elif "method" in msg:
+                    if msg["method"] in self._NOISE:
+                        continue
+                    q = self.active_turn_queue
+                    if q is not None:
+                        q.put((msg["method"], msg.get("params") or {}))
+        except Exception as e:
+            _log(f"grok reader exited: {e}")
+
+    # -- tool gate (ACP client hook) --
+
+    HOOK_RUN_METHOD = "_x.ai/hooks/run"
+    HOOK_CALLBACK_ID = "agentry-tool-gate"
+
+    def _hooks_meta(self):
+        """`_meta` for session/new: one PreToolUse group matching every tool,
+        answered by _hook_decision. Shape from grok-build
+        extensions/hooks.rs (parse_hook_group)."""
+        return {"x.ai/hooks": {"PreToolUse": [
+            {"matcher": "*", "hookCallbackIds": [self.HOOK_CALLBACK_ID]}]}}
+
+    @staticmethod
+    def _canon(p):
+        return os.path.normcase(os.path.realpath(p))
+
+    def _path_allowed(self, p):
+        if not isinstance(p, str) or not p:
+            return False
+        try:
+            rp = self._canon(p)
+        except Exception:
+            return False
+        return any(rp == root or rp.startswith(root + os.sep) for root in self._allowed_roots)
+
+    def _hook_decision(self, params):
+        """pre_tool_use verdict for one tool call. {} lets it run; a deny
+        aborts it with the message shown to the model."""
+        tool = params.get("toolName")
+        inp = params.get("toolInput") or {}
+        if tool == "image_gen":
+            return {}
+        if tool == "read_file":
+            ok = self._path_allowed(inp.get("target_file"))
+        elif tool == "image_edit":
+            paths = inp.get("image") or []
+            if isinstance(paths, str):
+                paths = [paths]
+            ok = bool(paths) and all(self._path_allowed(p) for p in paths)
+        else:
+            ok = False
+        if ok:
+            return {}
+        _log(f"grok hook: denied {tool} {json.dumps(inp)[:160]}")
+        return {"decision": "deny",
+                "systemMessage": f"agentry: {tool or 'this tool'} may only be used on image "
+                                 f"files the user attached in this chat"}
+
+    def _write_refs(self, images, subdir):
+        """Write (mime, b64) attachments under refs/<subdir>/; returns their
+        forward-slash paths (what the model sends back in tool calls)."""
+        d = os.path.join(self.refs_root, subdir)
+        os.makedirs(d, exist_ok=True)
+        existing = len(os.listdir(d))
+        paths = []
+        for i, (mime, data) in enumerate(images, existing + 1):
+            p = os.path.join(d, f"ref-{i}{self._REF_EXT.get(mime, '.img')}")
+            with open(p, "wb") as f:
+                f.write(base64.b64decode(data))
+            paths.append(p.replace("\\", "/"))
+        return paths
+
+    def _stderr_loop(self):
+        try:
+            for line in iter(self.proc.stderr.readline, ""):
+                if line:
+                    _log(f"grok stderr: {line.rstrip()[:200]}")
+        except Exception:
+            pass
+
+    def _initialize(self):
+        result = self._request("initialize", {
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False},
+                                   "terminal": False},
+            "clientInfo": {"name": "agentry", "version": "0.2.0"},
+        }, timeout=30)
+        meta = result.get("_meta") or {}
+        self._models = ((meta.get("modelState") or {}).get("availableModels")) or []
+        caps = (result.get("agentCapabilities") or {}).get("promptCapabilities") or {}
+        _log(f"grok initialized; agent={meta.get('agentVersion')!r} "
+             f"models={[m.get('modelId') for m in self._models]} "
+             f"image_input={caps.get('image')}")
+
+    # -- selection --
+
+    def _efforts_for(self, model):
+        for m in self._models:
+            if m.get("modelId") == model:
+                ids = [e.get("id") for e in ((m.get("_meta") or {}).get("reasoningEfforts") or [])]
+                return [e for e in ids if e]
+        return []
+
+    def _effort_for(self, model, effort):
+        """agentry effort word -> what this grok model accepts (nearest lower
+        rung when the exact level is missing, e.g. xhigh on grok-4.5)."""
+        want = self.EFFORT_MAP.get(effort, effort)
+        supported = self._efforts_for(model)
+        if not supported or want in supported:
+            return want
+        if want not in self.EFFORT_LADDER:
+            return supported[0]
+        i = self.EFFORT_LADDER.index(want)
+        for cand in reversed(self.EFFORT_LADDER[:i]):
+            if cand in supported:
+                return cand
+        return supported[-1]
+
+    def _apply_selection(self, sid, model, effort):
+        """Set a session's model/effort when they differ from the request.
+        Caller holds turn_lock (or owns a scratch session nobody else sees).
+        Raises BackendError on rejection."""
+        state = self._sess_state.setdefault(sid, [None, None])
+        if model != state[0]:
+            self._request("session/set_model",
+                          {"sessionId": sid, "modelId": model}, timeout=15)
+            state[0] = model
+            # A model switch may reset effort on grok's side; re-apply below.
+            state[1] = None
+        if effort != state[1]:
+            self._request("session/set_config_option",
+                          {"sessionId": sid, "configId": "reasoning_effort",
+                           "value": effort}, timeout=15)
+            state[1] = effort
+
+    def _open_session(self, cwd=None, model=None, effort=None):
+        """session/new + selection; returns the id. Does NOT touch
+        session_id — new_session() and image_turn() both build on this."""
+        try:
+            result = self._request("session/new", {
+                "cwd": os.path.abspath(cwd) if cwd else self.cwd,
+                "mcpServers": [],
+                "_meta": self._hooks_meta()}, timeout=60)
+        except BackendError as e:
+            # Expired login (7-day token) surfaces here first.
+            raise BackendError(f"{e}. If this is an auth error, run `grok login`.")
+        sid = result.get("sessionId")
+        if not sid:
+            raise BackendError("session/new returned no sessionId")
+        self._sess_state[sid] = [((result.get("models") or {}).get("currentModelId")), None]
+        want_model = model or self.default_model
+        self._apply_selection(sid, want_model,
+                              self._effort_for(want_model, effort or self.default_effort))
+        return sid
+
+    def _close_session(self, sid):
+        """session/close plus this session's attachment copies. Grok's own
+        session record and generated images stay on disk."""
+        self._sess_state.pop(sid, None)
+        shutil.rmtree(os.path.join(self.refs_root, sid), ignore_errors=True)
+        try:
+            self._request("session/close", {"sessionId": sid}, timeout=10)
+        except Exception as e:
+            _log(f"grok session/close {sid}: {e}")
+
+    # -- Backend interface --
+
+    def new_session(self, cwd=None, model=None, effort=None):
+        with self.turn_lock:
+            old = self.session_id
+            self.session_id = self._open_session(cwd, model, effort)
+            self.session_fresh = True
+            st = self._sess_state[self.session_id]
+            _log(f"grok session: {self.session_id} (model={st[0]} effort={st[1]})")
+            if old:
+                self._close_session(old)
+            return self.session_id
+
+    def current_model(self):
+        return self.default_model
+
+    def list_models(self):
+        out = []
+        for m in self._models:
+            mid = m.get("modelId")
+            if not mid or mid in self.HIDDEN_MODELS:
+                continue
+            out.append({"id": mid, "name": m.get("name") or mid,
+                        "displayName": m.get("name") or mid,
+                        "isDefault": mid == self.default_model,
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": e} for e in self._efforts_for(mid)]})
+        return out or None
+
+    def prompt(self, text, images=None, timeout=900, model=None, effort=None,
+               session_id=None):
+        """Generator for one turn on the chat session, or on `session_id`
+        (grok-only extension used by image_turn's throwaway sessions).
+        Serialized by the same turn lock either way."""
+        sid = session_id or self.session_id
+        if not sid:
+            raise BackendError("no active session (call new_session first)")
+        if images:
+            # No image content over ACP: park the files under refs/<session>/
+            # (kept for the session's life so later turns can still name
+            # them) and tell the model where they are. The hook lets
+            # read_file / image_edit touch exactly these.
+            paths = self._write_refs(images, sid)
+            _log(f"grok: {len(paths)} attachment(s) written under refs/{sid}")
+            text = (f"[The user attached {len(paths)} image file(s) to this message: "
+                    + ", ".join(paths) + ". Look at each with read_file before "
+                    "answering. If the user wants a picture edited or made from "
+                    "them, pass these paths to the image tool.]\n\n" + (text or ""))
+        with self.turn_lock:
+            want_model = model or self.default_model
+            try:
+                self._apply_selection(sid, want_model,
+                                      self._effort_for(want_model, effort or self.default_effort))
+            except BackendError as e:
+                yield f"\n[grok error] {e}"
+                return
+            q = queue.Queue()
+            self.active_turn_queue = q
+            msg_id = self._next_id()
+            # The prompt's RESPONSE ends the turn, so it lands in the same
+            # queue as the notifications (dict vs tuple tells them apart).
+            self.pending[msg_id] = q
+            self._turn_in_flight = True
+            self._active_sid = sid
+            self._turn_usage = None
+            tool_prompts = {}      # toolCallId -> prompt the model gave image_gen
+            tool_names = {}        # toolCallId -> tool name
+            t0 = time.time()
+            try:
+                self._write({"jsonrpc": "2.0", "id": msg_id, "method": "session/prompt",
+                             "params": {"sessionId": sid,
+                                        "prompt": [{"type": "text", "text": text}]}})
+                if sid == self.session_id:
+                    self.session_fresh = False
+                while True:
+                    try:
+                        item = q.get(timeout=timeout)
+                    except queue.Empty:
+                        # finally: sends session/cancel for the abandoned turn
+                        yield f"\n[grok timeout after {timeout}s]"
+                        return
+                    if isinstance(item, dict):           # the session/prompt response
+                        self._turn_in_flight = False
+                        if "error" in item:
+                            err = item["error"]
+                            msg = err.get("message", err) if isinstance(err, dict) else err
+                            yield f"\n[grok error] {msg}"
+                        else:
+                            stop = (item.get("result") or {}).get("stopReason")
+                            _log(f"grok turn stop={stop}" + self._usage_suffix())
+                        return
+                    method, params = item
+                    if params.get("sessionId") not in (None, sid):
+                        continue
+                    upd = params.get("update") or {}
+                    kind = upd.get("sessionUpdate")
+                    if method == "session/update":
+                        content = upd.get("content") or {}
+                        if kind == "agent_message_chunk":
+                            if content.get("type") == "text" and content.get("text"):
+                                yield content["text"]
+                        elif kind == "agent_thought_chunk":
+                            if content.get("type") == "text" and content.get("text"):
+                                yield ("reasoning", content["text"])
+                        elif kind == "tool_call":
+                            tid = upd.get("toolCallId")
+                            name = (((upd.get("_meta") or {}).get("x.ai/tool") or {}).get("name")
+                                    or upd.get("title"))
+                            tool_names[tid] = name
+                            raw = upd.get("rawInput") or {}
+                            if name in self._IMAGE_TOOLS:
+                                tool_prompts[tid] = raw.get("prompt")
+                                self._image_t0 = time.time()
+                                _log(f"grok {name} started"
+                                     + (f" ({len(raw['image'])} reference(s))"
+                                        if isinstance(raw.get("image"), list) else ""))
+                            elif name == "read_file":
+                                # Looking at an attachment; the hook has
+                                # already vetted the path.
+                                _log(f"grok read_file {str(raw.get('target_file'))[-40:]!r}")
+                            else:
+                                _log(f"WARN: grok called tool {name!r} despite the profile")
+                        elif kind == "tool_call_update":
+                            tid = upd.get("toolCallId")
+                            if tool_names.get(tid) not in self._IMAGE_TOOLS:
+                                continue
+                            status = upd.get("status")
+                            if status == "completed":
+                                yield self._image_from_update(upd, tool_prompts.get(tid))
+                            elif status == "failed":
+                                yield f"\n[grok image error] {self._update_text(upd)[:200]}"
+                    elif method == "_x.ai/session_notification":
+                        if kind == "turn_completed":
+                            usage = upd.get("usage") or {}
+                            self._turn_usage = usage
+                            ticks = usage.get("costUsdTicks") or 0
+                            self._cost_ticks += ticks
+            finally:
+                if self._turn_in_flight:
+                    # Abandoned mid-turn (client disconnect / generator close):
+                    # stop grok's work, don't let it stream into the next turn.
+                    self._cancel_turn(sid)
+                    self._turn_in_flight = False
+                self._active_sid = None
+                self.active_turn_queue = None
+                self.pending.pop(msg_id, None)
+                _log(f"grok turn took {time.time() - t0:.1f}s")
+
+    _IMAGE_TOOLS = ("image_gen", "image_edit")
+    _REF_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                "image/webp": ".webp"}
+
+    def image_turn(self, prompt, images=None, timeout=900, model=None, effort=None):
+        """One Images-API call on a throwaway ACP session (the chat session
+        never sees the references or the result). The ACP prompt takes no
+        image content, but grok's `image_edit` tool takes `image: [paths]`,
+        so references are written under the scratch cwd and named in the
+        instruction; `image_gen` is asked for when there are none. Probed
+        2026-10-04 on 1.0.46: one card edited in 10 s, a two-reference scene
+        in 15 s, both 832x1248 JPEG. Yields like prompt(): text, notes
+        starting with "[", and ("image", ...) tuples."""
+        refs_dir, paths = None, []
+        if images:
+            sub = "img-" + uuid.uuid4().hex
+            paths = self._write_refs(images, sub)
+            refs_dir = os.path.join(self.refs_root, sub)
+        if paths:
+            text = ("Call the image editing tool (image_edit) exactly once, with "
+                    f"these {len(paths)} reference image file(s) as its `image` "
+                    "argument, in this order: " + ", ".join(paths) + ". Pass the "
+                    "complete text below as its prompt, verbatim, including any "
+                    "size requirement. Keep the composition and aspect ratio of "
+                    "the first reference unless the text below says otherwise. "
+                    "Then reply with one short sentence:\n\n" + prompt)
+        else:
+            text = ("Call the image generation tool (image_gen) exactly once, "
+                    "passing the complete text below as its prompt, verbatim, "
+                    "including any size requirement. Then reply with one short "
+                    "sentence:\n\n" + prompt)
+        sid = None
+        try:
+            sid = self._open_session(model=model, effort=effort)
+            _log(f"grok scratch session: {sid} ({len(paths)} reference file(s))")
+            yield from self.prompt(text, timeout=timeout, model=model, effort=effort,
+                                   session_id=sid)
+        finally:
+            if sid:
+                self._close_session(sid)
+            if refs_dir:
+                # Our copies of the client's upload; the generated image stays
+                # under ~/.grok/sessions with the rest of the session.
+                shutil.rmtree(refs_dir, ignore_errors=True)
+
+    @staticmethod
+    def _update_text(upd):
+        parts = []
+        for c in upd.get("content") or []:
+            inner = c.get("content") if isinstance(c, dict) else None
+            if isinstance(inner, dict) and inner.get("type") == "text":
+                parts.append(inner.get("text") or "")
+        return "".join(parts)
+
+    def _image_from_update(self, upd, revised_prompt):
+        """Completed image_gen/image_edit tool_call_update -> ("image", mime,
+        b64, prompt), or a visible error note. The tool reports a JSON blob
+        with the path of the file it wrote (JPEG today), not the bytes."""
+        dt = time.time() - (getattr(self, "_image_t0", None) or time.time())
+        text = self._update_text(upd)
+        path = None
+        try:
+            info = json.loads(text)
+            path = info.get("path")
+        except Exception:
+            pass
+        if not path:
+            _log(f"grok image: no path in tool result after {dt:.1f}s: {text[:120]!r}")
+            return f"\n[grok image error] {text[:200] or 'no image path reported'}"
+        try:
+            data = Path(path).read_bytes()
+        except OSError as e:
+            _log(f"grok image: cannot read {path}: {e}")
+            return f"\n[grok image error] cannot read {path}"
+        mime = next((m for magic, m in self._IMAGE_MAGIC if data.startswith(magic)),
+                    "image/jpeg")
+        _log(f"grok image: {len(data) / 1024:.0f} KB {mime} in {dt:.1f}s (saved {path})")
+        return ("image", mime, base64.b64encode(data).decode("ascii"), revised_prompt)
+
+    def _cancel_turn(self, sid):
+        try:
+            self._notify("session/cancel", {"sessionId": sid})
+            return True
+        except Exception:
+            return False
+
+    def cancel(self):
+        sid = self._active_sid
+        if not (self._turn_in_flight and sid):
+            return False
+        return self._cancel_turn(sid)
+
+    def _usage_suffix(self):
+        u = self._turn_usage
+        if not u:
+            return ""
+        cost = (u.get("costUsdTicks") or 0) / 1e10
+        return (f"  tokens in={u.get('inputTokens', 0)} (cached {u.get('cachedReadTokens', 0)}) "
+                f"out={u.get('outputTokens', 0)} reasoning={u.get('reasoningTokens', 0)}"
+                f"  ~${cost:.4f} (run ~${self._cost_ticks / 1e10:.3f})")
+
+    def quota_status(self):
+        """Grok exposes no subscription quota; the only metering is the
+        per-turn cost estimate grok itself reports (model tokens only, the
+        image tool's cost is not in it)."""
+        if not self._cost_ticks:
+            return None
+        return (f"grok usage | this run ~${self._cost_ticks / 1e10:.3f} est. "
+                f"(tokens only, images excluded; no subscription quota readout)")
+
+    def is_alive(self):
+        return self.proc.poll() is None
+
+    def close(self):
+        if self.session_id:
+            shutil.rmtree(os.path.join(self.refs_root, self.session_id), ignore_errors=True)
+        # EOF on stdin lets grok flush its session persistence; terminate
+        # only if it lingers.
+        try:
+            if self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=3)
+        except Exception:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
             except Exception:
                 try:
-                    p.kill()
+                    self.proc.kill()
                 except Exception:
                     pass
         if self._logf:
@@ -1679,8 +2422,6 @@ class ClaudeCodeBackend(Backend):
             except Exception:
                 pass
 
-
-# --- Factory -------------------------------------------------------------
 
 def make_backend(kind, *, model=None, reasoning_effort=None, log_dir: Optional[Path] = None) -> Backend:
     """Construct the selected backend. `model`/`reasoning_effort` None means
@@ -1706,4 +2447,11 @@ def make_backend(kind, *, model=None, reasoning_effort=None, log_dir: Optional[P
         if reasoning_effort is not None:
             kw["reasoning_effort"] = reasoning_effort
         return ClaudeCodeBackend(**kw)
-    raise BackendError(f"unknown backend {kind!r} (expected 'copilot', 'codex', or 'claude')")
+    if kind == "grok":
+        kw = {"log_path": log_dir / "grok_wire.log"}
+        if model is not None:
+            kw["model"] = model
+        if reasoning_effort is not None:
+            kw["reasoning_effort"] = reasoning_effort
+        return GrokACPBackend(**kw)
+    raise BackendError(f"unknown backend {kind!r} (expected 'copilot', 'codex', 'claude', or 'grok')")

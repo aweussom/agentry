@@ -8,9 +8,8 @@ shutdown on every turn.
 Backends (see backends.py), selected with --backend:
   copilot  GitHub Copilot CLI (`copilot --acp`) — the free tier (default).
   codex    OpenAI Codex (`codex app-server`)    — paid-cheap (ChatGPT Go/Plus).
-  claude   Anthropic Claude Code (`claude -p`)  — premium. COLD-START: one fresh
-           process per turn (claude-code has no persistent stdio server). ~2.5s
-           startup overhead; trades that for zero cross-turn context bleed.
+  claude   Anthropic Claude Code (`claude -p`) — persistent stream-json worker,
+           cleared between requests to retain per-task conversation isolation.
 
 Each backend resolves its own model + reasoning defaults; --model and
 --reasoning-effort override them.
@@ -27,6 +26,7 @@ import atexit
 import base64
 import json
 import re
+import socket
 import struct
 import sys
 import threading
@@ -34,6 +34,7 @@ import time
 import uuid
 from pathlib import Path
 from flask import Flask, Response, jsonify, request, render_template
+from werkzeug.serving import ThreadedWSGIServer
 
 from logutil import (REQ_T0 as _REQ_T0, now as _now, log as _log,
                      start_keepalive, set_status_provider, set_ticker_provider)
@@ -164,7 +165,7 @@ def _sse(delta, model, done=False, reasoning=False, images=None):
 
 
 # Effort vocabulary across all backends; each backend validates/no-ops what
-# its runtime can't apply (claude has no knob at all). "ultra" is codex-only
+# its runtime can't apply (Claude effort is not yet forwarded). "ultra" is codex-only
 # (model/list: "maximum reasoning with automatic task delegation").
 EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 
@@ -196,7 +197,8 @@ def health():
 
 @app.route("/v1/models")
 def models():
-    owner = {"codex": "openai", "claude": "anthropic"}.get(BACKEND_KIND, "github-copilot")
+    owner = {"codex": "openai", "claude": "anthropic",
+             "grok": "xai"}.get(BACKEND_KIND, "github-copilot")
     # Real list when the backend can enumerate (copilot's models.list); the
     # extra fields (price_category, name) are non-standard but OpenAI clients
     # ignore unknown keys. Falls back to the single synthetic entry.
@@ -363,8 +365,11 @@ def chat_completions():
 # the log counts tokens only (an image turn reports ~10-50 output tokens), so
 # it understates image turns.
 
-# codex's tool accepts at most 5 reference images (ImagegenArgs, tool.rs).
-_MAX_EDIT_IMAGES = 5
+# Reference-image ceilings are the tools' own, not ours: codex's accepts at
+# most 5 (ImagegenArgs, tool.rs); grok's image_edit fails at the API with
+# "This model supports at most 3 input image(s)" (probed 2026-10-04 on
+# 1.0.46 with 6). Rejecting early saves a 20 s turn that ends in that error.
+_MAX_EDIT_IMAGES = {"codex": 5, "grok": 3}
 
 
 def _size_wording(size):
@@ -391,16 +396,26 @@ def _size_wording(size):
             f"i.e. {w} pixels wide by {h} pixels tall."), (w, h)
 
 
-def _png_size(b64):
-    """(w, h) from a base64 PNG's IHDR, or None. Decodes only the header —
-    the prose codex returns claims whatever size was asked for, the IHDR
-    says what was delivered."""
+def _image_size(b64):
+    """(w, h, "png"|"jpeg") from a base64 PNG (IHDR) or JPEG (SOF marker),
+    or None. The prose the model returns claims whatever size was asked
+    for; the header says what was delivered. codex emits PNG, grok JPEG."""
     try:
-        head = base64.b64decode(b64[:64])
-        if head[:8] == b"\x89PNG\r\n\x1a\n":
-            return struct.unpack(">II", head[16:24])
+        data = base64.b64decode(b64)
     except Exception:
-        pass
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        w, h = struct.unpack(">II", data[16:24])
+        return w, h, "png"
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data) and data[i] == 0xFF:
+            marker = data[i + 1]
+            seglen = struct.unpack(">H", data[i + 2:i + 4])[0]
+            if marker in (0xC0, 0xC1, 0xC2):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h, "jpeg"
+            i += 2 + seglen
     return None
 
 
@@ -463,56 +478,64 @@ def _run_image_turn(route, wrapper):
     if fields.get("response_format", "b64_json") != "b64_json":
         return fail(400, "only response_format=b64_json is supported",
                     param="response_format")
+    if BACKEND_KIND not in ("codex", "grok"):
+        return fail(501, f"image generation is not available on the "
+                         f"{BACKEND_KIND} backend (codex or grok)",
+                    code="unsupported_backend")
     if route == "edits":
         if not images:
             return fail(400, "at least one reference image is required "
                              "(multipart `image` file, or a data: URI in JSON)",
                         param="image")
-        if len(images) > _MAX_EDIT_IMAGES:
-            return fail(400, f"at most {_MAX_EDIT_IMAGES} reference images",
-                        param="image")
+        limit = _MAX_EDIT_IMAGES.get(BACKEND_KIND)
+        if limit and len(images) > limit:
+            return fail(400, f"at most {limit} reference images on the "
+                             f"{BACKEND_KIND} backend", param="image")
         if fields.get("mask"):
-            return fail(400, "mask is not supported (codex's image tool takes "
+            return fail(400, "mask is not supported (the image tools take "
                              "whole-image references only)", param="mask")
-    if BACKEND_KIND != "codex":
-        return fail(501, f"image generation is not available on the "
-                         f"{BACKEND_KIND} backend (codex only)",
-                    code="unsupported_backend")
     for k in ("quality", "style", "background", "output_format"):
         if fields.get(k) not in (None, "auto"):
             _log(f"WARN: images/{route} ignoring {k}={fields[k]!r} "
-                 f"(codex pins gpt-image-2 @ auto)")
+                 f"(the backend's image tool exposes no such knob)")
     size_text, want_size = _size_wording(fields.get("size"))
 
+    # The size sentence goes INSIDE the prompt body: the wrapper says
+    # "verbatim", and the model obeys — a size requirement placed in the
+    # wrapper never reached the tool (both test cases came back flipped, WARN
+    # fired). Same paragraph, not a trailing one: with "verbatim" in play the
+    # model forwarded only the first paragraph and dropped a size paragraph
+    # after a blank line (generations test, WARN fired).
+    body = prompt.rstrip() + (" " + size_text.strip() if size_text else "")
+    img_note = f" images={len(images)}" if images else ""
     try:
         backend = _get_backend()
-        # Every Images call gets its own throwaway thread: it never touches
-        # the chat session, and a batch caller doesn't build up a context of
-        # old references the tool could mistake for this call's (see
-        # CodexAppServerBackend.scratch_thread).
-        thread_id = backend.scratch_thread()
+        if BACKEND_KIND == "grok":
+            # Throwaway ACP session per call; references go to disk because
+            # the ACP prompt takes no image content (GrokACPBackend.image_turn).
+            _log(f"image/{route}: grok scratch session{img_note} prompt={prompt[:60]!r}")
+            gen = backend.image_turn(body, images=images)
+        else:
+            # Every Images call gets its own throwaway thread: it never touches
+            # the chat session, and a batch caller doesn't build up a context of
+            # old references the tool could mistake for this call's (see
+            # CodexAppServerBackend.scratch_thread).
+            thread_id = backend.scratch_thread()
+            _log(f"image/{route}: thread={thread_id}{img_note} prompt={prompt[:60]!r}")
+            # Serialized with chat turns by the backend's turn lock. The wrapper
+            # text makes the tool call unambiguous. "exactly once": a wordy
+            # dimensions instruction made the model call the tool twice in one
+            # turn during the aspect trials (double cost).
+            text = (f"{wrapper} Call the image generation tool exactly once, passing "
+                    f"the complete text below as its prompt, verbatim, including any "
+                    f"size requirement. Then reply with one short sentence:\n\n{body}")
+            gen = backend.prompt(text, images=images, thread_id=thread_id)
     except Exception as e:
         return fail(500, f"backend init failed: {e}", code="server_error")
 
-    img_note = f" images={len(images)}" if images else ""
-    _log(f"image/{route}: thread={thread_id}{img_note} prompt={prompt[:60]!r}")
-    # Serialized with chat turns by the backend's turn lock. The wrapper text
-    # makes the tool call unambiguous.
-    # "exactly once": a wordy dimensions instruction made the model call the
-    # tool twice in one turn during the aspect trials (double cost). The size
-    # sentence goes INSIDE the prompt body: the wrapper says "verbatim", and
-    # the model obeys — a size requirement placed in the wrapper never
-    # reached the tool (both test cases came back flipped, WARN fired).
-    # Same paragraph, not a trailing one: with "verbatim" in play the model
-    # forwarded only the first paragraph and dropped a size paragraph after
-    # a blank line (generations test, WARN fired).
-    body = prompt.rstrip() + (" " + size_text.strip() if size_text else "")
-    text = (f"{wrapper} Call the image generation tool exactly once, passing "
-            f"the complete text below as its prompt, verbatim, including any "
-            f"size requirement. Then reply with one short sentence:\n\n{body}")
     imgs, notes = [], []
     try:
-        for d in backend.prompt(text, images=images, thread_id=thread_id):
+        for d in gen:
             if isinstance(d, tuple) and d[0] == "image":
                 imgs.append(d)
             elif isinstance(d, str) and d.lstrip().startswith("["):
@@ -522,17 +545,21 @@ def _run_image_turn(route, wrapper):
     if not imgs:
         return fail(502, "backend returned no image" +
                     (": " + "; ".join(notes) if notes else ""), code="server_error")
-    data = []
+    data, fmt = [], None
     for img in imgs:
         entry = {"b64_json": img[2], "revised_prompt": img[3]}
-        got = _png_size(img[2])
+        got = _image_size(img[2])
         if got:
             entry["size"] = f"{got[0]}x{got[1]}"
+            fmt = fmt or got[2]
             if want_size and abs(got[0] / got[1] - want_size[0] / want_size[1]) > 0.05:
                 _log(f"WARN: images/{route} asked {want_size[0]}x{want_size[1]}, "
                      f"got {entry['size']} (aspect not honored)")
         data.append(entry)
-    return jsonify({"created": int(time.time()), "data": data}), 200, {
+    # OpenAI's shape: `output_format` is top-level. codex returns PNG, grok
+    # JPEG — say which, so a client saving `b64_json` picks the right suffix.
+    return jsonify({"created": int(time.time()), "data": data,
+                    "output_format": fmt or "png"}), 200, {
         "X-Device": BACKEND_KIND, "X-Model": _model_label()}
 
 
@@ -562,6 +589,18 @@ def images_edits():
 
 
 # --- Entry point --------------------------------------------------------
+
+class ExclusiveThreadedWSGIServer(ThreadedWSGIServer):
+    """Reserve the listening address against a second Windows bind."""
+
+    def server_bind(self):
+        if sys.platform == "win32":
+            # Werkzeug normally sets SO_REUSEADDR. On Windows that lets a
+            # second listener claim the same port, with undefined routing.
+            self.allow_reuse_address = False
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
 
 def _check_pinned_model(backend):
     """Exit at startup if --model names something the backend cannot run.
@@ -595,22 +634,25 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--backend", choices=["copilot", "codex", "claude"], default="copilot",
+    p.add_argument("--backend", choices=["copilot", "codex", "claude", "grok"], default="copilot",
                    help="Agent backend: copilot (AI-credit metered, cheapest), "
-                        "codex (paid-cheap), or claude (premium, cold-start).")
-    p.add_argument("--model", default=None,
+                        "codex (paid-cheap), claude (premium, persistent worker), "
+                        "or grok (Grok Build over ACP, SuperGrok / X Premium+).")
+    p.add_argument("--model", type=str.lower, default=None,
                    help="Model override. copilot: e.g. gpt-5.6-luna. "
                         "codex: e.g. gpt-5.6-luna (default: codex's own "
                         "configured model, i.e. the last TUI selection). "
-                        "claude: e.g. claude-sonnet-4-6 (default).")
-    p.add_argument("--reasoning-effort",
+                        "claude: e.g. claude-sonnet-4-6 (default). "
+                        "grok: grok-4.7 (default), grok-4.6, grok-4.5.")
+    p.add_argument("--reasoning-effort", type=str.lower,
                    choices=["none", "minimal", "low", "medium", "high", "xhigh",
                             "max", "ultra"],
                    default=None,
                    help="Reasoning effort override. The gpt-5.6 models take "
                         "none..max on copilot and none..ultra on codex; a "
                         "model that rejects a level keeps its previous one "
-                        "(logged). No-op on claude.")
+                        "(logged). grok maps onto low/medium/high/xhigh "
+                        "(default high). No-op on claude.")
     args = p.parse_args()
     BACKEND_KIND = args.backend
     BACKEND_MODEL = args.model
@@ -620,30 +662,30 @@ def main():
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     LOG_DIR.mkdir(exist_ok=True)
 
-    # Idle heartbeat: pulses '...*...*...*' in place once a second, and drops a
-    # permanent quota snapshot into scrollback every 10 min (codex: rate-limit
-    # %, copilot: AI-credit spend). While a turn is in flight the
-    # same line becomes a news ticker scrolling the model's current output
-    # line (reasoning summary or response), so long turns show visible work.
-    set_status_provider(lambda: _backend.quota_status() if _backend else None)
-    set_ticker_provider(lambda: _backend.ticker_line() if _backend else None)
-    start_keepalive(pulse_interval=1.0, snapshot_interval=600.0)
+    # Bind before starting a backend. This makes a competing launch fail
+    # immediately and keeps the port reserved throughout eager initialization.
+    with ExclusiveThreadedWSGIServer(args.host, args.port, app) as server:
+        # Idle heartbeat: pulses '...*...*...*' in place once a second, and
+        # drops a permanent quota snapshot into scrollback every 10 min.
+        set_status_provider(lambda: _backend.quota_status() if _backend else None)
+        set_ticker_provider(lambda: _backend.ticker_line() if _backend else None)
+        start_keepalive(pulse_interval=1.0, snapshot_interval=600.0)
 
-    print(f"  agentry on http://localhost:{args.port}  (backend={BACKEND_KIND})", flush=True)
-    print(f"  model={BACKEND_MODEL or '(backend default)'}  reasoning={REASONING_EFFORT or '(backend default)'}", flush=True)
+        print(f"  agentry on http://localhost:{server.port}  (backend={BACKEND_KIND})", flush=True)
+        print(f"  model={BACKEND_MODEL or '(backend default)'}  reasoning={REASONING_EFFORT or '(backend default)'}", flush=True)
 
-    # Eagerly spawn the backend subprocess so the first user request doesn't
-    # pay the handshake/session-new cost (~2-4s typically).
-    try:
-        backend = _get_backend()
-        _check_pinned_model(backend)
-        backend.new_session()
-        user_note = f"user={backend.auth_login}  " if backend.auth_login else ""
-        print(f"  {BACKEND_KIND} ready  ({user_note}session={backend.session_id})", flush=True)
-    except Exception as e:
-        print(f"  WARN: backend eager init failed: {e}", flush=True)
+        # Eagerly spawn the backend subprocess so the first user request
+        # doesn't pay the handshake/session-new cost (~2-4s typically).
+        try:
+            backend = _get_backend()
+            _check_pinned_model(backend)
+            backend.new_session()
+            user_note = f"user={backend.auth_login}  " if backend.auth_login else ""
+            print(f"  {BACKEND_KIND} ready  ({user_note}session={backend.session_id})", flush=True)
+        except Exception as e:
+            print(f"  WARN: backend eager init failed: {e}", flush=True)
 
-    app.run(host=args.host, port=args.port, threaded=True)
+        server.serve_forever()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch agentry. Run from a shell where the chosen backend's CLI is already
-# authenticated (`copilot login`, `codex login`, or the Claude Code CLI's own
-# login). Mirrors start.ps1 — same flag names, same defaults.
+# authenticated (`copilot login`, `codex login`, `grok login`, or the Claude
+# Code CLI's own login). Mirrors start.ps1 — same flag names, same defaults.
 #
 # Run a test instance on a different --port than a running prod instance to
 # avoid an "address already in use" collision (agentry-vs-agentry).
@@ -10,20 +10,21 @@ set -euo pipefail
 PORT=8765
 BACKEND="copilot"
 MODEL=""
-REASONING_EFFORT="low"
+REASONING_EFFORT=""
 
 usage() {
     cat <<EOF
 Usage: ./start.sh [options]
   --port N                HTTP port (default: ${PORT})
-  --backend NAME          copilot | codex | claude (default: ${BACKEND})
+  --backend NAME          copilot | codex | claude | grok (default: ${BACKEND})
   --model NAME            Model override (copilot default: gpt-5.6-luna;
                           codex default: whatever codex itself is
                           configured for (last TUI selection);
-                          claude default: claude-sonnet-4-6)
+                          claude default: claude-sonnet-4-6;
+                          grok default: grok-4.7)
   --reasoning-effort X    none|minimal|low|medium|high|xhigh|max|ultra
-                          (default: ${REASONING_EFFORT}; what applies is
-                          per model; no-op on claude — it has no effort knob)
+                          (default: low, grok: high; what applies is
+                          per model; not yet forwarded to claude)
   -h, --help              Show this help
 
 Examples:
@@ -31,6 +32,7 @@ Examples:
   ./start.sh --backend codex
   ./start.sh --backend codex --model gpt-5.6-luna --reasoning-effort low
   ./start.sh --backend claude
+  ./start.sh --backend grok
   ./start.sh --port 9000
 EOF
 }
@@ -52,6 +54,11 @@ cd "$(dirname "$(readlink -f "$0")")"
 # tier ($0.20/M input, ~10x below terra), benchmarked 2026-08; codex follows
 # its own configured model (last selected in the codex TUI) unless overridden.
 if [[ -z "$MODEL" && "$BACKEND" == "copilot" ]]; then MODEL="gpt-5.6-luna"; fi
+# Effort default is per backend: low everywhere except grok, whose models are
+# weak enough that high (the CLI's own default) is the sensible floor.
+if [[ -z "$REASONING_EFFORT" ]]; then
+    if [[ "$BACKEND" == "grok" ]]; then REASONING_EFFORT="high"; else REASONING_EFFORT="low"; fi
+fi
 
 if [[ ! -x venv/bin/python ]]; then
     echo "Creating venv..."
@@ -82,8 +89,9 @@ if [[ "$BACKEND" == "copilot" ]]; then
         exit 1
     fi
 else
-    case "$BACKEND" in codex) CLI=codex ;; *) CLI=claude ;; esac
-    if ! command -v "$CLI" >/dev/null 2>&1; then
+    case "$BACKEND" in codex) CLI=codex ;; grok) CLI=grok ;; *) CLI=claude ;; esac
+    # grok's installer puts the binary in ~/.grok/bin; accept it off PATH too.
+    if ! command -v "$CLI" >/dev/null 2>&1 && ! [[ "$BACKEND" == "grok" && -x "$HOME/.grok/bin/grok" ]]; then
         echo "ERROR: '$CLI' not found on PATH (needed for the $BACKEND backend)." >&2
         exit 1
     fi

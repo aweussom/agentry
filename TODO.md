@@ -2,6 +2,15 @@
 
 ## Done
 
+- [x] Grok Build backend (`grok agent stdio`, ACP) landed 2026-10-04 as
+      backend #4, SuperGrok / X Premium+ tier. One ACP session per chat,
+      model/effort as session state inside the turn lock, live text and
+      thought streaming, `session/cancel`, inline `image_gen` images. Tool
+      lockdown is `grok-agent-profile.md` because `grok agent` takes none
+      of the headless tool flags. Default `grok-4.7 @ high`; the 2x-price
+      fast variant is hidden. `archive/GROK-PLAN.md`, `_bench/grok_acp_probe.py`,
+      `test_grok_backend.py`.
+
 - [x] `--acp` backend (persistent `copilot.exe` driven over JSON-RPC on
       stdio). Turn time dropped from ~8 s (`-p` mode) to ~2-3 s (api_ms
       floor) for short prompts.
@@ -44,7 +53,7 @@
       see `archive/CLAUDE-PLAN.md` for why prompting can't cleanly fix its
       cross-turn leakage. `_bench/claude_probe.py`.
       **2026-09-11:** leakage objection removed — `/clear` over stream-json
-      resets the conversation in place; see the open persistent-claude item.
+      resets the conversation in place; see the completed persistent-claude item below.
 - [x] OpenAI-like model handling (2026-08-13, after the GitHub AI-credits
       billing switch made model choice a per-token cost decision):
     - Per-request `model` honored on `/v1/chat/completions` (copilot switches
@@ -255,23 +264,31 @@
 
 ## Backends
 
-- [ ] **Persistent `claude` backend with `/clear` per task** (unblocked
-      2026-09-11). Hold one `claude -p --input-format stream-json
-      --output-format stream-json --verbose` process (lean flags), and
-      instead of respawning per turn send `/clear` as a user message: Claude
-      Code 2.1.268 answers with a `conversation_reset` frame in ~125 ms at
-      $0.00 and the next turn has no memory of prior turns
-      (`_bench/claude_clear_probe.py`, haiku-4-5). Saves the ~2.5 s cold start
-      per turn that `archive/CLAUDE-PLAN.md` accepted for isolation. Design:
-      keep the structural guarantees — `new_session()` = `/clear`, and if the
-      reset frame does not arrive within a short timeout, fall back to a
-      respawn so isolation is never silently lost. Watch for: does `/clear`
-      drop the API prompt cache for the system prefix (measure first-turn
-      cost after reset vs. a fresh spawn); does `--session-id` change per
-      conversation (the frame carries `new_conversation_id`); ticker/quota
-      code assumes one process per turn today. Bench before switching the
-      default — for 40–90 s enrichment turns the saving is still noise;
-      the win is short-turn batches and the web UI's snappiness.
+- [x] (grok) Images routes on grok (2026-10-04, same day): throwaway ACP
+      session per call, `image_gen` for generations, `image_edit` with
+      references written to the scratch cwd for edits (ACP takes no image
+      input). JPEG out, `output_format` reported, 3-reference ceiling from
+      xAI's API mirrored as a 400. Live with konaogco's cards: identity
+      survives, style drifts photoreal; see README *Image generation (grok)*.
+- [x] (grok) Image input in chat (2026-10-04): attachments to disk under
+      `refs/<session>/`, seen via `read_file`, editable via `image_edit`;
+      all tool calls gated by an ACP client hook (`_x.ai/hooks/run`) that
+      denies paths outside the refs dir and grok's session store. The
+      "images dropped" note is gone on grok.
+- [ ] (grok) Still unverified: whether `grok agent` honours
+      `[cli] auto_update = false` or needs it in `~/.grok/config.toml`, and
+      what an expired 7-day token looks like on `session/new`.
+- [x] **Persistent `claude` backend with `/clear` per task** (2026-09-23).
+      Reuses one lean stream-JSON worker, consuming both reset acknowledgement
+      and successful reset result before every subsequent task. Safe mode,
+      no tools/MCP/saved sessions; normal subscription auth retained. Model
+      changes restart; failed reset falls back to fresh workers. Cancellation,
+      disconnect, early EOF and failed results retire/reap the worker.
+      Offline lifecycle tests plus live Sonnet reset/isolation and Flask
+      streaming checks passed on Claude Code 2.1.281. Timings are noisy but
+      the repeated spawn is removed and input context fell substantially.
+      See `archive/CLAUDE-STARTUP-2026-09-23.md` and
+      `_bench/claude_startup_bench.py` for measurements and limitations.
 
 ## Research / evaluation
 

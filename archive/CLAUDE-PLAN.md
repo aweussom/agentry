@@ -1,5 +1,10 @@
 # Claude Code backend plan
 
+**Update 2026-09-23:** persistent stream-JSON workers with acknowledged `/clear`
+between requests are now implemented. See [startup measurements and lifecycle
+design](CLAUDE-STARTUP-2026-09-23.md). The material below records the original
+cold-start decision and subsequent investigations.
+
 **Status (2026-05-31): LANDED as backend #3 (cold-start).** `claude` CLI 2.1.158
 installed (`C:\Users\wossn\.local\bin\claude.exe`, a real exe — NOT a .cmd shim).
 Auth: already logged in via the Claude Code CLI's own OAuth; `-p` runs headless

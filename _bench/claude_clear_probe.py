@@ -73,11 +73,13 @@ def main(model):
                 print(f"  result {sub} cost=${d.get('total_cost_usd', 0):.4f} "
                       f"dur={d.get('duration_ms')}ms turns={d.get('num_turns')}")
                 if until_result:
+                    if d.get("is_error") or sub != "success":
+                        return seen_reset, None
                     return seen_reset, str(d.get("result", ""))
         return seen_reset, None
 
     send("Remember the codeword PINEAPPLE. Reply with exactly: OK")
-    drain("turn 1: plant codeword")
+    _, planted = drain("turn 1: plant codeword")
     send("/clear")
     reset, _ = drain("/clear", until_result=False, quiet=4)
     send("What codeword did I ask you to remember earlier? Reply with just the word, or NONE.")
@@ -90,9 +92,11 @@ def main(model):
     print()
     print("conversation_reset frame seen:", bool(reset))
     print("turn 3 answered:", (answer or "").strip()[:40] or "(no result)")
-    clean = bool(reset) and "PINEAPPLE" not in (answer or "").upper()
+    clean = bool(reset) and (planted or "").strip() == "OK" and (answer or "").strip() == "NONE"
     print("VERDICT:", "clean reset — persistent claude with per-task isolation is viable"
           if clean else "context leaked or no reset frame — keep cold-start")
+    if not clean:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

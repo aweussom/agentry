@@ -22,6 +22,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backends import _relocate_runtime_for_store_python
 from copilot import CopilotClient
 from copilot.rpc import ModelsListRequest, PermissionDecisionReject
 from copilot.session_events import (
@@ -116,6 +117,7 @@ async def main():
         help="session cwd; decides which copilot-instructions.md loads")
     args = ap.parse_args()
 
+    _relocate_runtime_for_store_python()   # Store Python: same shim as agentry
     client = CopilotClient(working_directory=args.cwd)
     await client.start()
     st = await client.get_auth_status()

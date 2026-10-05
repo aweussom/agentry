@@ -108,6 +108,13 @@ second backend justified it.
 Re-evaluate a specific candidate if it ships a persistent stdio protocol on
 par with ACP / codex app-server.
 
+**Update 2026-10-04:** Grok Build (`grok agent stdio`, real ACP) cleared that
+bar and landed as backend #4 (`GrokACPBackend`, `archive/GROK-PLAN.md`).
+Distinct audience: SuperGrok / X Premium+ subscribers. The "each backend adds
+auth gotchas and a support tail" caution proved right in miniature: its
+headless tool flags do not apply to ACP mode, so the lockdown is an agent
+profile, and it silently loads Claude Code's skills and hooks.
+
 ## Polling `account/getQuota` on a TTL from a long-lived Copilot runtime
 
 Idea (landed 2026-09-01, 888fa7a/92528dd): drive the heartbeat's
