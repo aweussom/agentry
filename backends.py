@@ -102,7 +102,10 @@ class Backend(abc.ABC):
         consumers that only want the answer must filter for str items.
         Backends whose runtime can generate images yield each finished image
         as ("image", mime_type, base64_data, revised_prompt_or_None) — never
-        inline in the text, so JSON-expecting clients keep a clean content."""
+        inline in the text, so JSON-expecting clients keep a clean content.
+        A finished video is ("video", mime_type, file_path, revised_prompt):
+        a path, not bytes, because the Videos route serves it on a later
+        GET rather than inlining a megabyte of MP4 in JSON."""
 
     @abc.abstractmethod
     def cancel(self) -> bool:
@@ -1877,6 +1880,7 @@ class GrokACPBackend(Backend):
         self.active_turn_queue = None   # (method, params) notifications of the in-flight turn
         self._turn_in_flight = False
         self._active_sid = None         # session the in-flight turn runs on
+        self._video_sid = None          # session allowed to call the video tools
         self.session_id = None
         self.session_fresh = False
         self._sess_state = {}           # sessionId -> [model, effort] the session runs
@@ -2009,23 +2013,36 @@ class GrokACPBackend(Backend):
         aborts it with the message shown to the model."""
         tool = params.get("toolName")
         inp = params.get("toolInput") or {}
+        why = "may only be used on image files the user attached in this chat"
         if tool == "image_gen":
             return {}
         if tool == "read_file":
             ok = self._path_allowed(inp.get("target_file"))
         elif tool == "image_edit":
-            paths = inp.get("image") or []
-            if isinstance(paths, str):
-                paths = [paths]
-            ok = bool(paths) and all(self._path_allowed(p) for p in paths)
+            ok = self._paths_allowed(inp.get("image"))
+        elif tool in self._VIDEO_TOOLS:
+            # Video only through /v1/videos (a video_turn session): the chat
+            # contract has no slot for a clip, and a clip is a quota event.
+            if params.get("sessionId") != self._video_sid:
+                ok = False
+                why = "is only available through the /v1/videos API"
+            else:
+                refs = [inp.get(k) for k in ("image", "first_frame", "last_frame",
+                                              "images", "keyframes")]
+                refs = [r for r in refs if r]
+                ok = bool(refs) and all(self._paths_allowed(r) for r in refs)
         else:
             ok = False
         if ok:
             return {}
         _log(f"grok hook: denied {tool} {json.dumps(inp)[:160]}")
         return {"decision": "deny",
-                "systemMessage": f"agentry: {tool or 'this tool'} may only be used on image "
-                                 f"files the user attached in this chat"}
+                "systemMessage": f"agentry: {tool or 'this tool'} {why}"}
+
+    def _paths_allowed(self, paths):
+        if isinstance(paths, str):
+            paths = [paths]
+        return bool(paths) and all(self._path_allowed(p) for p in paths)
 
     def _write_refs(self, images, subdir):
         """Write (mime, b64) attachments under refs/<subdir>/; returns their
@@ -2244,12 +2261,15 @@ class GrokACPBackend(Backend):
                                     or upd.get("title"))
                             tool_names[tid] = name
                             raw = upd.get("rawInput") or {}
-                            if name in self._IMAGE_TOOLS:
+                            if name in self._IMAGE_TOOLS or name in self._VIDEO_TOOLS:
                                 tool_prompts[tid] = raw.get("prompt")
                                 self._image_t0 = time.time()
                                 _log(f"grok {name} started"
                                      + (f" ({len(raw['image'])} reference(s))"
-                                        if isinstance(raw.get("image"), list) else ""))
+                                        if isinstance(raw.get("image"), list) else "")
+                                     + (f" duration={raw.get('duration')} "
+                                        f"{raw.get('resolution_name')}"
+                                        if name in self._VIDEO_TOOLS else ""))
                             elif name == "read_file":
                                 # Looking at an attachment; the hook has
                                 # already vetted the path.
@@ -2258,7 +2278,15 @@ class GrokACPBackend(Backend):
                                 _log(f"WARN: grok called tool {name!r} despite the profile")
                         elif kind == "tool_call_update":
                             tid = upd.get("toolCallId")
-                            if tool_names.get(tid) not in self._IMAGE_TOOLS:
+                            name = tool_names.get(tid)
+                            if name in self._VIDEO_TOOLS:
+                                status = upd.get("status")
+                                if status == "completed":
+                                    yield self._video_from_update(upd, tool_prompts.get(tid))
+                                elif status == "failed":
+                                    yield f"\n[grok video error] {self._update_text(upd)[:300]}"
+                                continue
+                            if name not in self._IMAGE_TOOLS:
                                 continue
                             status = upd.get("status")
                             if status == "completed":
@@ -2283,8 +2311,59 @@ class GrokACPBackend(Backend):
                 _log(f"grok turn took {time.time() - t0:.1f}s")
 
     _IMAGE_TOOLS = ("image_gen", "image_edit")
+    _VIDEO_TOOLS = ("image_to_video", "reference_to_video")
     _REF_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
                 "image/webp": ".webp"}
+
+    def video_turn(self, prompt, image, seconds=6, size_text="", timeout=900,
+                   model=None, effort=None):
+        """One /v1/videos call: `image_to_video` from one reference image on
+        a throwaway session. Grok has no text-only video (`reference_to_video`
+        wants at least one image/frame/voice input), so a reference is
+        mandatory. Probed 2026-10-05 on 1.0.46: 6 s is the tool's floor,
+        480p the model's default pick, ~30 s per clip, MP4 H.264+AAC 448x672
+        for a portrait reference, reported like images as a JSON blob with
+        the file path under ~/.grok/sessions/<cwd>/<session>/videos/. Yields
+        like prompt(): text, notes starting with "[", and one
+        ("video", "video/mp4", path, revised_prompt) tuple on success."""
+        sub = "vid-" + uuid.uuid4().hex
+        paths = self._write_refs([image], sub)
+        refs_dir = os.path.join(self.refs_root, sub)
+        text = ("Call the image_to_video tool exactly once, with the file "
+                f"{paths[0]} as its `image` argument and a duration of {int(seconds)} "
+                "seconds. Pass the complete text below as its prompt, verbatim, "
+                "including any size or resolution requirement. Then reply with "
+                "one short sentence:\n\n" + prompt.rstrip()
+                + (" " + size_text.strip() if size_text else ""))
+        sid = None
+        try:
+            sid = self._open_session(model=model, effort=effort)
+            self._video_sid = sid
+            _log(f"grok video session: {sid}")
+            yield from self.prompt(text, timeout=timeout, model=model, effort=effort,
+                                   session_id=sid)
+        finally:
+            self._video_sid = None
+            if sid:
+                self._close_session(sid)
+            shutil.rmtree(refs_dir, ignore_errors=True)
+
+    def _video_from_update(self, upd, revised_prompt):
+        """Completed image_to_video/reference_to_video update -> ("video",
+        "video/mp4", path, prompt), or a visible error note. Returns the
+        path, not the bytes: the Videos route serves the file on GET."""
+        dt = time.time() - (getattr(self, "_image_t0", None) or time.time())
+        text = self._update_text(upd)
+        path = None
+        try:
+            path = json.loads(text).get("path")
+        except Exception:
+            pass
+        if not path or not os.path.isfile(path):
+            _log(f"grok video: no usable path after {dt:.1f}s: {text[:120]!r}")
+            return f"\n[grok video error] {text[:200] or 'no video path reported'}"
+        _log(f"grok video: {os.path.getsize(path) / 1024:.0f} KB in {dt:.1f}s (saved {path})")
+        return ("video", "video/mp4", path, revised_prompt)
 
     def image_turn(self, prompt, images=None, timeout=900, model=None, effort=None):
         """One Images-API call on a throwaway ACP session (the chat session

@@ -33,7 +33,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from flask import Flask, Response, jsonify, request, render_template
+from flask import Flask, Response, jsonify, request, render_template, send_file
 from werkzeug.serving import ThreadedWSGIServer
 
 from logutil import (REQ_T0 as _REQ_T0, now as _now, log as _log,
@@ -586,6 +586,219 @@ def images_edits():
         "Edit the attached image(s) with the image generation tool. Use every "
         "attached image as reference. Keep the composition and aspect ratio of "
         "the attached image unless the text below says otherwise.")
+
+
+# --- Videos API (grok's built-in video tool) --------------------------------
+#
+# The OpenAI Videos API shape (the Sora one: POST /v1/videos -> video object,
+# GET /v1/videos/{id}, GET /v1/videos/{id}/content, GET /v1/videos, DELETE)
+# over grok's `image_to_video`. grok only (501 elsewhere). A reference image
+# is mandatory: grok has no text-only video (`reference_to_video` demands at
+# least one image/frame/voice input, probed 2026-10-05). Generation is
+# synchronous, ~30 s for a 6 s clip, so the object comes back already
+# `completed` (or `failed`) instead of `queued`; `/content` then serves the
+# MP4 grok wrote under ~/.grok/sessions. The registry is in memory: ids die
+# with the process, the files do not. Chat stays on spec — a clip has no
+# slot in a chat completion, and the backend's hook denies the video tools
+# outside a /v1/videos turn.
+
+_VIDEOS = {}
+_VIDEOS_LOCK = threading.Lock()
+
+
+def _mp4_info(path):
+    """(width, height, seconds) from an MP4's tkhd/mvhd boxes, or None.
+    Enough ISO-BMFF to report what was delivered without ffprobe."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    # find() lands on the 4-byte box type; the body (version byte first)
+    # starts right after it.
+    w = h = secs = None
+    i = data.find(b"tkhd")
+    if i > 0:
+        v = data[i + 4]
+        off = i + 4 + (88 if v == 1 else 76)
+        if off + 8 <= len(data):
+            w = struct.unpack(">I", data[off:off + 4])[0] >> 16
+            h = struct.unpack(">I", data[off + 4:off + 8])[0] >> 16
+    j = data.find(b"mvhd")
+    if j > 0:
+        v = data[j + 4]
+        base = j + 4
+        try:
+            if v == 1:
+                ts = struct.unpack(">I", data[base + 16:base + 20])[0]
+                dur = struct.unpack(">Q", data[base + 20:base + 28])[0]
+            else:
+                ts = struct.unpack(">I", data[base + 12:base + 16])[0]
+                dur = struct.unpack(">I", data[base + 16:base + 20])[0]
+            if ts:
+                secs = dur / ts
+        except struct.error:
+            pass
+    if w is None and secs is None:
+        return None
+    return w, h, secs
+
+
+def _video_request():
+    """Normalize a Videos create request to (fields, image_or_None), where
+    image is (mime, base64). OpenAI takes multipart (`input_reference` file
+    part) or JSON (`input_reference: {"image_url": ...}`); we accept both,
+    and a bare data: URI string for the JSON form."""
+    if request.content_type and request.content_type.startswith("multipart/"):
+        fields = request.form.to_dict()
+        f = request.files.get("input_reference")
+        if f is None:
+            return fields, None
+        data = f.read()
+        mime = f.mimetype if (f.mimetype or "").startswith("image/") else "image/png"
+        return fields, (mime, base64.b64encode(data).decode("ascii"))
+    fields = request.get_json(force=True, silent=True) or {}
+    ref = fields.get("input_reference")
+    url = ref.get("image_url") if isinstance(ref, dict) else ref
+    if isinstance(url, dict):
+        url = url.get("url")
+    return fields, (_parse_data_uri(url) if isinstance(url, str) else None)
+
+
+def _video_public(v):
+    return {k: val for k, val in v.items() if not k.startswith("_")}
+
+
+@app.route("/v1/videos", methods=["POST"])
+def videos_create():
+    """POST {"prompt", "input_reference", "seconds"?, "size"?} -> video object,
+    already completed (synchronous) or failed with `error`."""
+    tid = threading.get_ident()
+    _REQ_T0[tid] = _now()
+
+    def fail(status, message, code="invalid_request_error", param=None):
+        _REQ_T0.pop(tid, None)
+        err = {"message": message, "type": code}
+        if param:
+            err["param"] = param
+        return jsonify({"error": err}), status
+
+    fields, image = _video_request()
+    prompt = (fields.get("prompt") or "").strip()
+    if not prompt:
+        return fail(400, "prompt is required", param="prompt")
+    if BACKEND_KIND != "grok":
+        return fail(501, f"video generation is not available on the {BACKEND_KIND} "
+                         f"backend (grok only)", code="unsupported_backend")
+    if not image:
+        return fail(400, "input_reference is required: grok makes video only from a "
+                         "reference image (multipart file part, or a data: URI in JSON)",
+                    param="input_reference")
+    try:
+        seconds = int(float(fields.get("seconds") or 6))
+    except (TypeError, ValueError):
+        return fail(400, "seconds must be a number", param="seconds")
+    if seconds < 6:
+        _log(f"WARN: videos asked seconds={seconds}, grok's floor is 6")
+        seconds = 6
+    size_text, want_size = _size_wording(fields.get("size"))
+    if want_size:
+        size_text += f" Resolution {'720p' if min(want_size) >= 720 else '480p'}."
+
+    vid = "video_" + uuid.uuid4().hex
+    created = int(time.time())
+    obj = {"id": vid, "object": "video", "model": _model_label(), "status": "in_progress",
+           "progress": 0, "prompt": prompt, "seconds": str(seconds),
+           "size": fields.get("size") or None, "created_at": created, "completed_at": None,
+           "expires_at": None, "error": None, "remixed_from_video_id": None}
+    _log(f"video: {vid} seconds={seconds} size={fields.get('size')!r} prompt={prompt[:60]!r}")
+    try:
+        backend = _get_backend()
+        gen = backend.video_turn(prompt, image, seconds=seconds, size_text=size_text)
+    except Exception as e:
+        return fail(500, f"backend init failed: {e}", code="server_error")
+    clips, notes = [], []
+    try:
+        for d in gen:
+            if isinstance(d, tuple) and d[0] == "video":
+                clips.append(d)
+            elif isinstance(d, str) and d.lstrip().startswith("["):
+                notes.append(d.strip())
+    finally:
+        _REQ_T0.pop(tid, None)
+    obj["completed_at"] = int(time.time())
+    if not clips:
+        obj["status"] = "failed"
+        obj["error"] = {"code": "video_generation_failed",
+                        "message": "; ".join(notes) or "backend returned no video"}
+        with _VIDEOS_LOCK:
+            _VIDEOS[vid] = obj
+        return jsonify(_video_public(obj)), 502, {"X-Device": BACKEND_KIND,
+                                                  "X-Model": _model_label()}
+    _, mime, path, revised = clips[0]
+    obj.update({"status": "completed", "progress": 100, "_path": path, "_mime": mime,
+                "revised_prompt": revised})
+    info = _mp4_info(path)
+    if info:
+        w, h, secs = info
+        if w and h:
+            obj["size"] = f"{w}x{h}"
+            if want_size and abs(w / h - want_size[0] / want_size[1]) > 0.05:
+                _log(f"WARN: videos asked {want_size[0]}x{want_size[1]}, got {w}x{h}")
+        if secs:
+            obj["seconds"] = str(int(round(secs)))
+    with _VIDEOS_LOCK:
+        _VIDEOS[vid] = obj
+    return jsonify(_video_public(obj)), 200, {"X-Device": BACKEND_KIND,
+                                              "X-Model": _model_label()}
+
+
+@app.route("/v1/videos", methods=["GET"])
+def videos_list():
+    with _VIDEOS_LOCK:
+        data = [_video_public(v) for v in _VIDEOS.values()]
+    return jsonify({"object": "list", "data": data})
+
+
+@app.route("/v1/videos/<vid>", methods=["GET"])
+def videos_retrieve(vid):
+    with _VIDEOS_LOCK:
+        v = _VIDEOS.get(vid)
+    if not v:
+        return jsonify({"error": {"message": f"video {vid} not found",
+                                  "type": "invalid_request_error"}}), 404
+    return jsonify(_video_public(v))
+
+
+@app.route("/v1/videos/<vid>", methods=["DELETE"])
+def videos_delete(vid):
+    """Forgets the id. The MP4 stays where grok put it (session store)."""
+    with _VIDEOS_LOCK:
+        v = _VIDEOS.pop(vid, None)
+    if not v:
+        return jsonify({"error": {"message": f"video {vid} not found",
+                                  "type": "invalid_request_error"}}), 404
+    return jsonify({"id": vid, "object": "video.deleted", "deleted": True})
+
+
+@app.route("/v1/videos/<vid>/content", methods=["GET"])
+def videos_content(vid):
+    with _VIDEOS_LOCK:
+        v = _VIDEOS.get(vid)
+    if not v:
+        return jsonify({"error": {"message": f"video {vid} not found",
+                                  "type": "invalid_request_error"}}), 404
+    if v.get("status") != "completed" or not v.get("_path"):
+        return jsonify({"error": {"message": f"video {vid} has no content "
+                                             f"(status {v.get('status')})",
+                                  "type": "invalid_request_error"}}), 409
+    variant = request.args.get("variant", "video")
+    if variant != "video":
+        return jsonify({"error": {"message": f"variant {variant!r} not supported "
+                                             f"(video only)",
+                                  "type": "invalid_request_error",
+                                  "param": "variant"}}), 400
+    return send_file(v["_path"], mimetype=v.get("_mime") or "video/mp4",
+                     download_name=f"{vid}.mp4", conditional=True)
 
 
 # --- Entry point --------------------------------------------------------

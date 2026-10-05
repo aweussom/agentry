@@ -36,14 +36,14 @@ Use Python 3.11+ and the launchers, which create/manage `venv/`:
 .\start.ps1 -Backend codex -Port 9000
 .\venv\Scripts\python.exe -m py_compile agentry.py backends.py logutil.py
 .\venv\Scripts\python.exe test_agentry_race.py
-.\venv\Scripts\python.exe -m unittest -v test_claude_backend test_grok_backend
+.\venv\Scripts\python.exe -m unittest -v test_claude_backend test_grok_backend test_videos_api test_cli_model
 ```
 
 ```bash
 ./start.sh --backend claude --port 9000
 venv/bin/python -m py_compile agentry.py backends.py logutil.py
 venv/bin/python test_agentry_race.py
-venv/bin/python -m unittest -v test_claude_backend test_grok_backend
+venv/bin/python -m unittest -v test_claude_backend test_grok_backend test_videos_api test_cli_model
 ```
 
 `test_agentry_race.py` checks concurrent request model/effort isolation,
@@ -160,6 +160,16 @@ advisory aspect wording; it does not guarantee exact pixels. Report the
 actual delivered dimensions and format (Codex PNG, Grok JPEG) from the
 image header, never from the model's prose. Do not delete Codex- or
 Grok-owned generated images or session history.
+
+The Videos routes (`/v1/videos`, OpenAI's Sora-era shape) are Grok-only and
+run `image_to_video` on a throwaway session via `video_turn()`, which yields
+`("video", mime, path, revised_prompt)`: a path, never bytes. A reference
+image is mandatory (grok has no text-only video), generation is synchronous
+and the object returns `completed` or `failed`; `/content` serves the file
+grok wrote. The in-memory registry forgets ids on restart and `DELETE` never
+removes the file. Report delivered size and duration from the MP4 boxes.
+Chat completions must never carry video; the backend hook allows the video
+tools only for the session `video_turn()` is running.
 
 ## UI, Logging, and Quota
 

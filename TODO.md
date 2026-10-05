@@ -275,6 +275,11 @@
       all tool calls gated by an ACP client hook (`_x.ai/hooks/run`) that
       denies paths outside the refs dir and grok's session store. The
       "images dropped" note is gone on grok.
+- [x] (grok) `/v1/videos` (2026-10-05): OpenAI Videos API shape over
+      `image_to_video`, synchronous, reference image mandatory, MP4 served
+      on `/content`, size and duration read from the MP4 boxes. Needs the
+      account's `/privacy` (ZDR) off or an S3 bucket. Chat stays video-free
+      via the hook. `test_videos_api.py`.
 - [ ] (grok) Still unverified: whether `grok agent` honours
       `[cli] auto_update = false` or needs it in `~/.grok/config.toml`, and
       what an expired 7-day token looks like on `session/new`.

@@ -573,5 +573,75 @@ class GrokBackendTests(unittest.TestCase):
         self.assertFalse(os.listdir(os.path.join(self.tmp.name, "refs")))
 
 
+    def test_video_turn_yields_path_tuple_and_gates_video_tools(self):
+        mp4 = os.path.join(self.tmp.name, "1.mp4")
+        with open(mp4, "wb") as f:
+            f.write(b"\x00\x00\x00\x18ftypisom")
+        b = self.make()
+        b.new_session()
+        seen = {}
+
+        def script(proc, mid, sid, text):
+            paths = re.findall(r"[A-Za-z]:/[^ ,]+ref-1\.jpg", text)
+            seen["path"] = paths[0]
+            seen["during"] = b._hook_decision({"sessionId": sid, "toolName": "image_to_video",
+                                               "toolInput": {"image": paths[0]}})
+            seen["chat_during"] = b._hook_decision({"sessionId": "s1", "toolName": "image_to_video",
+                                                    "toolInput": {"image": paths[0]}})
+            seen["outside_path"] = b._hook_decision({"sessionId": sid, "toolName": "image_to_video",
+                                                     "toolInput": {"image": os.path.join(self.tmp.name, "x.jpg")}})
+            proc.update(sid, {"sessionUpdate": "tool_call", "toolCallId": "c1",
+                              "title": "image_to_video",
+                              "rawInput": {"image": paths[0], "prompt": "wag", "duration": 6},
+                              "_meta": {"x.ai/tool": {"name": "image_to_video"}}})
+            proc.update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+                              "status": "completed",
+                              "content": [{"type": "content", "content": {
+                                  "type": "text", "text": json.dumps({"path": mp4})}}]})
+            proc.text(sid, "Saved.")
+            proc.finish(mid, sid)
+
+        self.proc.script = script
+        jpg = base64.b64encode(b"\xff\xd8ref").decode()
+        got = list(b.image_turn("unused", images=None)) if False else None
+        out = list(b.video_turn("the dog wags its tail", ("image/jpeg", jpg), seconds=6,
+                                size_text="The video MUST be portrait."))
+        vids = [d for d in out if isinstance(d, tuple) and d[0] == "video"]
+        self.assertEqual(vids, [("video", "video/mp4", mp4, "wag")])
+        self.assertEqual(seen["during"], {})
+        self.assertEqual(seen["chat_during"]["decision"], "deny")
+        self.assertIn("/v1/videos", seen["chat_during"]["systemMessage"])
+        self.assertEqual(seen["outside_path"]["decision"], "deny")
+        sent = self.proc.sent("session/prompt")[-1]["params"]["prompt"][0]["text"]
+        self.assertIn("image_to_video tool exactly once", sent)
+        self.assertIn("duration of 6 seconds", sent)
+        self.assertTrue(sent.endswith("the dog wags its tail The video MUST be portrait."))
+        self.assertFalse(os.path.exists(seen["path"]))
+        self.assertIsNone(b._video_sid)
+        # Outside any video turn the tools are denied even on a good path
+        self.assertEqual(b._hook_decision({"sessionId": "s1", "toolName": "reference_to_video",
+                                           "toolInput": {"first_frame": mp4}})["decision"], "deny")
+        self.assertEqual([m["method"] for m in self.proc.received][-1], "session/close")
+
+    def test_video_turn_failure_is_visible(self):
+        b = self.make()
+        b.new_session()
+
+        def script(proc, mid, sid, text):
+            proc.update(sid, {"sessionUpdate": "tool_call", "toolCallId": "c1",
+                              "title": "image_to_video", "rawInput": {"prompt": "x"}})
+            proc.update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+                              "status": "failed",
+                              "content": [{"type": "content", "content": {
+                                  "type": "text", "text": "Video generation tools are unavailable under zero data retention (ZDR)."}}]})
+            proc.finish(mid, sid)
+
+        self.proc.script = script
+        out = list(b.video_turn("x", ("image/png", base64.b64encode(b"p").decode())))
+        text = "".join(d for d in out if isinstance(d, str))
+        self.assertIn("[grok video error] Video generation tools are unavailable", text)
+        self.assertFalse([d for d in out if isinstance(d, tuple)])
+
+
 if __name__ == "__main__":
     unittest.main()

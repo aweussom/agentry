@@ -285,6 +285,19 @@ also meters spend live:
   each call on a throwaway codex thread, so a batch of edits never
   accumulates old references in one context and never disturbs the chat
   session; they still serialize with chat turns through the one turn lock.
+- `POST /v1/videos` — the OpenAI Videos API shape over grok's
+  `image_to_video` (grok only, 501 elsewhere). `prompt` plus a mandatory
+  `input_reference` (multipart file part, or JSON `{"image_url": "data:..."}`);
+  grok has no text-only video. `seconds` (grok's floor is 6) and `size` are
+  advisory like the Images routes. Generation is synchronous, ~45 s for a 6 s
+  clip, so the returned video object is already `completed` (or `failed`
+  with `error`), with the delivered `size` and `seconds` read from the MP4.
+  `GET /v1/videos/{id}` returns the object, `GET /v1/videos/{id}/content`
+  the MP4 (`variant=video` only), `GET /v1/videos` lists, `DELETE` forgets
+  the id and leaves the file. Ids live in memory; the clips stay under
+  `~/.grok/sessions/<cwd>/<session>/videos/`. Chat completions never carry
+  video: the backend's hook denies the video tools outside a `/v1/videos`
+  turn.
 - `POST /v1/cancel` — cancels the in-flight turn (copilot `session.abort()`,
   codex `turn/interrupt`, grok `session/cancel`, claude kills the process).
 
@@ -369,6 +382,18 @@ between panels, a dog changed breed, and a character was doubled. Verdict was
 
 Judge for your own material.
 
+Video, too. Grok Build ships `image_to_video` and `reference_to_video`, and
+both need an input image (`reference_to_video` without one fails with
+"Provide at least one input: `images` (up to 14), `voices` (up to 3),
+`first_frame`, `last_frame`, and/or `keyframes` (up to 4)"). They also need
+the account's `/privacy` (zero data retention) setting off, or a
+user-hosted S3 bucket in `managed_config.toml`; under ZDR the tools return
+an error. Measured 2026-10-05 on 1.0.46 with a character card as reference:
+6 s clip (the tool's floor), 448x672 at the model's default 480p in 29 s,
+768x1168 at 720p in 39 s, MP4 H.264 + AAC, 1.1 to 3.2 MB. The cost estimate
+grok reports does not include the clip. Exposed as `/v1/videos` (see
+*API*), not in chat.
+
 ## Architecture
 
 `agentry.py` is the Flask layer (routes, OpenAI shape, session reuse);
@@ -399,7 +424,7 @@ context hints into prompts.
 | `templates/`, `static/` | Web UI |
 | `.github/copilot-instructions.md` | Per-project chat-only instructions (copilot) |
 | `grok-agent-profile.md` | Agent profile that strips grok's tools down to `image_gen` and sets its chat-only prompt |
-| `test_*.py` | Offline regression tests: HTTP selection race, Claude lifecycle, Grok ACP lifecycle |
+| `test_*.py` | Offline regression tests: HTTP selection race, CLI model pin, Claude lifecycle, Grok ACP lifecycle, Videos API |
 | `start.ps1` / `start.sh` | Launchers (create venv, run agentry) |
 | `TODO.md` / `TODONT.md` | Roadmap / paths intentionally not taken |
 | `archive/` | Backend design + validation records |

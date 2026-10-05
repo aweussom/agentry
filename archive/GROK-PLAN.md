@@ -46,6 +46,22 @@ Live through agentry: attach card → described in 7.5 s; "make the collar
 blue" in the same chat → `image_edit` on the attachment, 21 s, sample 08;
 "read win.ini" → refused by the model before the hook was needed.
 
+**Phase 4 (2026-10-05): video.** Tools `image_to_video` `{image, prompt,
+duration, resolution_name}` and `reference_to_video` `{prompt, first_frame,
+aspect_ratio, duration, resolution_name}`; the latter without any image
+fails with "Provide at least one input: `images` (up to 14), `voices` (up to
+3), `first_frame`, `last_frame`, and/or `keyframes` (up to 4)", so there is
+no text-only video. First attempt failed under the account's ZDR/`/privacy`
+setting ("Video generation tools are unavailable under zero data retention";
+alternatives: `/privacy` off, or `[tools.zdr_video_output_s3]` in
+`managed_config.toml`, docs.x.ai/build/settings/zdr-video-storage). With
+privacy off: 6 s floor, 480p default 448x672 in 29 s, 720p 768x1168 in
+39 s, MP4 H.264+AAC, result reported like images as `{path, filename,
+session_folder}` under `.../<session>/videos/1.mp4`. Landed as `/v1/videos`
+(OpenAI Videos shape, synchronous) with `video_turn()` and a hook rule that
+allows the video tools only on the video session. Samples 09 and 10 in
+`C:\temp\grok-agentry-samples\`.
+
 Downstream verdict (konaogco, same day, combined cards within the 3-ref
 ceiling, 13 s image, ~1.2 cents): modern-cartoon style and lettering right,
 identities recognisable, but the panel-by-panel draft was followed only
