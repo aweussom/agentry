@@ -3,8 +3,8 @@
 **Point your OpenAI SDK at the coding-agent subscription you already pay for.**
 *The agent built to call tools becomes the tool.*
 
-Agentry wraps a coding-agent CLI — GitHub Copilot, OpenAI Codex, or Claude
-Code — holds it as one persistent process, and serves the model behind it as
+Agentry wraps a coding-agent CLI — GitHub Copilot, OpenAI Codex, Claude
+Code, or Grok Build — holds it as one persistent process, and serves the model behind it as
 an OpenAI-compatible HTTP API on localhost. Your scripts and pipelines talk to
 `gpt-5.6-luna` or `claude-sonnet` through the subscription you're already
 logged into: no separate API bill, no per-call spawn tax (~8 s in `-p` mode
@@ -18,9 +18,10 @@ is here](https://dev.to/tommy_leonhardsen_81d1f4e/i-built-an-openai-compatible-p
 A minimal chat **web UI** ships with the proxy — markdown with code-copy,
 image attach, live collapsible thinking blocks, a model picker fed by
 `/v1/models`, and an artifact side panel that renders fenced `html`/`svg`/
-`markdown` blocks. On the `codex` backend it also **generates and edits
-images** through codex's built-in `gpt-image-2` tool, billed to the ChatGPT
-plan rather than the API — inline in chat, and as OpenAI-shaped
+`markdown` blocks. On the `codex` and `grok` backends it also **generates
+and edits images** through the CLI's built-in image tool (codex's
+`gpt-image-2`, grok's `image_gen`/`image_edit`), billed to the subscription
+rather than an API — inline in chat, and as OpenAI-shaped
 `/v1/images/generations` and `/v1/images/edits` routes (see *API*). It is not the point of the project, just proof the API
 works end-to-end. The launcher prints the URL (`http://localhost:8765`).
 
@@ -30,9 +31,10 @@ works end-to-end. The launcher prints the URL (`http://localhost:8765`).
 > authenticated through its own official client and remains subject to that
 > provider's terms — agentry adds no access path, credentials, or multi-user
 > service on top. The `copilot` backend rides the official Copilot SDK, a
-> supported product surface; `codex` and `claude` wrap interactive CLIs
-> programmatically and sit in the usual gray ToS zone — use a non-critical
-> account there, keep volume modest, and never expose the port publicly.
+> supported product surface; `codex`, `claude` and `grok` wrap interactive
+> CLIs programmatically and sit in the usual gray ToS zone — use a
+> non-critical account there, keep volume modest, and never expose the port
+> publicly.
 
 ## The idea: reverse MCP
 
@@ -76,30 +78,40 @@ Code CLI supporting these flags (validated on **2.1.281**). `--bare` is not
 used because its authentication behavior differs. Startup measurements and
 reproduction commands are in [the benchmark record](archive/CLAUDE-STARTUP-2026-09-23.md).
 
-Grok opens one ACP session per chat (`session/new` is ~0.6 s) and switches
-model and reasoning effort as session state before each turn. Its tools are
-removed by the shipped agent profile `grok-agent-profile.md`: `grok agent`
-accepts none of the headless `--tools` / `--deny` flags, an empty `tools:`
-list is ignored, and permission prompts never reach the client, so a
-non-empty allowlist is the only thing that works (validated on **1.0.46**,
-[plan and probes](archive/GROK-PLAN.md)). Three tools stay in: `image_gen`
-and `image_edit` (same carve-out as codex) and `read_file`, which is how
-grok sees attachments. The ACP prompt takes no image content, so an
-`image_url` attachment is written under the scratch cwd's `refs/<session>/`
-and the message names the path; grok's `read_file` returns it as an image
-block, so "what is in this picture" works, and a follow-up "now make the
-collar blue" hands the same path to `image_edit`. Every tool call passes a
-**client hook** agentry registers on `session/new` (`_meta["x.ai/hooks"]`,
-reverse request `_x.ai/hooks/run`): `read_file` and `image_edit` are denied
-for any path outside that refs dir or grok's own image output dir, and any
-other tool is denied outright. Grok fails *open* if the hook reply is late or
-malformed, so the profile remains the first line and the hook the second.
-Grok also reads Claude Code's `~/.claude` skills and hooks by default; the
-profile keeps them from mattering. `XAI_API_KEY` is stripped from grok's
-environment so turns bill the subscription, not the metered API. Sessions
-and generated images persist under `~/.grok/sessions/` and are left for the
-user to clean up; attachment copies are removed when the chat ends.
+Grok opens one ACP session per chat (`session/new` is ~0.6 s). It switches
+model and reasoning effort as session state before each turn.
 
+The shipped agent profile `grok-agent-profile.md` removes its tools. `grok
+agent` accepts none of the headless `--tools` / `--deny` flags, an empty
+`tools:` list is ignored, and permission prompts never reach the client. So a
+non-empty allowlist is the only thing that works. Validated on 1.0.46, [plan
+and probes](archive/GROK-PLAN.md).
+
+Three tools stay in: `image_gen` and `image_edit` (same carve-out as codex),
+and `read_file` - which is how grok sees attachments.
+
+The ACP prompt takes no image content. So an `image_url` attachment is written
+under the scratch cwd's `refs/<session>/` and the message names the path.
+grok's `read_file` returns it as an image block, so "what is in this picture"
+works. A follow-up "now make the collar blue" hands the same path to
+`image_edit`.
+
+Every tool call passes a client hook agentry registers on `session/new`
+(`_meta["x.ai/hooks"]`, reverse request `_x.ai/hooks/run`). `read_file` and
+`image_edit` are denied for any path outside that refs dir or grok's own image
+output dir. Any other tool is denied outright.
+
+Grok fails OPEN if the hook reply is late or malformed, so the profile is the
+first line and the hook is the second.
+
+Grok also reads Claude Code's `~/.claude` skills and hooks by default; the
+profile keeps them from mattering.
+
+`XAI_API_KEY` is stripped from grok's environment so turns bill the
+subscription, not the metered API.
+
+Sessions and generated images persist under `~/.grok/sessions/` and are left
+for the user to clean up. Attachment copies are removed when the chat ends.
 ## Quick start
 
 Prerequisites: Python 3.11+ plus the CLI login for the backend you use:
@@ -274,7 +286,7 @@ also meters spend live:
   accumulates old references in one context and never disturbs the chat
   session; they still serialize with chat turns through the one turn lock.
 - `POST /v1/cancel` — cancels the in-flight turn (copilot `session.abort()`,
-  codex `turn/interrupt`, claude kills the process).
+  codex `turn/interrupt`, grok `session/cancel`, claude kills the process).
 
 ### Image generation (codex)
 
@@ -290,18 +302,16 @@ image with a short prompt, ~45 s with a long prompt plus a 0.7 MB reference
 batch of 30 is ~20 min of wall clock. ~0.7–1.4 MB PNG; a copy is also left in
 `~/.codex/generated_images/<thread>/` by codex itself.
 
-The time scales hard with input. A real comic pipeline on 2026-10-04
-(prompt 1,000–4,800 chars, 4–5 reference images, `size` 1024x1536,
-`gpt-6-sol` @ medium) took **2.5–3.5 min per image**: three edits/generations
-measured 3 min 23 s, 2 min 40 s and 3 min 32 s from the client, of which
-152–195 s was the single `imageGeneration` item itself. One tool call per
-turn, near-empty reasoning, agentry's own overhead ~5 s; dropping from 5 to 4
-references gained nothing measurable. The same prompt and references against
-OpenAI's Images API with `gpt-image-2.5-flare` took ~25 s. On the plus side,
-`/v1/images/edits` is a real edit: in both tests the strip came back
-pixel-close with only the requested change (two deer added to one panel, a
-pile of fur removed from another).
-
+The time scales hard with input. A real comic pipeline on 2026-10-04 (prompt
+1,000-4,800 chars, 4-5 reference images, `size` 1024x1536, `gpt-6-sol` @
+medium) took 2.5-3.5 min per image. Three edits/generations measured 3 min 23
+s, 2 min 40 s and 3 min 32 s from the client. 152-195 s of that was the single
+`imageGeneration` item. One tool call per turn, near-empty reasoning, agentry
+overhead ~5 s. Dropping from 5 to 4 references gained nothing measurable. Same
+prompt and references against OpenAI's Images API with `gpt-image-2.5-flare`
+took ~25 s. `/v1/images/edits` is a real edit, though. In both tests the strip
+came back pixel-close with only the requested change (two deer added to one
+panel, a pile of fur removed from another).
 The chat model does not change the picture — every model on the account
 (`luna`, `terra`, `sol`, `gpt-6-astra`, `gpt-5.5`) gets the same
 `gpt-image-2` tool, honored the aspect, and took 40–58 s
@@ -326,35 +336,37 @@ For batch generation OpenAI points at `OPENAI_API_KEY` billing instead.
 ### Image generation (grok)
 
 Grok Build ships `image_gen` (plus `image_edit`, `image_to_video`,
-`reference_to_video`) as built-in tools. The agent profile keeps only
-`image_gen`, under the same "only when explicitly asked" clause, so a chat
-request for a picture on the `grok` backend renders inline too: the tool
+`reference_to_video`) as built-in tools. The agent profile keeps `image_gen`
+and `image_edit`, under the same "only when explicitly asked" clause. So a
+chat request for a picture on the `grok` backend renders inline too: the tool
 writes a JPEG (1024×1024 for a square prompt, ~75 KB) under
-`~/.grok/sessions/<cwd>/<session>/images/` and reports the path; agentry
-reads it back into `delta.images` / `message.images` with the model's
-rewritten prompt as `revised_prompt`. Measured 2026-10-04 on 1.0.46: ~6 s
-from tool start to file, ~12–14 s for the whole turn with a short prompt.
-Grok's per-turn cost estimate does not include the image.
+`~/.grok/sessions/<cwd>/<session>/images/` and reports the path. Agentry reads
+it back into `delta.images` / `message.images` with the model's rewritten
+prompt as `revised_prompt`. Measured 2026-10-04 on 1.0.46: ~6 s from tool
+start to file, ~12-14 s for the whole turn with a short prompt. Grok's
+per-turn cost estimate does not include the image.
 
-`/v1/images/generations` and `/v1/images/edits` work on `grok` too. Each
-call runs on a throwaway ACP session; references for edits are written to
-the scratch cwd and handed to grok's `image_edit` tool as file paths (the
-ACP prompt itself takes no image content), then deleted. Differences from
-codex, all measured 2026-10-04 with a four-panel strip prompt of ~1.5k
-chars: output is **JPEG** (the response's top-level `output_format` says
-so), 832×1248 for a 2:3 request, 20–30 s per call including the model's
-rewrite, and **at most 3 reference images** — xAI's API rejects more
-("This model supports at most 3 input image(s)"), so agentry returns 400
-above that, as it does above 5 on codex. Style note from the first real
-strips: `image_gen` from canon text alone followed a "modern 3D cartoon"
-instruction well; `image_edit` with character cards kept the identities
-but drifted toward photorealistic rendering and was more erratic (a head
-on the wrong body, a character swapped for a deer), with or without
-reinforced style wording. The comic pipeline that drives agentry's edits
-route tried it the same day with combined character cards: style and
+`/v1/images/generations` and `/v1/images/edits` work on `grok` too. Each call
+runs on a throwaway ACP session. References for edits are written to the
+scratch cwd and handed to grok's `image_edit` tool as file paths (the ACP
+prompt itself takes no image content), then deleted. Differences from codex,
+all measured 2026-10-04 with a four-panel strip prompt of ~1.5k chars: output
+is **JPEG** (the response's top-level `output_format` says so), 832×1248 for a
+2:3 request, 20-30 s per call including the model's rewrite, and **at most 3
+reference images** - xAI's API rejects more ("This model supports at most 3
+input image(s)"), so agentry returns 400 above that, as it does above 5 on
+codex.
+
+Style note from the first real strips: `image_gen` from canon text alone
+followed a "modern 3D cartoon" instruction well. `image_edit` with character
+cards kept the identities but drifted toward photorealistic rendering and was
+more erratic (a head on the wrong body, a character swapped for a deer), with
+or without reinforced style wording. The comic pipeline that drives agentry's
+edits route tried it the same day with combined character cards: style and
 lettering right, identities recognisable, but roles and figures swapped
-between panels, a dog changed breed, and a character was doubled. Its
-verdict was "not a candidate for strips today", at ~1.2 cents a call.
+between panels, a dog changed breed, and a character was doubled. Verdict was
+"not a candidate for strips today", at ~1.2 cents a call.
+
 Judge for your own material.
 
 ## Architecture
@@ -449,9 +461,9 @@ are from the same day and will drift.
 | [`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) | Copilot | reverse-engineered HTTP; the original | dormant since 2025-11, 130+ open issues; ~4k★ — use the caozhiyuan fork |
 
 Where agentry sits: every project above wraps **one** vendor; agentry puts
-Copilot, codex and Claude Code behind the same endpoint, and drives each
-through its supported surface (Copilot SDK, `codex app-server`, `claude -p`)
-rather than reverse-engineered HTTP. It is also the only one that
+Copilot, codex, Claude Code and Grok Build behind the same endpoint, and
+drives each through its supported surface (Copilot SDK, `codex app-server`,
+`claude -p`, `grok agent stdio`) rather than reverse-engineered HTTP. It is also the only one that
 **strips the tools** — the others expose tool execution as a feature, agentry
 serves the bare model (see *reverse MCP* above) — and the only one with a
 live credit/quota line in the console, which matters once a batch can drain
