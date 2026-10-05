@@ -87,8 +87,10 @@ agent` accepts none of the headless `--tools` / `--deny` flags, an empty
 non-empty allowlist is the only thing that works. Validated on 1.0.46, [plan
 and probes](archive/GROK-PLAN.md).
 
-Three tools stay in: `image_gen` and `image_edit` (same carve-out as codex),
-and `read_file` - which is how grok sees attachments.
+Four tools stay in: `image_gen` and `image_edit` (same carve-out as codex),
+`read_file`, which is how grok sees attachments, and `image_to_video` for
+`/v1/videos`. The profile is set per process, and there is one grok process,
+so chat sessions get the video tool too.
 
 The ACP prompt takes no image content. So an `image_url` attachment is written
 under the scratch cwd's `refs/<session>/` and the message names the path.
@@ -99,10 +101,13 @@ works. A follow-up "now make the collar blue" hands the same path to
 Every tool call passes a client hook agentry registers on `session/new`
 (`_meta["x.ai/hooks"]`, reverse request `_x.ai/hooks/run`). `read_file` and
 `image_edit` are denied for any path outside that refs dir or grok's own image
-output dir. Any other tool is denied outright.
+output dir. `image_to_video` is denied except on the session a `/v1/videos`
+call runs. `image_gen` passes. Any other tool is denied outright.
 
-Grok fails OPEN if the hook reply is late or malformed, so the profile is the
-first line and the hook is the second.
+Grok fails OPEN if the hook reply is late or malformed. For `read_file` and
+`image_edit` the profile is the first line and the hook the second. For video
+in chat the hook is the only line, apart from the profile prompt asking the
+model not to.
 
 Grok also reads Claude Code's `~/.claude` skills and hooks by default; the
 profile keeps them from mattering.
@@ -112,6 +117,7 @@ subscription, not the metered API.
 
 Sessions and generated images persist under `~/.grok/sessions/` and are left
 for the user to clean up. Attachment copies are removed when the chat ends.
+
 ## Quick start
 
 Prerequisites: Python 3.11+ plus the CLI login for the backend you use:
@@ -185,9 +191,9 @@ both spellings):
     (copilot `models.list`, codex `model/list`, grok's `initialize`
     model state); an unknown id exits with
     code 2 and prints what *is* available, instead of coming up "ready" and
-    failing every turn. Codex's ids are OpenAI's (`gpt-5.6-sol` /
-    `-terra` / `-luna`, `gpt-5.5` as of 2026-09) — there is no Claude on
-    codex.
+    failing every turn. Codex's ids are OpenAI's (`gpt-6-sol` /
+    `-astra` / `-luna`, `gpt-5.6-sol` / `-terra` / `-luna`, `gpt-5.5` as of
+    2026-10; `model/list` is the authority). There is no Claude on codex.
 - **ReasoningEffort** —
   `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`. What applies
   is per model: copilot's gpt-5.6 models advertise `none`→`max`, codex takes
@@ -247,18 +253,21 @@ also meters spend live:
   [`claude-code-quota`](https://github.com/aweussom/claude-code-quota) is
   installed (agentry reads its cache passively); otherwise the coarse
   `rate_limit_event` claude streams per turn (status + reset, no %).
+- **grok** — per-turn tokens and the dollar estimate grok itself reports,
+  plus a this-run total at idle. Model tokens only: images and video are not
+  in it, and the CLI has no subscription quota readout.
 
 ## API
 
 - `GET /health` — readiness probe.
 - `GET /v1/models` — the account's real model list (copilot `models.list`,
-  codex `model/list`) with an `active` flag and credit `price_category`;
+  codex `model/list`, grok's `initialize` model state) with an `active` flag and credit `price_category`;
   single synthetic entry when the backend can't enumerate.
 - `POST /v1/chat/completions` — SSE streaming in standard OpenAI delta
   format; images ride as `image_url` data: URIs; copilot's streamed reasoning
   summaries are forwarded as `delta.reasoning_content` (the
   DeepSeek-popularized extension; standard clients ignore it). Images the
-  backend *generates* (codex, see below) arrive as `delta.images` /
+  backend *generates* (codex or grok, see below) arrive as `delta.images` /
   `message.images` — OpenRouter's convention, a list of `image_url` data:
   URIs — never inline in `content`, so a client parsing JSON out of the
   reply is unaffected.
@@ -275,27 +284,29 @@ also meters spend live:
   backends answer 501.
 - `POST /v1/images/edits` — the same, anchored on reference images: OpenAI's
   multipart form (`image` / `image[]` file parts + `prompt`), or JSON with
-  `image` as a data: URI (or a list of up to 5). The references ride the
-  codex turn as attached images and its tool edits against them. Without
+  `image` as a data: URI (or a list). The ceiling is the tool's own: 5
+  references on codex, 3 on grok, 400 above that. On codex the references
+  ride the turn as attached images; on grok they are written to the scratch
+  cwd and passed to `image_edit` by path. Without
   `size`, the output takes the reference's proportions but the *prompt*
   decides orientation (a downstream 16:9 reference came back 941×1672 for
   "a standing figure filling the frame"); pass `size` to pin it. `mask` is
   rejected (400):
-  codex's tool takes whole-image references only. Both Images routes run
-  each call on a throwaway codex thread, so a batch of edits never
+  neither tool takes one. Both Images routes run each call on a throwaway
+  codex thread or grok ACP session, so a batch of edits never
   accumulates old references in one context and never disturbs the chat
   session; they still serialize with chat turns through the one turn lock.
 - `POST /v1/videos` — the OpenAI Videos API shape over grok's
   `image_to_video` (grok only, 501 elsewhere). `prompt` plus a mandatory
   `input_reference` (multipart file part, or JSON `{"image_url": "data:..."}`);
   grok has no text-only video. `seconds` (grok's floor is 6) and `size` are
-  advisory like the Images routes. Generation is synchronous, ~45 s for a 6 s
-  clip, so the returned video object is already `completed` (or `failed`
+  advisory like the Images routes. Generation is synchronous, ~45 s end to
+  end for a 6 s clip, so the returned video object is already `completed` (or `failed`
   with `error`), with the delivered `size` and `seconds` read from the MP4.
   `GET /v1/videos/{id}` returns the object, `GET /v1/videos/{id}/content`
   the MP4 (`variant=video` only), `GET /v1/videos` lists, `DELETE` forgets
   the id and leaves the file. Ids live in memory; the clips stay under
-  `~/.grok/sessions/<cwd>/<session>/videos/`. Chat completions never carry
+  `~/.grok/sessions/<cwd>/<session>/videos/`. Chat completions carry no
   video: the backend's hook denies the video tools outside a `/v1/videos`
   turn.
 - `POST /v1/cancel` — cancels the in-flight turn (copilot `session.abort()`,
@@ -309,15 +320,18 @@ thread (no approvals, read-only sandbox, empty cwd — probed on 0.154.0,
 `_bench/codex_imagegen_probe.py`). agentry's chat-only developer
 instructions carve it out as the one permitted tool, *only when the user
 explicitly asks for an image*, so enrichment prompts stay image-free. Ask
-for a picture in the web UI and it renders under the reply; ~15–20 s per
-image with a short prompt, ~45 s with a long prompt plus a 0.7 MB reference
-(downstream measurement), calls serialize through the one turn lock, so a
+for a picture in the web UI and it renders under the reply.
+
+It is slow on real work. A short prompt takes ~15-20 s, but a comic pipeline
+with long prompts and 4-5 references took 2.5-3.5 min per image, against ~25 s
+for the same job on OpenAI's Images API. For a batch the trade is wall clock
+against plan quota, not just money. A long prompt plus one 0.7 MB reference
+was ~45 s (downstream measurement). Calls serialize through the one turn lock, so a
 batch of 30 is ~20 min of wall clock. ~0.7–1.4 MB PNG; a copy is also left in
 `~/.codex/generated_images/<thread>/` by codex itself.
 
-The time scales hard with input. A real comic pipeline on 2026-10-04 (prompt
-1,000-4,800 chars, 4-5 reference images, `size` 1024x1536, `gpt-6-sol` @
-medium) took 2.5-3.5 min per image. Three edits/generations measured 3 min 23
+The pipeline run, 2026-10-04: prompts of 1,000-4,800 chars, 4-5 reference
+images, `size` 1024x1536, `gpt-6-sol` @ medium. Three edits/generations measured 3 min 23
 s, 2 min 40 s and 3 min 32 s from the client. 152-195 s of that was the single
 `imageGeneration` item. One tool call per turn, near-empty reasoning, agentry
 overhead ~5 s. Dropping from 5 to 4 references gained nothing measurable. Same
@@ -325,8 +339,9 @@ prompt and references against OpenAI's Images API with `gpt-image-2.5-flare`
 took ~25 s. `/v1/images/edits` is a real edit, though. In both tests the strip
 came back pixel-close with only the requested change (two deer added to one
 panel, a pile of fur removed from another).
-The chat model does not change the picture — every model on the account
-(`luna`, `terra`, `sol`, `gpt-6-astra`, `gpt-5.5`) gets the same
+
+The chat model does not change the picture. Every model on the account in
+the 2026-09-12 probe (`luna`, `terra`, `sol`, `gpt-6-astra`, `gpt-5.5`) gets the same
 `gpt-image-2` tool, honored the aspect, and took 40–58 s
 (`_bench/codex_image_model_probe.py`). What differs is the **rewrite**: the
 chat model rephrases your prompt before handing it to the image model.
@@ -350,7 +365,7 @@ For batch generation OpenAI points at `OPENAI_API_KEY` billing instead.
 
 Grok Build ships `image_gen` (plus `image_edit`, `image_to_video`,
 `reference_to_video`) as built-in tools. The agent profile keeps `image_gen`
-and `image_edit`, under the same "only when explicitly asked" clause. So a
+and `image_edit` (and `image_to_video`, for `/v1/videos` only), under the same "only when explicitly asked" clause. So a
 chat request for a picture on the `grok` backend renders inline too: the tool
 writes a JPEG (1024×1024 for a square prompt, ~75 KB) under
 `~/.grok/sessions/<cwd>/<session>/images/` and reports the path. Agentry reads
@@ -388,7 +403,9 @@ both need an input image (`reference_to_video` without one fails with
 `first_frame`, `last_frame`, and/or `keyframes` (up to 4)"). They also need
 the account's `/privacy` (zero data retention) setting off, or a
 user-hosted S3 bucket in `managed_config.toml`; under ZDR the tools return
-an error. Measured 2026-10-05 on 1.0.46 with a character card as reference:
+an error. `/privacy` is not scoped to video: with it off, zero data retention
+is off for all grok traffic on the account, chat and attachments included.
+Measured 2026-10-05 on 1.0.46 with a character card as reference:
 6 s clip (the tool's floor), 448x672 at the model's default 480p in 29 s,
 768x1168 at 720p in 39 s, MP4 H.264 + AAC, 1.1 to 3.2 MB. The cost estimate
 grok reports does not include the clip. Exposed as `/v1/videos` (see
@@ -423,7 +440,7 @@ context hints into prompts.
 | `logutil.py` | Timestamped logging + idle heartbeat/ticker |
 | `templates/`, `static/` | Web UI |
 | `.github/copilot-instructions.md` | Per-project chat-only instructions (copilot) |
-| `grok-agent-profile.md` | Agent profile that strips grok's tools down to `image_gen` and sets its chat-only prompt |
+| `grok-agent-profile.md` | Agent profile that strips grok's tools down to `read_file`, `image_gen`, `image_edit` and `image_to_video`, and sets its chat-only prompt |
 | `test_*.py` | Offline regression tests: HTTP selection race, CLI model pin, Claude lifecycle, Grok ACP lifecycle, Videos API |
 | `start.ps1` / `start.sh` | Launchers (create venv, run agentry) |
 | `TODO.md` / `TODONT.md` | Roadmap / paths intentionally not taken |
@@ -436,9 +453,15 @@ context hints into prompts.
   codex's and grok's built-in image generation, and only when a message
   explicitly asks for an image (see *Image generation*); on grok also
   `read_file`, gated to the attachment folder, because that is its only way
-  to see an image. Everything else — shell, other file reads, MCP — is
+  to see an image, and `image_to_video` inside `/v1/videos` calls. Everything else — shell, other file reads, MCP — is
   refused, so a prompt that genuinely needs a tool degrades or errors rather
   than working around it.
+- **The grok hook fails open.** A late or malformed hook reply lets the
+  tool call through. For `read_file` that means any file the user can read
+  can end up in the model context at xAI; for `image_to_video` it means a
+  clip from chat. The trigger would be a prompt injection in an attachment
+  plus a slow reply. The handler is pure and fast to keep that window small,
+  not closed.
 - **Reasoning trace depends on backend.** Copilot's and codex's streamed
   summaries reach the console ticker and the web UI think-block, grok's
   thought chunks reach the web UI; claude forwards none.
@@ -485,9 +508,9 @@ are from the same day and will drift.
 | [`anshulpatel25/copilot-sdk-gateway`](https://github.com/anshulpatel25/copilot-sdk-gateway) | Copilot | Python Copilot SDK, one client per request | archived 2026-05 (author cites the move to usage-based billing) |
 | [`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) | Copilot | reverse-engineered HTTP; the original | dormant since 2025-11, 130+ open issues; ~4k★ — use the caozhiyuan fork |
 
-Where agentry sits: every project above wraps **one** vendor; agentry puts
-Copilot, codex, Claude Code and Grok Build behind the same endpoint, and
-drives each through its supported surface (Copilot SDK, `codex app-server`,
+Where agentry sits: caozhiyuan covers several vendors over reverse-engineered
+HTTP; the rest wrap one. Agentry puts Copilot, codex, Claude Code and Grok
+Build behind the same endpoint, and drives each through its official surface (Copilot SDK, `codex app-server`,
 `claude -p`, `grok agent stdio`) rather than reverse-engineered HTTP. It is also the only one that
 **strips the tools** — the others expose tool execution as a feature, agentry
 serves the bare model (see *reverse MCP* above) — and the only one with a
