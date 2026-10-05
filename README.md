@@ -401,10 +401,13 @@ Video, too. Grok Build ships `image_to_video` and `reference_to_video`, and
 both need an input image (`reference_to_video` without one fails with
 "Provide at least one input: `images` (up to 14), `voices` (up to 3),
 `first_frame`, `last_frame`, and/or `keyframes` (up to 4)"). They also need
-the account's `/privacy` (zero data retention) setting off, or a
-user-hosted S3 bucket in `managed_config.toml`; under ZDR the tools return
-an error. `/privacy` is not scoped to video: with it off, zero data retention
-is off for all grok traffic on the account, chat and attachments included.
+coding-data sharing on, or a user-hosted S3 bucket in `managed_config.toml`.
+With `/privacy` ("Coding data, retention, and training") at Opt out, the
+tools fail as "unavailable under zero data retention". Opt in is not scoped
+to video. It is an account setting (`coding_data_retention_opt_out` in the
+login), and it lets xAI retain and train on prompts, traces and metrics from
+all grok use on the account, agentry chat and attachments included. Team
+ZDR is a separate admin switch that locks this setting.
 Measured 2026-10-05 on 1.0.46 with a character card as reference:
 6 s clip (the tool's floor), 448x672 at the model's default 480p in 29 s,
 768x1168 at 720p in 39 s, MP4 H.264 + AAC, 1.1 to 3.2 MB. The cost estimate
