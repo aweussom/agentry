@@ -10,6 +10,24 @@ an OpenAI-compatible HTTP API on localhost. Your scripts and pipelines talk to
 logged into: no separate API bill, no per-call spawn tax (~8 s in `-p` mode
 drops to the model's own ~1.5 s floor).
 
+Three lines to see it work (Python 3.11+, `copilot login` done once):
+
+```powershell
+git clone https://github.com/aweussom/agentry && cd agentry
+.\start.ps1        # ./start.sh on Linux and WSL2; makes venv/, listens on :8765
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8765/v1", api_key="unused")
+r = client.chat.completions.create(model="gpt-5.6-luna", messages=[{"role": "user", "content": "hi"}])
+print(r.choices[0].message.content)
+```
+
+Quota resets every month whether you spent it or not. Other backends and
+flags are under *Quick start*; the terms-of-service note is under *Known
+limits*.
+
 [![A manic developer in a Norwegian sweater smashing an acoustic guitar into a laptop, keyboard keys flying out of the soundhole. The whiteboard reads "DAGENS PLAN: 1. Fikse litt på søk ✓ 2. Legge til AI ✓ 3. En liten proxy ✓ 4. ??? 5. Profit (kanskje)"](./images/dev-to-article-header.png)](https://dev.to/tommy_leonhardsen_81d1f4e/i-built-an-openai-compatible-proxy-for-github-copilot-because-search-was-too-stupid-to-understand-31de)
 
 Prefer the unhinged origin story to sysadmin-grade docs? [The dev.to version
@@ -26,15 +44,6 @@ rather than an API — inline in chat, and as OpenAI-shaped
 works end-to-end. The launcher prints the URL (`http://localhost:8765`).
 
 ![Bundled chat UI talking to the proxy as a regular OpenAI endpoint: markdown answer with a copy button on the code block, a collapsible thinking block above it, a per-turn backend + latency tag, image attach, and a header showing the active model and reasoning effort](./images/web-ui.png)
-
-> **Intended use:** a personal, localhost-only adapter. Each backend stays
-> authenticated through its own official client and remains subject to that
-> provider's terms — agentry adds no access path, credentials, or multi-user
-> service on top. The `copilot` backend rides the official Copilot SDK, a
-> supported product surface; `codex`, `claude` and `grok` wrap interactive
-> CLIs programmatically and sit in the usual gray ToS zone — use a
-> non-critical account there, keep volume modest, and never expose the port
-> publicly.
 
 ## The idea: reverse MCP
 
@@ -452,6 +461,14 @@ context hints into prompts.
 
 ## Known limits
 
+- **Terms of service.** Personal, localhost-only adapter. Each
+  backend stays authenticated through its own official client and remains
+  subject to that provider's terms; agentry adds no access path, credentials
+  or multi-user service on top. The `copilot` backend rides the official
+  Copilot SDK, a supported product surface. `codex`, `claude` and `grok`
+  wrap interactive CLIs programmatically and sit in the usual gray ToS zone:
+  use a non-critical account there, keep volume modest, never expose the
+  port publicly.
 - **Tool requests are always denied** — by design, with one carve-out:
   codex's and grok's built-in image generation, and only when a message
   explicitly asks for an image (see *Image generation*); on grok also
