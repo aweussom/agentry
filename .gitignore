@@ -19,3 +19,6 @@ _bench/codex_schema/
 # Copilot runtime bundle relocated out of %LOCALAPPDATA% for Microsoft Store
 # Pythons (see CopilotSDKBackend in backends.py)
 .copilot-runtime/
+
+# Release zips built with git archive
+dist/
