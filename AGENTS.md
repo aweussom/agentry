@@ -53,6 +53,14 @@ CLI login and may consume subscription quota. Run relevant `_bench/` probes
 only for the behavior being changed. Use a separate port for test instances
 when an existing instance is running. Manually check UI changes in the browser.
 
+`smoke_live.py` is the live drift check: a real agentry per backend on a
+free localhost port, short turns, cancel, chat isolation and a canary file
+read that must be refused (informational on codex). It uses subscription
+quota and needs every CLI logged in. A daily Task Scheduler entry
+(`agentry-smoke`) runs it with `--update --if-changed`; results are in
+`logs/smoke/`. Run it after changing a backend's transport, and treat a
+pass there, not the pinned versions above, as the current validation.
+
 There is no frontend build step, configured linter, or CI workflow. With Node
 and Bash installed, `node --check static/js/app.js` and `bash -n start.sh`
 check syntax only. Use the PowerShell parser for `start.ps1` syntax checks;

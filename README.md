@@ -443,6 +443,58 @@ backend (treat prompts as standalone chat, no repo reads, no tool requests,
 be terse), overriding any global `~/.copilot/` instructions that would leak
 context hints into prompts.
 
+## Testing
+
+Two layers. The offline tests (`test_*.py`) drive agentry against fake
+backend processes: lifecycle, cancellation, model selection, the Videos API.
+They need no login and cost nothing, and they cannot see a CLI update that
+changes a protocol.
+
+`smoke_live.py` covers that. It starts a real agentry per backend on a free
+localhost port and runs a few short turns against whatever CLI versions are
+installed today:
+
+- boot, model list, and 404 on an unknown model id
+- a plain turn and a streamed turn, each echoing a random nonce
+- a follow-up in the same chat recalls the nonce (not on claude, which keeps
+  no conversation state); a new chat does not
+- `/v1/cancel` ends a long stream, and the next turn works
+- a request to read a canary file outside the allowed area does not leak
+  its contents. This fails the run on copilot, claude and grok. On codex it
+  is informational, since the read-only sandbox can read files.
+
+Before that it checks each login (`claude auth status`, `codex login
+status`, the age of grok's `auth.json`; copilot fails at boot instead) and
+reports a lapsed one as LOGIN, with the command that fixes it.
+
+```powershell
+.\venv\Scripts\python.exe smoke_live.py                         # all backends, live
+.\venv\Scripts\python.exe smoke_live.py --update --if-changed   # update CLIs, test what moved
+```
+
+`--update` runs each CLI's own `update` first. `--if-changed` skips a
+backend whose versions match the last pass, unless that pass is more than
+7 days old, so a server-side change is still caught within a week. Results
+go to `logs/smoke/history.jsonl`, the last passing versions to
+`logs/smoke/state.json`. A failure exits 1 and raises a Windows toast.
+
+I run it daily from Task Scheduler as my own user, interactive logon only,
+because the Copilot token lives in that logon's credential store:
+
+```powershell
+$root = 'C:\path\to\agentry'
+$a = New-ScheduledTaskAction -Execute "$root\venv\Scripts\pythonw.exe" `
+       -Argument 'smoke_live.py --update --if-changed' -WorkingDirectory $root
+$t = New-ScheduledTaskTrigger -Daily -At 06:00
+$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+       -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+Register-ScheduledTask -TaskName agentry-smoke -Action $a -Trigger $t -Settings $s
+```
+
+A full pass costs a handful of short prompts per backend. On 2026-10-09 all
+four passed on copilot SDK 1.0.8 with CLI 1.0.94, codex-cli 0.162.0, Claude
+Code 2.1.295 and grok 1.0.50.
+
 ## File map
 
 | Path | Purpose |
@@ -454,6 +506,7 @@ context hints into prompts.
 | `.github/copilot-instructions.md` | Per-project chat-only instructions (copilot) |
 | `grok-agent-profile.md` | Agent profile that strips grok's tools down to `read_file`, `image_gen`, `image_edit` and `image_to_video`, and sets its chat-only prompt |
 | `test_*.py` | Offline regression tests: HTTP selection race, CLI model pin, Claude lifecycle, Grok ACP lifecycle, Videos API |
+| `smoke_live.py` | Live drift check against the installed CLIs (see *Testing*) |
 | `start.ps1` / `start.sh` | Launchers (create venv, run agentry) |
 | `TODO.md` / `TODONT.md` | Roadmap / paths intentionally not taken |
 | `archive/` | Backend design + validation records |
