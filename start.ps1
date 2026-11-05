@@ -56,7 +56,7 @@ function Find-Python {
     }
     $sys = python --version 2>$null
     if ($sys -match 'Python 3\.(\d+)' -and [int]$Matches[1] -ge $minMinor) { return @("python") }
-    return $null
+    # Return nothing (not $null) so the caller's @(...) wrap yields an empty array.
 }
 
 $venvPy = ".\venv\Scripts\python.exe"
@@ -68,14 +68,16 @@ if (Test-Path $venvPy) {
 }
 
 if (-not $venvOk) {
-    $py = Find-Python
-    if (-not $py) {
+    # @() matters: PowerShell unrolls a one-element return (@("python")) to a
+    # bare string, and "python"[0] is 'p'.
+    $py = @(Find-Python)
+    if ($py.Count -eq 0) {
         Write-Warning "Python 3.$minMinor+ not found (required by github-copilot-sdk). Install it, e.g.: winget install Python.Python.3.13"
         exit 1
     }
     if (Test-Path .\venv) { Remove-Item -Recurse -Force .\venv }
     Write-Host "Creating venv..."
-    & $py[0] @($py[1..($py.Count-1)] + @('-m', 'venv', 'venv'))
+    & $py[0] @(@($py | Select-Object -Skip 1) + @('-m', 'venv', 'venv'))
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPy)) {
         Write-Warning "venv creation failed."
         exit 1
