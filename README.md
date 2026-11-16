@@ -5,7 +5,7 @@
 
 Agentry wraps a coding-agent CLI — GitHub Copilot, OpenAI Codex, Claude
 Code, or Grok Build — holds it as one persistent process, and serves the model behind it as
-an OpenAI-compatible HTTP API on localhost. Your scripts and pipelines talk to
+an OpenAI-compatible HTTP API on your own machine and LAN. Your scripts and pipelines talk to
 `gpt-5.6-luna` or `claude-sonnet` through the subscription you're already
 logged into: no separate API bill, no per-call spawn tax (~8 s in `-p` mode
 drops to the model's own ~1.5 s floor).
@@ -72,8 +72,9 @@ class in `backends.py`.
 | `codex` | `codex app-server` (persistent JSON-RPC stdio) | ChatGPT Go $8 / Plus $20; Codex credits per token, `luna` 25× cheaper than `sol` | codex's own configured model @ `low` |
 | `claude` | persistent `claude -p` stream-JSON, conversation cleared per request | Claude subscription (premium) | `claude-sonnet-4-6` |
 | `grok` | `grok agent stdio` ([Grok Build](https://github.com/xai-org/grok-build), Agent Client Protocol over stdio) | SuperGrok / X Premium+ subscription via `grok login`; no quota readout in the CLI | `grok-4.7` @ `high` |
+| `agy` | `agy acp` ([Antigravity CLI](https://antigravity.google/docs/cli/acp/), Agent Client Protocol over stdio) | Gemini API key, per token (default); personal Google AI Pro/Ultra login only on opt-in, see below | agy's own pick @ `low` |
 
-All four backends reuse a runtime process. Claude clears its conversation
+All five backends reuse a runtime process. Claude clears its conversation
 before every subsequent request, preserving independent tasks without paying
 startup each time. Both the reset acknowledgement and its completion must
 arrive; otherwise agentry falls back to fresh workers for the rest of that
@@ -127,6 +128,55 @@ subscription, not the metered API.
 Sessions and generated images persist under `~/.grok/sessions/` and are left
 for the user to clean up. Attachment copies are removed when the chat ends.
 
+agy has the same shape as grok: one `agy acp` process, one ACP session per
+chat, model and thought level set before each turn (`session/set_model` with
+agy's combined ids such as `gemini-3.8-flash-high`). Probed on 1.5.9.
+
+Auth is chosen with `--agy-auth`, never inherited:
+
+- `api-key` (default) uses `GEMINI_API_KEY` from the environment, or from
+  `keys.ini` (`[gemini]`, git-ignored) next to `agentry.py`. Billed per token
+  on the Gemini API. This is the path Google points third-party tools at.
+- `oauth` uses your personal Google login and its AI Pro/Ultra quota. Google's
+  [Antigravity terms](https://antigravity.google/terms) §6 call third-party
+  access a breach, and accounts have been suspended for it, including
+  accounts that ran nothing but the official `agy` binary. agentry prints a
+  warning at start. Log in once with
+  `agy acp --gemini-dir .gemini-agentry-oauth --login`.
+
+The model list depends on the auth. On 2026-11-16 the API key offered seven
+Gemini bases. The AI Pro login offered `claude-opus-5-5`,
+`claude-sonnet-5-5`, `gemini-3.8-flash`, `gemini-4-argon` (agy's default),
+`gemini-4-hydrogen`, `gemini-pro-orchestrator-g1-pro` and `gpt-oss-120b`.
+Chat on argon and sonnet and one image generation worked on that login. The
+Claude models take low, medium and high. agentry gets no quota readout over
+ACP on either auth, only the per-turn token counts.
+
+Each mode runs in its own gemini dir under the home directory
+(`.gemini-agentry-api-key`, `.gemini-agentry-oauth`). agy falls back to a
+saved login when the requested auth has no credential, so the api-key dir
+must never hold one. It also keeps agentry's lockdown hook out of the
+`~/.gemini` your interactive agy uses.
+
+The lockdown is a `PreToolUse` hook (`agy_hook.py`) agentry writes into that
+dir's `config/hooks.json` at every start. It denies every tool except the
+image path: the `image-generator` subagent, `generate_image`, its
+`send_message` back, and `read_file` inside agy's `brain/` dir. Without the
+hook agy read a canary file in its cwd without asking, and no ACP permission
+request ever reached the client. agy fails closed on this hook: a missing
+command, a timeout and non-JSON output all blocked the call.
+
+Attachments ride the ACP prompt as image blocks, and copies are written under
+`brain/<session>/refs/` so the image subagent has paths it may use. Images
+come from an asynchronous subagent: the turn ends before the file exists, and
+ACP never reports it. agentry waits for a new image file in
+`brain/<session>/` (up to 240 s; 10-45 s observed). Generated images and
+sessions stay under the gemini dir.
+
+`search_web` is denied with the rest. It is Google Search grounding, and in
+three checks it was right on a star count, altered a quoted clause, and
+reported a stale version as current.
+
 ## Quick start
 
 Prerequisites: Python 3.11+ plus the CLI login for the backend you use:
@@ -143,6 +193,9 @@ Prerequisites: Python 3.11+ plus the CLI login for the backend you use:
   `curl -fsSL https://x.ai/cli/install.sh | bash`), `grok login` with the
   grok.com account. `~/.grok/bin` is found even before PATH is refreshed.
   Leave `XAI_API_KEY` unset.
+- `agy` — Antigravity CLI (`%LOCALAPPDATA%\agy\bin` is found before PATH is
+  refreshed) and a `GEMINI_API_KEY` in the environment or `keys.ini`. For
+  `--agy-auth oauth`, see *Backends*.
 
 **Windows (PowerShell 7+)** — run from the same logon session as your
 interactive `copilot login`, or the credential-store token is unreachable:
@@ -152,6 +205,7 @@ interactive `copilot login`, or the credential-store token is unreachable:
 .\start.ps1 -Backend codex           # model from codex config
 .\start.ps1 -Backend claude
 .\start.ps1 -Backend grok             # grok-4.7, effort=high
+.\start.ps1 -Backend agy              # Gemini API key; -AgyAuth oauth for the Google login
 .\start.ps1 -Port 9000
 .\start.ps1 -Model gpt-5.6-terra -ReasoningEffort high   # or --model/--reasoning-effort
 ```
@@ -165,7 +219,7 @@ not via the Windows host; npm is only needed for this login step):
 
 ```bash
 npm install -g @github/copilot && copilot login     # one-time
-./start.sh                           # flags: --backend codex|claude|grok, --port 9000
+./start.sh                           # flags: --backend codex|claude|grok|agy, --agy-auth, --port 9000
 ```
 
 Open `http://localhost:8765` and chat. From WSL2 the same URL works in a
@@ -179,7 +233,8 @@ Launcher params (`start.ps1 -Flag` / `start.sh --flag`; `start.ps1` accepts
 both spellings):
 
 - **Port** — HTTP port, default `8765`.
-- **Backend** — `copilot` (default), `codex`, `claude`, or `grok`.
+- **Backend** — `copilot` (default), `codex`, `claude`, `grok`, or `agy`.
+- **AgyAuth** — agy only: `api-key` (default) or `oauth`.
 - **Model** — override the default.
   - `copilot`: set as the SDK session's model, validated against your plan's
     `models.list`. The available set tracks Copilot's plans — check your
@@ -500,12 +555,13 @@ Code 2.1.295 and grok 1.0.50.
 | Path | Purpose |
 |---|---|
 | `agentry.py` | Flask server + OpenAI surface + backend selection |
-| `backends.py` | `Backend` ABC + copilot / codex / claude / grok implementations |
+| `backends.py` | `Backend` ABC + copilot / codex / claude / grok / agy implementations |
+| `agy_hook.py` | agy's PreToolUse lockdown hook (denies every tool but the image path) |
 | `logutil.py` | Timestamped logging + idle heartbeat/ticker |
 | `templates/`, `static/` | Web UI |
 | `.github/copilot-instructions.md` | Per-project chat-only instructions (copilot) |
 | `grok-agent-profile.md` | Agent profile that strips grok's tools down to `read_file`, `image_gen`, `image_edit` and `image_to_video`, and sets its chat-only prompt |
-| `test_*.py` | Offline regression tests: HTTP selection race, CLI model pin, Claude lifecycle, Grok ACP lifecycle, Videos API |
+| `test_*.py` | Offline regression tests: HTTP selection race, CLI model pin, Claude lifecycle, Grok and agy ACP lifecycle, agy hook, Videos API |
 | `smoke_live.py` | Live drift check against the installed CLIs (see *Testing*) |
 | `start.ps1` / `start.sh` | Launchers (create venv, run agentry) |
 | `TODO.md` / `TODONT.md` | Roadmap / paths intentionally not taken |
@@ -514,14 +570,29 @@ Code 2.1.295 and grok 1.0.50.
 
 ## Known limits
 
-- **Terms of service.** Personal, localhost-only adapter. Each
-  backend stays authenticated through its own official client and remains
-  subject to that provider's terms; agentry adds no access path, credentials
-  or multi-user service on top. The `copilot` backend rides the official
-  Copilot SDK, a supported product surface. `codex`, `claude` and `grok`
-  wrap interactive CLIs programmatically and sit in the usual gray ToS zone:
-  use a non-critical account there, keep volume modest, never expose the
-  port publicly.
+- **Terms of service.** Personal adapter for your own machines. Each backend
+  stays authenticated through its own official client and remains subject to
+  that provider's terms. agentry never reads or reuses a token, and adds no
+  credentials or multi-user service on top. `copilot` uses the official
+  Copilot SDK. `codex` uses its app-server protocol. `claude` runs the real
+  `claude` binary in its documented headless `-p` mode with JSON streaming.
+  That mode exists to script Claude Code from your own tools, which is what
+  agentry does. Anthropic forbids putting a subscription login inside other
+  tools; agentry never touches the login. Billing for `-p` usage may be
+  tracked separately from interactive use; I have not tested it. The backend
+  works, and I have tested it, but I do not use it day to day: my Copilot
+  subscription carries the Claude models, and the `copilot` backend
+  integrates better. `grok` runs
+  `grok agent` over ACP. Keep volume modest and check the current terms
+  yourself. `agy` defaults to a Gemini API key; its `oauth` mode is the one
+  backend whose vendor says in writing that this use is a breach. On a work seat, your employer's AI
+  policy decides before the vendor's terms do.
+- **Listens on all interfaces, no API auth.** The default `--host 0.0.0.0`
+  is deliberate, so one always-on laptop can serve the office LAN. On a
+  machine with one network card a narrower bind changes little. Keep it
+  behind your own LAN or VPN; never port-forward it, put it on the public
+  internet, or share it with other people. Their traffic would ride your
+  account.
 - **Tool requests are always denied** — by design, with one carve-out:
   codex's and grok's built-in image generation, and only when a message
   explicitly asks for an image (see *Image generation*); on grok also
@@ -565,26 +636,31 @@ Code 2.1.295 and grok 1.0.50.
 
 The same itch — "I already pay for this agent, let my own code call the
 model" — has been scratched once per vendor, many times over. Ordered by
-maintenance activity as of 2026-09-11 (most recently pushed first); stars
+maintenance activity as of 2026-11-15 (most recently pushed first); stars
 are from the same day and will drift.
 
-| Project | Wraps | How | Status 2026-09-11 |
+| Project | Wraps | How | Status 2026-11-15 |
 |---|---|---|---|
-| [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api) | Copilot, codex, third-party APIs | reverse-engineered HTTP; Chat Completions + Responses + Anthropic Messages; Electron desktop app | very active — releases several times a week; ~1k★ |
-| [`icebear0828/codex-proxy`](https://github.com/icebear0828/codex-proxy) | codex | ChatGPT backend API with the OAuth token; OpenAI/Anthropic/Gemini protocols; non-commercial license | very active; ~1.7k★ |
-| [`messense/copilot-api-proxy`](https://github.com/messense/copilot-api-proxy) | Copilot | Rust reverse proxy, OpenAI + Anthropic endpoints | active; small |
-| [`hotchpotch/openai-api-server-via-codex`](https://github.com/hotchpotch/openai-api-server-via-codex) | codex | Go server on the codex login token; PyPI/binaries | active; ~50★ |
-| [`wende/claude-max-api-proxy`](https://github.com/wende/claude-max-api-proxy) | Claude Code | spawns `claude -p` per request; OpenClaw integration | active; ~130★ |
-| [`theblixguy/copilot-sdk-proxy`](https://github.com/theblixguy/copilot-sdk-proxy) | Copilot | the **official Copilot SDK** (TypeScript); Chat Completions + Anthropic + Responses; npm; the core of [`xcode-copilot-server`](https://github.com/theblixguy/xcode-copilot-server) | dependabot-only since 2026-07; ~10★ |
-| [`rezrov/copilot-proxy`](https://github.com/rezrov/copilot-proxy) | Copilot | the official Copilot SDK (Node); client-owned tool loop; proposed in [copilot-sdk discussion #218](https://github.com/github/copilot-sdk/discussions/218), unanswered by GitHub staff | quiet since 2026-07; ~10★ |
-| [`vkop007/codex-app-proxy`](https://github.com/vkop007/codex-app-proxy) | codex | persistent `codex app-server` — the same surface agentry's `codex` backend uses | abandoned 2026-02 |
+| [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) | Antigravity, Gemini CLI, codex, Claude Code, Grok Build, Kimi, Muse Code, Devin | Go server on the CLIs' OAuth tokens, several accounts per provider; OpenAI/Gemini/Claude/Codex protocols; MIT | very active; ~58.6k★, ~880 open issues. Its own tracker has Antigravity account bans ([#1558](https://github.com/router-for-me/CLIProxyAPI/discussions/1558), [#1637](https://github.com/router-for-me/CLIProxyAPI/issues/1637), [#1803](https://github.com/router-for-me/CLIProxyAPI/issues/1803)) |
+| [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api) | Copilot, codex, third-party APIs | reverse-engineered HTTP; Chat Completions + Responses + Anthropic Messages; Electron desktop app | very active; ~1.1k★ |
+| [`icebear0828/codex-proxy`](https://github.com/icebear0828/codex-proxy) | codex | ChatGPT backend API with the OAuth token; OpenAI/Anthropic/Gemini protocols; non-commercial license | very active; ~1.9k★ |
+| [`rezrov/copilot-proxy`](https://github.com/rezrov/copilot-proxy) | Copilot | the official Copilot SDK (Node); client-owned tool loop; proposed in [copilot-sdk discussion #218](https://github.com/github/copilot-sdk/discussions/218), unanswered by GitHub staff | active again since 2026-11; ~14★ |
+| [`hotchpotch/openai-api-server-via-codex`](https://github.com/hotchpotch/openai-api-server-via-codex) | codex | Go server on the codex login token; PyPI/binaries | active; ~100★ |
+| [`wende/claude-max-api-proxy`](https://github.com/wende/claude-max-api-proxy) | Claude Code | spawns `claude -p` per request; OpenClaw integration | quiet since 2026-08; ~160★ |
+| [`theblixguy/copilot-sdk-proxy`](https://github.com/theblixguy/copilot-sdk-proxy) | Copilot | the **official Copilot SDK** (TypeScript); Chat Completions + Anthropic + Responses; npm; the core of [`xcode-copilot-server`](https://github.com/theblixguy/xcode-copilot-server) | quiet since 2026-07; ~10★ |
+| [`messense/copilot-api-proxy`](https://github.com/messense/copilot-api-proxy) | Copilot | Rust reverse proxy, OpenAI + Anthropic endpoints | archived 2026-09 |
 | [`anshulpatel25/copilot-sdk-gateway`](https://github.com/anshulpatel25/copilot-sdk-gateway) | Copilot | Python Copilot SDK, one client per request | archived 2026-05 (author cites the move to usage-based billing) |
-| [`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) | Copilot | reverse-engineered HTTP; the original | dormant since 2025-11, 130+ open issues; ~4k★ — use the caozhiyuan fork |
+| [`vkop007/codex-app-proxy`](https://github.com/vkop007/codex-app-proxy) | codex | persistent `codex app-server`, the same surface agentry's `codex` backend uses | abandoned 2026-02 |
+| [`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) | Copilot | reverse-engineered HTTP; the original | dormant since 2025-11, ~140 open issues; ~4.2k★. Use the caozhiyuan fork |
 
-Where agentry sits: caozhiyuan covers several vendors over reverse-engineered
-HTTP; the rest wrap one. Agentry puts Copilot, codex, Claude Code and Grok
-Build behind the same endpoint, and drives each through its official surface (Copilot SDK, `codex app-server`,
-`claude -p`, `grok agent stdio`) rather than reverse-engineered HTTP. It is also the only one that
+Antigravity is an agentry backend on a Gemini API key. The personal Google
+login is opt-in only: Google's [Additional Terms](https://antigravity.google/terms)
+§6 call third-party access a breach, and accounts get suspended for it.
+
+Where agentry sits: CLIProxyAPI and caozhiyuan cover several vendors on
+lifted OAuth tokens or reverse-engineered HTTP; the rest wrap one. Agentry puts Copilot, codex, Claude Code, Grok
+Build and Antigravity behind the same endpoint, and drives each through its official surface (Copilot SDK, `codex app-server`,
+`claude -p`, `grok agent stdio`, `agy acp`) rather than reverse-engineered HTTP. It is also the only one that
 **strips the tools** — the others expose tool execution as a feature, agentry
 serves the bare model (see *reverse MCP* above) — and the only one with a
 live credit/quota line in the console, which matters once a batch can drain

@@ -22,6 +22,11 @@ Backends:
                        Protocol). SuperGrok / X Premium+ subscription. One ACP
                        session per chat; tools removed by an agent profile.
                        Validated 2026-10-04; see archive/GROK-PLAN.md.
+  AgyACPBackend        Google Antigravity CLI (`agy acp`, Agent Client
+                       Protocol). Gemini API key by default; the personal
+                       Google AI plan login only on explicit opt-in. Tools
+                       denied by a PreToolUse hook (agy_hook.py).
+                       Probed 2026-11-16 on agy 1.5.9.
 
 The transports are deliberately NOT merged into a shared base: each backend
 owns its plumbing so a change to one carries zero regression risk for the
@@ -2502,7 +2507,673 @@ class GrokACPBackend(Backend):
                 pass
 
 
-def make_backend(kind, *, model=None, reasoning_effort=None, log_dir: Optional[Path] = None) -> Backend:
+# --- Antigravity backend (agy acp, ACP over stdio) ----------------------------
+
+class AgyACPBackend(Backend):
+    """Google Antigravity CLI (`agy acp`) over the Agent Client Protocol.
+
+    Same lifecycle as the Grok backend: one persistent process, one ACP
+    session per chat, model+effort applied as session state inside the turn
+    lock before `session/prompt`. Probed 2026-11-15/16 on agy 1.5.9 with
+    `_bench`-style scratch scripts (see TODONT.md, antigravity entry).
+
+    Auth is explicit, never inherited:
+      api-key  GEMINI_API_KEY (env, else keys.ini [gemini]); per-token Gemini
+               API billing, inside Google's terms.
+      oauth    the personal Google login (Google AI Pro/Ultra quota). Google's
+               Antigravity terms §6 call third-party access a breach and
+               accounts have been suspended for it; the user opts in.
+    Each auth mode gets its OWN gemini dir under the home dir
+    (`.gemini-agentry-<auth>`). agy falls back to a saved login when the
+    requested method has no credential, so the api-key dir must never hold
+    an OAuth login; and agentry's lockdown hook must never land in the
+    ~/.gemini the user's interactive agy reads.
+
+    Tool lockdown is a PreToolUse hook (agy_hook.py) in that dir's
+    config/hooks.json: deny everything but the image path. agy fails CLOSED
+    on a missing, slow or garbage hook (probed). Without the hook agy reads
+    files in the cwd without asking; ACP permission requests never arrive.
+
+    Images: input rides the ACP prompt (`promptCapabilities.image: true`);
+    agy stores uploads under brain/<session>/.user_uploaded/. Output comes
+    from an ASYNC subagent (`invoke_subagent` TypeName image-generator ->
+    `generate_image`): the turn ends before the file exists and ACP never
+    reports it. So after a turn that dispatched the subagent, we watch
+    brain/<session>/ for a new image file. Generated images and sessions stay
+    on disk under the gemini dir, like grok's.
+    """
+
+    # agy's own default model when none is pinned is whatever session/new
+    # reports as current; the launcher default effort is applied on top.
+    DEFAULT_EFFORT = "low"
+    # agentry's effort vocabulary -> agy thought levels.
+    EFFORT_MAP = {"none": "low", "minimal": "low", "ultra": "max"}
+    EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"]
+    AUTH_METHODS = {"api-key": "gemini-api-key", "oauth": "oauth-personal"}
+    # Same chat-only contract as codex; image generation is the one carve-out.
+    CHAT_ONLY_INSTRUCTIONS = (
+        "You are a stateless question-answering assistant exposed over an HTTP "
+        "chat API. Answer each user message directly and completely using only "
+        "your own knowledge and the content of the message itself, including "
+        "any attached images. Your tools are disabled and every call is "
+        "refused, so do not try them. The ONE exception is image generation "
+        "through the image-generator subagent, and only when the user "
+        "explicitly asks for an image. There is no relevant codebase, "
+        "repository, or workspace. If the message asks for a specific output "
+        "format (e.g. a JSON object), return exactly that and nothing else."
+    )
+    _IMAGE_MAGIC = ((b"\xff\xd8", "image/jpeg"), (b"\x89PNG", "image/png"),
+                    (b"RIFF", "image/webp"))
+    _IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
+    # How long to wait for the async image subagent after the turn ends.
+    # Observed 3-15 s; the ceiling is for a slow or queued generation.
+    IMAGE_WAIT_S = 240
+    HOOK_SCRIPT = Path(__file__).parent / "agy_hook.py"
+    KEYS_INI = Path(__file__).parent / "keys.ini"
+
+    def __init__(self, agy_path="agy", cwd=None, model=None, reasoning_effort=None,
+                 auth="api-key", log_path=None):
+        if auth not in self.AUTH_METHODS:
+            raise BackendError(f"agy auth must be one of {sorted(self.AUTH_METHODS)}, got {auth!r}")
+        self.auth = auth
+        self.default_model = model            # None: agy's current model
+        self.default_effort = reasoning_effort or self.DEFAULT_EFFORT
+        self.cwd = os.path.abspath(cwd) if cwd else os.path.join(
+            tempfile.gettempdir(), "agentry-agy-scratch")
+        os.makedirs(self.cwd, exist_ok=True)
+
+        # agy rejects an absolute --gemini-dir; a bare name resolves under
+        # the home dir (observed: ~/.gemini-agentry-probe).
+        self.gemini_dir_name = f".gemini-agentry-{auth}"
+        self.gemini_home = Path.home() / self.gemini_dir_name
+        self.brain_root = self.gemini_home / "antigravity-cli" / "brain"
+        self._write_hooks()
+
+        env = dict(os.environ)
+        if auth == "api-key":
+            api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+            if not api_key:
+                api_key = self._key_from_ini()
+            if not api_key:
+                raise BackendError(
+                    "agy api-key auth needs GEMINI_API_KEY in the environment or in "
+                    f"{self.KEYS_INI} under [gemini]")
+            env["GEMINI_API_KEY"] = api_key
+        else:
+            # The personal login must be what pays; a key in the environment
+            # would silently move billing to the API (or the other way round).
+            for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "AGY_ADC_AUTH"):
+                if k in env:
+                    _log(f"agy: {k} is set in the environment; NOT passing it to agy "
+                         f"so oauth auth uses the Google login only")
+                    env.pop(k)
+
+        exe = shutil.which(agy_path)
+        if not exe:
+            cand = Path(os.environ.get("LOCALAPPDATA", "")) / "agy" / "bin" / "agy.exe"
+            if cand.is_file():
+                exe = str(cand)
+        exe = exe or agy_path
+        cmd = [exe, "acp", "--disable-telemetry", "--gemini-dir", self.gemini_dir_name]
+        _log(f"agy spawn: {' '.join(cmd)}  (auth={auth}, cwd={self.cwd})")
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
+            cwd=self.cwd, env=env,
+        )
+        self.next_id = 1
+        self.id_lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.pending = {}
+        self.active_turn_queue = None
+        self._turn_in_flight = False
+        self._active_sid = None
+        self._cancel_requested = False
+        self.session_id = None
+        self.session_fresh = False
+        self._sess_state = {}         # sessionId -> agy model id applied (e.g. gemini-3.8-flash-high)
+        self._levels = {}             # base model -> [thought levels], from session/new
+        self._model_names = {}        # base model -> display name
+        self._agy_default = None      # base model agy picked on the first session
+        self._run_tokens = {"in": 0, "cached": 0, "out": 0, "thought": 0, "turns": 0}
+        self._turn_usage = None
+        self.turn_lock = threading.Lock()
+        self.log_path = log_path
+        self._logf = None
+        if self.log_path:
+            self.log_path.parent.mkdir(exist_ok=True)
+            self._logf = open(self.log_path, "w", encoding="utf-8")
+
+        threading.Thread(target=self._reader_loop, daemon=True).start()
+        threading.Thread(target=self._stderr_loop, daemon=True).start()
+        self._initialize()
+
+    # -- setup --
+
+    def _key_from_ini(self):
+        if not self.KEYS_INI.is_file():
+            return ""
+        import configparser
+        ini = configparser.ConfigParser()
+        ini.read(self.KEYS_INI, encoding="utf-8")
+        key = ini.get("gemini", "GEMINI_API_KEY", fallback="").strip()
+        if key:
+            _log(f"agy: GEMINI_API_KEY not in environment; using {self.KEYS_INI.name}")
+        return key
+
+    def _write_hooks(self):
+        """(Re)write the lockdown hook into agentry's gemini dir on every
+        start, so an edited or stale hooks.json never survives a restart."""
+        config_dir = self.gemini_home / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        if not self.HOOK_SCRIPT.is_file():
+            raise BackendError(f"agy hook script missing: {self.HOOK_SCRIPT}")
+        deny_log = config_dir / "agentry-hook-denied.jsonl"
+        command = (f'"{os.path.normpath(sys.executable)}" -I '
+                   f'"{os.path.normpath(self.HOOK_SCRIPT)}" '
+                   f'"{os.path.normpath(self.brain_root)}" "{os.path.normpath(deny_log)}"')
+        config = {"agentry-lockdown": {"enabled": True, "PreToolUse": [
+            {"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 10}]}]}}
+        hooks_path = config_dir / "hooks.json"
+        hooks_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        _log(f"agy: lockdown hook written to {hooks_path}")
+
+    # -- plumbing (same shape as the grok backend) --
+
+    def _log_wire(self, direction, msg):
+        if self._logf:
+            try:
+                self._logf.write(f"{direction} {json.dumps(msg)}\n")
+                self._logf.flush()
+            except Exception:
+                pass
+
+    def _next_id(self):
+        with self.id_lock:
+            i = self.next_id
+            self.next_id += 1
+            return i
+
+    def _write(self, msg):
+        line = json.dumps(msg) + "\n"
+        self._log_wire(">>", msg)
+        with self.write_lock:
+            self.proc.stdin.write(line)
+            self.proc.stdin.flush()
+
+    def _request(self, method, params, timeout=60):
+        msg_id = self._next_id()
+        q = queue.Queue(maxsize=1)
+        self.pending[msg_id] = q
+        self._write({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params})
+        try:
+            resp = q.get(timeout=timeout)
+        except queue.Empty:
+            raise BackendError(f"timeout waiting for {method}")
+        finally:
+            self.pending.pop(msg_id, None)
+        if "error" in resp:
+            err = resp["error"]
+            msg = err.get("message", err) if isinstance(err, dict) else err
+            raise BackendError(f"{method}: {msg}")
+        return resp.get("result") or {}
+
+    def _notify(self, method, params):
+        self._write({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _reader_loop(self):
+        try:
+            for line in iter(self.proc.stdout.readline, ""):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    _log(f"agy non-JSON line: {line[:120]!r}")
+                    continue
+                self._log_wire("<<", msg)
+                if "id" in msg and ("result" in msg or "error" in msg):
+                    q = self.pending.pop(msg["id"], None)
+                    if q is not None:
+                        q.put(msg)
+                elif "id" in msg and "method" in msg:
+                    if msg["method"] == "session/request_permission":
+                        # Never observed (the hook decides first); refuse.
+                        _log("WARN: agy asked session/request_permission; cancelled")
+                        self._write({"jsonrpc": "2.0", "id": msg["id"],
+                                     "result": {"outcome": {"outcome": "cancelled"}}})
+                        continue
+                    _log(f"agy asked {msg['method']!r}; refused")
+                    self._write({
+                        "jsonrpc": "2.0", "id": msg["id"],
+                        "error": {"code": -32601,
+                                  "message": f"method '{msg['method']}' not supported by client"},
+                    })
+                elif "method" in msg:
+                    q = self.active_turn_queue
+                    if q is not None:
+                        q.put((msg["method"], msg.get("params") or {}))
+        except Exception as e:
+            _log(f"agy reader exited: {e}")
+
+    def _stderr_loop(self):
+        try:
+            for line in iter(self.proc.stderr.readline, ""):
+                if line:
+                    _log(f"agy stderr: {line.rstrip()[:200]}")
+        except Exception:
+            pass
+
+    def _initialize(self):
+        result = self._request("initialize", {
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False},
+                                   "terminal": False},
+            "clientInfo": {"name": "agentry", "version": "0.2.0"},
+        }, timeout=30)
+        info = result.get("agentInfo") or {}
+        caps = (result.get("agentCapabilities") or {}).get("promptCapabilities") or {}
+        _log(f"agy initialized; agent={info.get('name')!r} {info.get('version')!r} "
+             f"image_input={caps.get('image')}")
+        method = self.AUTH_METHODS[self.auth]
+        _log(f"agy: authenticating with {method}, expecting an empty result")
+        try:
+            self._request("authenticate", {"methodId": method}, timeout=30)
+        except BackendError as e:
+            if self.auth == "oauth":
+                raise BackendError(
+                    f"{e}. Log in once for agentry's own agy dir: "
+                    f"agy acp --gemini-dir {self.gemini_dir_name} --login")
+            raise
+        _log(f"agy authenticated ({method})")
+
+    # -- selection --
+
+    def _record_models(self, result):
+        """availableModels ids are '<base>-<level>' (gemini-3.8-flash-high);
+        split them into base -> levels. An id without a known level suffix
+        is a model with no thought levels."""
+        avail = ((result.get("models") or {}).get("availableModels")) or []
+        levels, names = {}, {}
+        for m in avail:
+            mid = m.get("modelId") or ""
+            base, level = mid, None
+            for lv in self.EFFORT_LADDER:
+                if mid.endswith("-" + lv):
+                    base, level = mid[:-len(lv) - 1], lv
+                    break
+            levels.setdefault(base, [])
+            if level:
+                levels[base].append(level)
+            name = m.get("name") or mid
+            names[base] = name.split(" (")[0]
+        if levels:
+            self._levels = levels
+            self._model_names = names
+        current = (result.get("models") or {}).get("currentModelId") or ""
+        return current
+
+    def _base_of(self, model_id):
+        for lv in self.EFFORT_LADDER:
+            if model_id.endswith("-" + lv) and model_id[:-len(lv) - 1] in self._levels:
+                return model_id[:-len(lv) - 1]
+        return model_id
+
+    def _agy_model_id(self, model, effort):
+        """(base model, agentry effort) -> the agy model id to set. Nearest
+        lower thought level when the exact one is missing."""
+        if self._levels and model not in self._levels:
+            raise BackendError(f"unknown agy model {model!r}; known: {sorted(self._levels)}")
+        supported = self._levels.get(model) or []
+        if not supported:
+            return model
+        want = self.EFFORT_MAP.get(effort, effort)
+        if want in supported:
+            return f"{model}-{want}"
+        if want in self.EFFORT_LADDER:
+            i = self.EFFORT_LADDER.index(want)
+            for cand in reversed(self.EFFORT_LADDER[:i]):
+                if cand in supported:
+                    return f"{model}-{cand}"
+        lowest = min(supported, key=self.EFFORT_LADDER.index)
+        return f"{model}-{lowest}"
+
+    def _apply_selection(self, sid, model, effort):
+        """Caller holds turn_lock (or owns a scratch session)."""
+        want = self._agy_model_id(model, effort)
+        if self._sess_state.get(sid) == want:
+            return
+        self._request("session/set_model", {"sessionId": sid, "modelId": want}, timeout=15)
+        self._sess_state[sid] = want
+
+    def _open_session(self, model=None, effort=None):
+        result = self._request("session/new", {
+            "cwd": self.cwd, "mcpServers": [],
+            "_meta": {"antigravity": {"systemPrompt": {"append": self.CHAT_ONLY_INSTRUCTIONS}}},
+        }, timeout=60)
+        sid = result.get("sessionId")
+        if not sid:
+            raise BackendError("session/new returned no sessionId")
+        current = self._record_models(result)
+        self._sess_state[sid] = current
+        if self._agy_default is None and current:
+            self._agy_default = self._base_of(current)
+            _log(f"agy default model (agy's own pick): {self._agy_default}")
+        want_model = model or self.default_model or self._agy_default
+        self._apply_selection(sid, want_model, effort or self.default_effort)
+        return sid
+
+    def _close_session(self, sid):
+        """session/close plus our attachment copies. agy's own session record,
+        its upload copies and generated images stay on disk."""
+        self._sess_state.pop(sid, None)
+        shutil.rmtree(self.brain_root / sid / "refs", ignore_errors=True)
+        try:
+            self._request("session/close", {"sessionId": sid}, timeout=10)
+        except Exception as e:
+            _log(f"agy session/close {sid}: {e}")
+
+    # -- Backend interface --
+
+    def new_session(self, cwd=None, model=None, effort=None):
+        with self.turn_lock:
+            old = self.session_id
+            self.session_id = self._open_session(model, effort)
+            self.session_fresh = True
+            _log(f"agy session: {self.session_id} (model={self._sess_state[self.session_id]})")
+            if old:
+                self._close_session(old)
+            return self.session_id
+
+    def current_model(self):
+        return self.default_model or self._agy_default
+
+    def list_models(self):
+        out = []
+        current = self.current_model()
+        for base in sorted(self._levels):
+            out.append({"id": base, "name": self._model_names.get(base, base),
+                        "displayName": self._model_names.get(base, base),
+                        "isDefault": base == current,
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": e} for e in self._levels[base]]})
+        return out or None
+
+    def _brain_images(self, sid):
+        """{path: mtime} of image files directly in brain/<sid>/ (uploads live
+        in .user_uploaded/ below it and are not listed)."""
+        d = self.brain_root / sid
+        found = {}
+        if not d.is_dir():
+            return found
+        for p in d.iterdir():
+            if p.is_file() and p.suffix.lower() in self._IMAGE_SUFFIXES:
+                found[str(p)] = p.stat().st_mtime
+        return found
+
+    def _wait_for_images(self, sid, before, want):
+        """After a turn that dispatched the image subagent: wait for `want`
+        new image files in brain/<sid>/. Returns the new paths (possibly
+        fewer than wanted on timeout or cancel)."""
+        t0 = time.time()
+        next_beat = t0 + 15
+        _log(f"agy: waiting up to {self.IMAGE_WAIT_S}s for {want} image(s) from the "
+             f"async image subagent in brain/{sid}/")
+        while True:
+            now_files = self._brain_images(sid)
+            new = [p for p in now_files if p not in before]
+            if len(new) >= want:
+                break
+            if self._cancel_requested:
+                _log("agy: image wait cancelled")
+                break
+            if time.time() - t0 > self.IMAGE_WAIT_S:
+                _log(f"agy: image wait timed out after {self.IMAGE_WAIT_S}s with {len(new)} file(s)")
+                break
+            if time.time() > next_beat:
+                _log(f"agy: still waiting for image ({time.time() - t0:.0f}s), next check in 0.5s")
+                next_beat += 15
+            time.sleep(0.5)
+        # A file can be listed before its writer finished: wait until the size
+        # holds still for half a second.
+        for p in new:
+            last = -1
+            for _ in range(20):
+                size = os.path.getsize(p)
+                if size == last and size > 0:
+                    break
+                last = size
+                time.sleep(0.25)
+        _log(f"agy: {len(new)} new image(s) after {time.time() - t0:.1f}s")
+        return sorted(new, key=lambda p: now_files.get(p, 0))
+
+    _REF_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                "image/webp": ".webp"}
+
+    def _write_refs(self, images, sid):
+        """Write (mime, b64) attachments under brain/<sid>/refs/; returns
+        forward-slash paths. Kept for the session's life so a later turn can
+        still name them; removed with the session."""
+        d = self.brain_root / sid / "refs"
+        d.mkdir(parents=True, exist_ok=True)
+        existing = len(list(d.iterdir()))
+        paths = []
+        for i, (mime, data) in enumerate(images, existing + 1):
+            p = d / f"ref-{i}{self._REF_EXT.get(mime, '.img')}"
+            p.write_bytes(base64.b64decode(data))
+            paths.append(str(p).replace("\\", "/"))
+        _log(f"agy: {len(paths)} attachment(s) written under brain/{sid}/refs")
+        return paths
+
+    def _image_tuple(self, path, revised_prompt):
+        data = Path(path).read_bytes()
+        mime = next((m for magic, m in self._IMAGE_MAGIC if data.startswith(magic)),
+                    "image/jpeg")
+        _log(f"agy image: {len(data) / 1024:.0f} KB {mime} (saved {path})")
+        return ("image", mime, base64.b64encode(data).decode("ascii"), revised_prompt)
+
+    def prompt(self, text, images=None, timeout=900, model=None, effort=None,
+               session_id=None):
+        """One turn on the chat session, or on `session_id` (image_turn's
+        scratch session). Images ride the ACP prompt as image blocks."""
+        sid = session_id or self.session_id
+        if not sid:
+            raise BackendError("no active session (call new_session first)")
+        blocks = []
+        for mime, data in images or []:
+            blocks.append({"type": "image", "mimeType": mime, "data": data})
+        if images:
+            # The inline blocks let the model SEE the images, but the image
+            # subagent needs file paths and does not know where agy put its
+            # upload copy: live, it guessed a cwd path and the hook refused
+            # it, then generated from scratch (2026-11-16). So write our own
+            # copies inside brain/<sid>/refs/ (the hook allows that root) and
+            # name them.
+            paths = self._write_refs(images, sid)
+            text = (f"[The user attached {len(paths)} image(s), also saved as files: "
+                    + ", ".join(paths) + ". If the user wants an image edited or made "
+                    "from them, tell the image-generator subagent to pass exactly these "
+                    "paths as ImagePaths to generate_image.]\n\n" + (text or ""))
+        blocks.append({"type": "text", "text": text or ""})
+        with self.turn_lock:
+            want_model = model or self.default_model or self._agy_default
+            try:
+                self._apply_selection(sid, want_model, effort or self.default_effort)
+            except BackendError as e:
+                yield f"\n[agy error] {e}"
+                return
+            q = queue.Queue()
+            self.active_turn_queue = q
+            msg_id = self._next_id()
+            self.pending[msg_id] = q
+            self._turn_in_flight = True
+            self._cancel_requested = False
+            self._active_sid = sid
+            self._turn_usage = None
+            image_prompts = []         # Prompt of each image-generator dispatch
+            images_before = self._brain_images(sid)
+            t0 = time.time()
+            try:
+                self._write({"jsonrpc": "2.0", "id": msg_id, "method": "session/prompt",
+                             "params": {"sessionId": sid, "prompt": blocks}})
+                if sid == self.session_id:
+                    self.session_fresh = False
+                while True:
+                    try:
+                        item = q.get(timeout=timeout)
+                    except queue.Empty:
+                        yield f"\n[agy timeout after {timeout}s]"
+                        return
+                    if isinstance(item, dict):           # the session/prompt response
+                        self._turn_in_flight = False
+                        if "error" in item:
+                            err = item["error"]
+                            msg = err.get("message", err) if isinstance(err, dict) else err
+                            yield f"\n[agy error] {msg}"
+                            return
+                        result = item.get("result") or {}
+                        self._account_usage(result.get("usage") or {})
+                        _log(f"agy turn stop={result.get('stopReason')}" + self._usage_suffix())
+                        break
+                    method, params = item
+                    if method != "session/update" or params.get("sessionId") not in (None, sid):
+                        continue
+                    upd = params.get("update") or {}
+                    kind = upd.get("sessionUpdate")
+                    content = upd.get("content") or {}
+                    if kind == "agent_message_chunk":
+                        if content.get("type") == "text" and content.get("text"):
+                            yield content["text"]
+                    elif kind == "agent_thought_chunk":
+                        if content.get("type") == "text" and content.get("text"):
+                            yield ("reasoning", content["text"])
+                    elif kind == "tool_call":
+                        raw = upd.get("rawInput") or {}
+                        if raw.get("TypeName") == "image-generator":
+                            image_prompts.append(raw.get("Prompt"))
+                            _log("agy: image subagent dispatched")
+                        else:
+                            # The hook denies it; worth knowing the model tried.
+                            _log(f"agy tool attempt (hook decides): {upd.get('title')!r}")
+                # The turn is over. An image subagent outlives it: collect its file.
+                if image_prompts and not self._cancel_requested:
+                    new_paths = self._wait_for_images(sid, images_before, len(image_prompts))
+                    if not new_paths:
+                        yield "\n[agy image error] the image subagent produced no file"
+                    for i, path in enumerate(new_paths):
+                        prompt_used = image_prompts[min(i, len(image_prompts) - 1)]
+                        yield self._image_tuple(path, prompt_used)
+            finally:
+                if self._turn_in_flight:
+                    self._cancel_turn(sid)
+                    self._turn_in_flight = False
+                self._active_sid = None
+                self.active_turn_queue = None
+                self.pending.pop(msg_id, None)
+                _log(f"agy turn took {time.time() - t0:.1f}s")
+
+    def image_turn(self, prompt, images=None, timeout=900, model=None, effort=None):
+        """One Images-API call on a throwaway session. References ride the
+        prompt as image blocks; agy saves them under .user_uploaded/ and the
+        subagent passes them to generate_image as ImagePaths (probed)."""
+        if images:
+            # prompt() names the reference file paths ahead of this text.
+            text = (f"Edit the {len(images)} attached image(s): dispatch the "
+                    "image-generator subagent exactly once, telling it to call "
+                    "generate_image with the attached image files as ImagePaths and "
+                    "the complete text below as the image prompt, verbatim, including "
+                    "any size requirement. Keep the composition and aspect ratio of "
+                    "the first attached image unless the text says otherwise. Then "
+                    "reply with one short sentence:\n\n" + prompt)
+        else:
+            text = ("Dispatch the image-generator subagent exactly once, passing the "
+                    "complete text below as the image prompt, verbatim, including any "
+                    "size requirement. Then reply with one short sentence:\n\n" + prompt)
+        sid = None
+        try:
+            with self.turn_lock:
+                sid = self._open_session(model, effort)
+            _log(f"agy scratch session: {sid} ({len(images or [])} reference(s))")
+            yield from self.prompt(text, images=images, timeout=timeout, model=model,
+                                   effort=effort, session_id=sid)
+        finally:
+            if sid:
+                with self.turn_lock:
+                    self._close_session(sid)
+
+    def _cancel_turn(self, sid):
+        try:
+            self._notify("session/cancel", {"sessionId": sid})
+            return True
+        except Exception:
+            return False
+
+    def cancel(self):
+        sid = self._active_sid
+        if not sid:
+            return False
+        self._cancel_requested = True
+        if not self._turn_in_flight:
+            return True        # waiting for an image file; the wait loop stops
+        return self._cancel_turn(sid)
+
+    def _account_usage(self, usage):
+        self._turn_usage = usage
+        self._run_tokens["in"] += usage.get("inputTokens") or 0
+        self._run_tokens["cached"] += usage.get("cachedReadTokens") or 0
+        self._run_tokens["out"] += usage.get("outputTokens") or 0
+        self._run_tokens["thought"] += usage.get("thoughtTokens") or 0
+        self._run_tokens["turns"] += 1
+
+    def _usage_suffix(self):
+        u = self._turn_usage
+        if not u:
+            return ""
+        return (f"  tokens in={u.get('inputTokens', 0)} (cached {u.get('cachedReadTokens', 0)}) "
+                f"out={u.get('outputTokens', 0)} thought={u.get('thoughtTokens', 0)}")
+
+    def quota_status(self):
+        """agy reports tokens per turn and nothing about plan quota over ACP.
+        api-key turns bill per token on the Gemini API; images are not in
+        these counts."""
+        r = self._run_tokens
+        if not r["turns"]:
+            return None
+        billing = "Gemini API per token" if self.auth == "api-key" else "Google AI plan quota"
+        return (f"agy usage | this run {r['turns']} turns, in={r['in']} "
+                f"(cached {r['cached']}) out={r['out']} thought={r['thought']} "
+                f"({billing}; images excluded)")
+
+    def is_alive(self):
+        return self.proc.poll() is None
+
+    def close(self):
+        try:
+            if self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=3)
+        except Exception:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        if self._logf:
+            try:
+                self._logf.close()
+            except Exception:
+                pass
+
+
+def make_backend(kind, *, model=None, reasoning_effort=None, log_dir: Optional[Path] = None,
+                 agy_auth="api-key") -> Backend:
     """Construct the selected backend. `model`/`reasoning_effort` None means
     'use the backend's own default'."""
     log_dir = log_dir or (Path(__file__).parent / "logs")
@@ -2533,4 +3204,8 @@ def make_backend(kind, *, model=None, reasoning_effort=None, log_dir: Optional[P
         if reasoning_effort is not None:
             kw["reasoning_effort"] = reasoning_effort
         return GrokACPBackend(**kw)
-    raise BackendError(f"unknown backend {kind!r} (expected 'copilot', 'codex', 'claude', or 'grok')")
+    if kind == "agy":
+        return AgyACPBackend(model=model, reasoning_effort=reasoning_effort,
+                             auth=agy_auth, log_path=log_dir / "agy_wire.log")
+    raise BackendError(f"unknown backend {kind!r} (expected 'copilot', 'codex', 'claude', "
+                       f"'grok', or 'agy')")

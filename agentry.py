@@ -46,6 +46,7 @@ app = Flask(__name__)
 BACKEND_KIND = "copilot"
 BACKEND_MODEL = None
 REASONING_EFFORT = None
+AGY_AUTH = "api-key"
 LOG_DIR = Path(__file__).parent / "logs"
 
 
@@ -66,6 +67,7 @@ def _get_backend():
                 model=BACKEND_MODEL,
                 reasoning_effort=REASONING_EFFORT,
                 log_dir=LOG_DIR,
+                agy_auth=AGY_AUTH,
             )
         return _backend
 
@@ -198,7 +200,7 @@ def health():
 @app.route("/v1/models")
 def models():
     owner = {"codex": "openai", "claude": "anthropic",
-             "grok": "xai"}.get(BACKEND_KIND, "github-copilot")
+             "grok": "xai", "agy": "google"}.get(BACKEND_KIND, "github-copilot")
     # Real list when the backend can enumerate (copilot's models.list); the
     # extra fields (price_category, name) are non-standard but OpenAI clients
     # ignore unknown keys. Falls back to the single synthetic entry.
@@ -478,9 +480,9 @@ def _run_image_turn(route, wrapper):
     if fields.get("response_format", "b64_json") != "b64_json":
         return fail(400, "only response_format=b64_json is supported",
                     param="response_format")
-    if BACKEND_KIND not in ("codex", "grok"):
+    if BACKEND_KIND not in ("codex", "grok", "agy"):
         return fail(501, f"image generation is not available on the "
-                         f"{BACKEND_KIND} backend (codex or grok)",
+                         f"{BACKEND_KIND} backend (codex, grok or agy)",
                     code="unsupported_backend")
     if route == "edits":
         if not images:
@@ -514,6 +516,12 @@ def _run_image_turn(route, wrapper):
             # Throwaway ACP session per call; references go to disk because
             # the ACP prompt takes no image content (GrokACPBackend.image_turn).
             _log(f"image/{route}: grok scratch session{img_note} prompt={prompt[:60]!r}")
+            gen = backend.image_turn(body, images=images)
+        elif BACKEND_KIND == "agy":
+            # Throwaway ACP session per call; references ride the prompt as
+            # image blocks and the async image subagent's file is collected
+            # from agy's brain dir (AgyACPBackend.image_turn).
+            _log(f"image/{route}: agy scratch session{img_note} prompt={prompt[:60]!r}")
             gen = backend.image_turn(body, images=images)
         else:
             # Every Images call gets its own throwaway thread: it never touches
@@ -843,20 +851,29 @@ def _check_pinned_model(backend):
 
 
 def main():
-    global BACKEND_KIND, BACKEND_MODEL, REASONING_EFFORT
+    global BACKEND_KIND, BACKEND_MODEL, REASONING_EFFORT, AGY_AUTH
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--backend", choices=["copilot", "codex", "claude", "grok"], default="copilot",
+    p.add_argument("--backend", choices=["copilot", "codex", "claude", "grok", "agy"],
+                   default="copilot",
                    help="Agent backend: copilot (AI-credit metered, cheapest), "
                         "codex (paid-cheap), claude (premium, persistent worker), "
-                        "or grok (Grok Build over ACP, SuperGrok / X Premium+).")
+                        "grok (Grok Build over ACP, SuperGrok / X Premium+), "
+                        "or agy (Google Antigravity CLI over ACP).")
+    p.add_argument("--agy-auth", choices=["api-key", "oauth"], default="api-key",
+                   help="agy only. api-key (default): GEMINI_API_KEY, billed per "
+                        "token on the Gemini API. oauth: your personal Google login "
+                        "and AI Pro/Ultra quota; Google's Antigravity terms forbid "
+                        "third-party access and suspend accounts for it. One-time "
+                        "login: agy acp --gemini-dir .gemini-agentry-oauth --login")
     p.add_argument("--model", type=str.lower, default=None,
                    help="Model override. copilot: e.g. gpt-5.6-luna. "
                         "codex: e.g. gpt-5.6-luna (default: codex's own "
                         "configured model, i.e. the last TUI selection). "
                         "claude: e.g. claude-sonnet-4-6 (default). "
-                        "grok: grok-4.7 (default), grok-4.6, grok-4.5.")
+                        "grok: grok-4.7 (default), grok-4.6, grok-4.5. "
+                        "agy: e.g. gemini-3.8-flash (default: agy's own pick).")
     p.add_argument("--reasoning-effort", type=str.lower,
                    choices=["none", "minimal", "low", "medium", "high", "xhigh",
                             "max", "ultra"],
@@ -865,11 +882,17 @@ def main():
                         "none..max on copilot and none..ultra on codex; a "
                         "model that rejects a level keeps its previous one "
                         "(logged). grok maps onto low/medium/high/xhigh "
-                        "(default high). No-op on claude.")
+                        "(default high). agy maps onto the model's thought "
+                        "levels (low..xhigh). No-op on claude.")
     args = p.parse_args()
     BACKEND_KIND = args.backend
     BACKEND_MODEL = args.model
     REASONING_EFFORT = args.reasoning_effort
+    AGY_AUTH = args.agy_auth
+    if BACKEND_KIND == "agy" and AGY_AUTH == "oauth":
+        print("  WARNING: agy oauth uses your personal Google login. Google's "
+              "Antigravity terms (section 6) call third-party access a breach "
+              "and have suspended accounts for it.", flush=True)
 
     import logging
     logging.getLogger("werkzeug").setLevel(logging.WARNING)

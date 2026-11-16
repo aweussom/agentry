@@ -5,6 +5,10 @@
 #   codex backend   -> `codex login`   (ChatGPT account)
 #   claude backend  -> Claude Code CLI already logged in (its own OAuth/API key)
 #   grok backend    -> `grok login`    (grok.com / SuperGrok account; keep XAI_API_KEY unset)
+#   agy backend     -> GEMINI_API_KEY in the environment or keys.ini (default), or
+#                      -AgyAuth oauth after a one-time
+#                      `agy acp --gemini-dir .gemini-agentry-oauth --login`
+#                      (personal Google login; Google's terms forbid third-party use)
 #
 # Run a test instance on a different -Port than a running prod instance to
 # avoid an "address already in use" collision (agentry-vs-agentry).
@@ -19,11 +23,13 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [int]$Port = 8765,
-    [ValidateSet("copilot","codex","claude","grok")]
+    [ValidateSet("copilot","codex","claude","grok","agy")]
     [string]$Backend = "copilot",
     [string]$Model = "",
     [ValidateSet("none","minimal","low","medium","high","xhigh","max","ultra","")]
     [string]$ReasoningEffort = "",
+    [ValidateSet("api-key","oauth","")]
+    [string]$AgyAuth = "",
     [Parameter(ValueFromRemainingArguments)]
     [string[]]$Rest = @()
 )
@@ -31,6 +37,7 @@ param(
 # argparse's choices are case-sensitive; PowerShell's ValidateSet is not.
 $ReasoningEffort = $ReasoningEffort.ToLowerInvariant()
 $Backend = $Backend.ToLowerInvariant()
+$AgyAuth = $AgyAuth.ToLowerInvariant()
 
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
@@ -106,12 +113,15 @@ if ($Backend -eq "copilot") {
         exit 1
     }
 } else {
-    $cli = switch ($Backend) { "codex" { "codex" } "grok" { "grok" } default { "claude" } }
-    # grok's installer drops the exe in ~/.grok/bin and adds it to PATH for new
-    # shells; accept that location directly so a fresh install works at once.
+    $cli = switch ($Backend) { "codex" { "codex" } "grok" { "grok" } "agy" { "agy" } default { "claude" } }
+    # grok's installer drops the exe in ~/.grok/bin and agy's in
+    # %LOCALAPPDATA%\agy\bin, both added to PATH for new shells only; accept
+    # those locations directly so a fresh install works at once.
     $grokHome = Join-Path $HOME ".grok\bin\grok.exe"
+    $agyHome = Join-Path $env:LOCALAPPDATA "agy\bin\agy.exe"
     if (-not (Get-Command $cli -ErrorAction SilentlyContinue) -and
-        -not ($Backend -eq "grok" -and (Test-Path $grokHome))) {
+        -not ($Backend -eq "grok" -and (Test-Path $grokHome)) -and
+        -not ($Backend -eq "agy" -and (Test-Path $agyHome))) {
         Write-Warning "$cli not found on PATH. Install and authenticate the $Backend backend first."
         exit 1
     }
@@ -131,5 +141,6 @@ if ($Backend -eq "claude" -and -not (Test-Path (Join-Path $HOME ".claude\quota-d
 $pyArgs = @('agentry.py', '--port', $Port, '--backend', $Backend)
 if ($Model)            { $pyArgs += @('--model', $Model) }
 if ($ReasoningEffort)  { $pyArgs += @('--reasoning-effort', $ReasoningEffort) }
+if ($AgyAuth)          { $pyArgs += @('--agy-auth', $AgyAuth) }
 $pyArgs += $Rest   # GNU-style flags; argparse lets the last occurrence win
 .\venv\Scripts\python.exe @pyArgs

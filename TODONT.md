@@ -99,6 +99,22 @@ second backend justified it.
        gray zone; Google demonstrably does not.
   The former watch items (SDK #20 credential reuse, CLI #31 `--acp`) are
   dropped: even if they land, (2) and (3) stand.
+  **Revised 2026-11-16: landed as backend #5 (`AgyACPBackend`), API key by
+  default.** agy 1.5.9 ships `agy acp`, a real ACP stdio server with image
+  input and an `authMethods` list that includes `gemini-api-key`. On a key
+  the economics objection is moot (per-token, Google's own recommended path
+  for third-party tools) and the ban risk does not apply. The personal login
+  is `--agy-auth oauth`, opt-in, with a startup warning: (3) still stands,
+  and forum reports from 2026-11 include a suspension of an account that ran
+  only the official binary from a parent process. Probed with the key
+  [OBSERVED 2026-11-15/16]: tool lockdown works only via a PreToolUse hook
+  (no ACP permission request ever arrives; without the hook agy read a
+  canary file unasked); the hook fails CLOSED on missing/slow/garbage
+  handlers; image output comes from an async subagent and is collected from
+  brain/<session>/; the subagent cannot find agy's own upload copy, so
+  references are written under brain/<session>/refs/ and named.
+  Not taken: `search_web`. Search grounding over snippets, 1 of 3 factual
+  checks right (altered a "verbatim" quote, reported a stale version).
 - General caution still holds: each backend adds CLI surface, auth
   gotchas, and a support tail. Add a backend only when it clears the bar
   codex did — a clean persistent JSON/streaming protocol AND a distinct

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Launch agentry. Run from a shell where the chosen backend's CLI is already
 # authenticated (`copilot login`, `codex login`, `grok login`, or the Claude
-# Code CLI's own login). Mirrors start.ps1 — same flag names, same defaults.
+# Code CLI's own login; agy: GEMINI_API_KEY or keys.ini, or --agy-auth oauth
+# after `agy acp --gemini-dir .gemini-agentry-oauth --login`).
+# Mirrors start.ps1 — same flag names, same defaults.
 #
 # Run a test instance on a different --port than a running prod instance to
 # avoid an "address already in use" collision (agentry-vs-agentry).
@@ -11,12 +13,13 @@ PORT=8765
 BACKEND="copilot"
 MODEL=""
 REASONING_EFFORT=""
+AGY_AUTH=""
 
 usage() {
     cat <<EOF
 Usage: ./start.sh [options]
   --port N                HTTP port (default: ${PORT})
-  --backend NAME          copilot | codex | claude | grok (default: ${BACKEND})
+  --backend NAME          copilot | codex | claude | grok | agy (default: ${BACKEND})
   --model NAME            Model override (copilot default: gpt-5.6-luna;
                           codex default: whatever codex itself is
                           configured for (last TUI selection);
@@ -25,6 +28,8 @@ Usage: ./start.sh [options]
   --reasoning-effort X    none|minimal|low|medium|high|xhigh|max|ultra
                           (default: low, grok: high; what applies is
                           per model; not yet forwarded to claude)
+  --agy-auth MODE         agy only: api-key (default) | oauth (personal
+                          Google login; Google's terms forbid third-party use)
   -h, --help              Show this help
 
 Examples:
@@ -43,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --backend) BACKEND="$2"; shift 2 ;;
         --model) MODEL="$2"; shift 2 ;;
         --reasoning-effort) REASONING_EFFORT="$2"; shift 2 ;;
+        --agy-auth) AGY_AUTH="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -89,7 +95,7 @@ if [[ "$BACKEND" == "copilot" ]]; then
         exit 1
     fi
 else
-    case "$BACKEND" in codex) CLI=codex ;; grok) CLI=grok ;; *) CLI=claude ;; esac
+    case "$BACKEND" in codex) CLI=codex ;; grok) CLI=grok ;; agy) CLI=agy ;; *) CLI=claude ;; esac
     # grok's installer puts the binary in ~/.grok/bin; accept it off PATH too.
     if ! command -v "$CLI" >/dev/null 2>&1 && ! [[ "$BACKEND" == "grok" && -x "$HOME/.grok/bin/grok" ]]; then
         echo "ERROR: '$CLI' not found on PATH (needed for the $BACKEND backend)." >&2
@@ -111,5 +117,6 @@ fi
 ARGS=(agentry.py --port "$PORT" --backend "$BACKEND")
 [[ -n "$MODEL" ]]            && ARGS+=(--model "$MODEL")
 [[ -n "$REASONING_EFFORT" ]] && ARGS+=(--reasoning-effort "$REASONING_EFFORT")
+[[ -n "$AGY_AUTH" ]]         && ARGS+=(--agy-auth "$AGY_AUTH")
 
 exec venv/bin/python "${ARGS[@]}"

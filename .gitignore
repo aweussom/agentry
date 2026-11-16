@@ -20,5 +20,8 @@ _bench/codex_schema/
 # Pythons (see CopilotSDKBackend in backends.py)
 .copilot-runtime/
 
+# Local API keys for live probes; never commit
+keys.ini
+
 # Release zips built with git archive
 dist/

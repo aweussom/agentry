@@ -10,10 +10,12 @@ not omissions to fix during unrelated work. This is a single-user relay,
 not a multi-tenant gateway.
 
 `agentry.py` is the HTTP server and CLI entry point.
-`backends.py` contains the Copilot SDK, Codex app-server, Claude Code and
-Grok Build (ACP) implementations; shared console and request logging lives
-in `logutil.py`. `grok-agent-profile.md` is runtime prompt content for the
-Grok backend, like `.github/copilot-instructions.md` is for Copilot.
+`backends.py` contains the Copilot SDK, Codex app-server, Claude Code,
+Grok Build (ACP) and Antigravity `agy acp` (ACP) implementations; shared
+console and request logging lives in `logutil.py`. `grok-agent-profile.md`
+is runtime prompt content for the Grok backend, like
+`.github/copilot-instructions.md` is for Copilot. `agy_hook.py` is the agy
+backend's PreToolUse lockdown hook, run by agy itself.
 The browser UI uses `templates/index.html`, `static/css/style.css`, and
 `static/js/app.js`. Launchers are `start.ps1` for Windows and `start.sh` for
 Linux/WSL. Keep exploratory scripts in `_bench/`; project notes and historical
@@ -36,14 +38,14 @@ Use Python 3.11+ and the launchers, which create/manage `venv/`:
 .\start.ps1 -Backend codex -Port 9000
 .\venv\Scripts\python.exe -m py_compile agentry.py backends.py logutil.py
 .\venv\Scripts\python.exe test_agentry_race.py
-.\venv\Scripts\python.exe -m unittest -v test_claude_backend test_grok_backend test_videos_api test_cli_model
+.\venv\Scripts\python.exe -m unittest -v test_claude_backend test_grok_backend test_agy_backend test_videos_api test_cli_model
 ```
 
 ```bash
 ./start.sh --backend claude --port 9000
 venv/bin/python -m py_compile agentry.py backends.py logutil.py
 venv/bin/python test_agentry_race.py
-venv/bin/python -m unittest -v test_claude_backend test_grok_backend test_videos_api test_cli_model
+venv/bin/python -m unittest -v test_claude_backend test_grok_backend test_agy_backend test_videos_api test_cli_model
 ```
 
 `test_agentry_race.py` checks concurrent request model/effort isolation,
@@ -88,7 +90,7 @@ functions and variables, and `PascalCase` for classes. Prefer standard-library
 modules before third-party imports. Keep plain JavaScript and CSS consistent
 with the existing UI; avoid introducing a framework without a clear need.
 
-Keep backend transports separate behind the `Backend` interface. All four
+Keep backend transports separate behind the `Backend` interface. All five
 backends reuse runtime processes, with different conversation lifecycles.
 
 - Copilot bridges an asyncio loop thread to synchronous Flask workers with
@@ -134,6 +136,27 @@ backends reuse runtime processes, with different conversation lifecycles.
   is grok's per-turn cost estimate, which excludes images. Grok also loads
   Claude Code skills and hooks from `~/.claude`; `GROK_HOME` isolates that
   but moves `auth.json`, so it is not used.
+- agy uses one persistent `agy acp --disable-telemetry --gemini-dir
+  .gemini-agentry-<auth>` process, one `session/new` per chat, and sets the
+  combined model id (`gemini-3.8-flash-high`) with `session/set_model`
+  inside the turn lock. Auth is explicit (`--agy-auth`): `api-key` (default,
+  `GEMINI_API_KEY` from env or `keys.ini`) or `oauth` (personal Google login,
+  opt-in, warned at start; Google's terms §6 forbid third-party access).
+  Each auth gets its own gemini dir: agy falls back to a saved login when
+  the requested method lacks a credential, and the lockdown hook must never
+  land in the user's `~/.gemini`. In oauth mode strip `GEMINI_API_KEY`,
+  `GOOGLE_API_KEY` and `AGY_ADC_AUTH`. The tool restriction is the
+  PreToolUse hook `agy_hook.py`, rewritten into `<gemini-dir>/config/
+  hooks.json` at every start: it allows only the `image-generator`
+  subagent, `generate_image` with references inside `brain/`, its
+  `send_message`, and `read_file` inside `brain/`. No ACP permission request
+  ever arrives, and without the hook agy reads cwd files unasked. agy fails
+  closed on a missing, slow or garbage hook (validated on 1.5.9). Images
+  come from an async subagent: after a turn that dispatched it, wait for a
+  new file in `brain/<session>/`. Attachments ride the prompt as image
+  blocks and are also written to `brain/<session>/refs/`, named in the
+  prompt, and removed when the session closes. Sessions and generated
+  images stay under the gemini dir; do not delete them.
 
 ## Request and Session Contracts
 
@@ -158,11 +181,12 @@ and stop backend work when abandoning a response.
 never mixed into answer text. Preserve these contracts in streaming and
 non-streaming changes, and return structured errors for invalid requests.
 
-Images endpoints run on Codex and Grok (501 elsewhere), accept `n=1` and
-`b64_json`, and use separate scratch threads or sessions serialized with
+Images endpoints run on Codex, Grok and agy (501 elsewhere), accept `n=1`
+and `b64_json`, and use separate scratch threads or sessions serialized with
 chat turns. Edits accept multipart or data URIs and reject masks; the
 reference ceiling is the tool's own, five on Codex and three on Grok, and
-agentry rejects above it with 400. On Grok the references are written under
+agentry rejects above it with 400. agy's ceiling is not probed and not
+enforced. On Grok the references are written under
 the scratch cwd for `image_edit` and removed after the turn. `size` adds
 advisory aspect wording; it does not guarantee exact pixels. Report the
 actual delivered dimensions and format (Codex PNG, Grok JPEG) from the
