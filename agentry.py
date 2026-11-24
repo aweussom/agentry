@@ -82,9 +82,19 @@ def _get_backend():
 
 @atexit.register
 def _shutdown_backend():
-    global _backend
-    if _backend:
-        _backend.close()
+    # Ctrl-C reaches every process on the console, so the backend's CLI
+    # child is usually exiting already; close() still waits on it with
+    # bounded timeouts. A second Ctrl-C during that wait means "quit now":
+    # skip the rest of the cleanup instead of printing "Exception ignored in
+    # atexit callback" (seen 2026-11-24).
+    b = _backend
+    if not b:
+        return
+    print("\n  shutting down backend (Ctrl-C again to skip)", flush=True)
+    try:
+        b.close()
+    except KeyboardInterrupt:
+        print("  backend shutdown skipped", flush=True)
 
 
 # --- HTTP helpers -------------------------------------------------------

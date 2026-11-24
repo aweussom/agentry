@@ -39,7 +39,7 @@ Use Python 3.11+ and the launchers, which create/manage `venv/`:
 .\venv\Scripts\python.exe -m py_compile agentry.py backends.py logutil.py
 .\venv\Scripts\python.exe test_agentry_race.py
 .\venv\Scripts\python.exe test_session_reset_race.py
-.\venv\Scripts\python.exe -m unittest -v test_claude_backend test_grok_backend test_agy_backend test_videos_api test_cli_model
+.\venv\Scripts\python.exe -m unittest -v test_claude_backend test_grok_backend test_agy_backend test_videos_api test_cli_model test_shutdown
 ```
 
 ```bash
@@ -47,7 +47,7 @@ Use Python 3.11+ and the launchers, which create/manage `venv/`:
 venv/bin/python -m py_compile agentry.py backends.py logutil.py
 venv/bin/python test_agentry_race.py
 venv/bin/python test_session_reset_race.py
-venv/bin/python -m unittest -v test_claude_backend test_grok_backend test_agy_backend test_videos_api test_cli_model
+venv/bin/python -m unittest -v test_claude_backend test_grok_backend test_agy_backend test_videos_api test_cli_model test_shutdown
 ```
 
 `test_agentry_race.py` checks concurrent request model/effort isolation,
