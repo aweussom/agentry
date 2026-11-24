@@ -53,6 +53,14 @@ LOG_DIR = Path(__file__).parent / "logs"
 # --- Module-level backend state -----------------------------------------
 
 _backend_lock = threading.Lock()
+# Audit A02: a chat request's "new chat -> reset the session" decision and its
+# turn are one critical section. Without it, request C's reset disconnected
+# request B's fresh session between B's new_session() and B's prompt() ("no
+# active session", HTTP 500, seen 2026-11-24), or B and C ran in one session.
+# Always taken BEFORE the backend's turn_lock and never inside a backend, so
+# the order is fixed and cannot deadlock; /cancel does not take it. Turns were
+# already serialized by turn_lock, so this costs no throughput.
+_chat_lock = threading.Lock()
 _backend = None
 
 
@@ -290,55 +298,79 @@ def chat_completions():
     elif req_reasoning:
         _log(f"WARN: ignoring unknown reasoning_effort={req_reasoning!r}")
 
-    # New chat from UI -> need a fresh session, unless the eager startup
-    # session has not been used yet (in which case reuse it and avoid waste).
-    # Seeded with this request's selection where the runtime wants it at
-    # session scope (copilot).
-    if backend.session_id is None or (
-            _is_new_chat(messages) and not backend.session_fresh):
-        try:
-            backend.new_session(model=want_model, effort=want_effort)
-        except Exception as e:
-            _REQ_T0.pop(tid, None)
-            return jsonify({"error": {"message": f"new_session failed: {e}"}}), 500
+    # From here to the end of the turn this request owns the chat (A02).
+    # Released exactly once: by the non-streaming path's finally, or when a
+    # streamed response closes (call_on_close also fires on client
+    # disconnect, and when the generator never started, where a finally
+    # inside the generator would not run).
+    _chat_lock.acquire()
+    release_guard = threading.Lock()
+    released = []
 
-    img_note = f" images={len(images)}" if images else ""
-    _log(f"prompt: session={backend.session_id}{img_note} text={prompt_text[:60]!r}")
+    def release_chat():
+        with release_guard:
+            if not released:
+                released.append(True)
+                _chat_lock.release()
 
-    # Attribution is per-request: the label is this request's own selection,
-    # falling back to what a selection-less request runs on.
-    model = want_model or _model_label()
-    headers = {"X-Device": BACKEND_KIND, "X-Model": model}
-
-    if stream:
-        def generate():
-            try:
-                for delta in backend.prompt(prompt_text, images=images,
-                                            model=want_model, effort=want_effort):
-                    if isinstance(delta, tuple) and delta[0] == "image":
-                        yield _sse("", model, images=[_image_part(delta)])
-                    elif isinstance(delta, tuple):    # ("reasoning", text)
-                        yield _sse(delta[1], model, reasoning=True)
-                    else:
-                        yield _sse(delta, model)
-                yield _sse("", model, done=True)
-            finally:
-                _REQ_T0.pop(tid, None)
-        return Response(generate(), mimetype="text/event-stream", headers=headers)
-
+    handed_to_stream = False
     try:
-        # Non-streaming: reasoning tuples are dropped; answer text joins and
-        # generated images collect into message.images.
-        parts, imgs = [], []
-        for d in backend.prompt(prompt_text, images=images,
-                                model=want_model, effort=want_effort):
-            if isinstance(d, str):
-                parts.append(d)
-            elif d[0] == "image":
-                imgs.append(_image_part(d))
-        full = "".join(parts)
+        # New chat from UI -> need a fresh session, unless the eager startup
+        # session has not been used yet (in which case reuse it and avoid
+        # waste). Seeded with this request's selection where the runtime
+        # wants it at session scope (copilot).
+        if backend.session_id is None or (
+                _is_new_chat(messages) and not backend.session_fresh):
+            try:
+                backend.new_session(model=want_model, effort=want_effort)
+            except Exception as e:
+                _REQ_T0.pop(tid, None)
+                return jsonify({"error": {"message": f"new_session failed: {e}"}}), 500
+
+        img_note = f" images={len(images)}" if images else ""
+        _log(f"prompt: session={backend.session_id}{img_note} text={prompt_text[:60]!r}")
+
+        # Attribution is per-request: the label is this request's own
+        # selection, falling back to what a selection-less request runs on.
+        model = want_model or _model_label()
+        headers = {"X-Device": BACKEND_KIND, "X-Model": model}
+
+        if stream:
+            def generate():
+                try:
+                    for delta in backend.prompt(prompt_text, images=images,
+                                                model=want_model, effort=want_effort):
+                        if isinstance(delta, tuple) and delta[0] == "image":
+                            yield _sse("", model, images=[_image_part(delta)])
+                        elif isinstance(delta, tuple):    # ("reasoning", text)
+                            yield _sse(delta[1], model, reasoning=True)
+                        else:
+                            yield _sse(delta, model)
+                    yield _sse("", model, done=True)
+                finally:
+                    _REQ_T0.pop(tid, None)
+                    release_chat()
+            resp = Response(generate(), mimetype="text/event-stream", headers=headers)
+            resp.call_on_close(release_chat)
+            handed_to_stream = True
+            return resp
+
+        try:
+            # Non-streaming: reasoning tuples are dropped; answer text joins
+            # and generated images collect into message.images.
+            parts, imgs = [], []
+            for d in backend.prompt(prompt_text, images=images,
+                                    model=want_model, effort=want_effort):
+                if isinstance(d, str):
+                    parts.append(d)
+                elif d[0] == "image":
+                    imgs.append(_image_part(d))
+            full = "".join(parts)
+        finally:
+            _REQ_T0.pop(tid, None)
     finally:
-        _REQ_T0.pop(tid, None)
+        if not handed_to_stream:
+            release_chat()
     message = {"role": "assistant", "content": full}
     if imgs:
         message["images"] = imgs

@@ -38,6 +38,7 @@ Use Python 3.11+ and the launchers, which create/manage `venv/`:
 .\start.ps1 -Backend codex -Port 9000
 .\venv\Scripts\python.exe -m py_compile agentry.py backends.py logutil.py
 .\venv\Scripts\python.exe test_agentry_race.py
+.\venv\Scripts\python.exe test_session_reset_race.py
 .\venv\Scripts\python.exe -m unittest -v test_claude_backend test_grok_backend test_agy_backend test_videos_api test_cli_model
 ```
 
@@ -45,12 +46,17 @@ Use Python 3.11+ and the launchers, which create/manage `venv/`:
 ./start.sh --backend claude --port 9000
 venv/bin/python -m py_compile agentry.py backends.py logutil.py
 venv/bin/python test_agentry_race.py
+venv/bin/python test_session_reset_race.py
 venv/bin/python -m unittest -v test_claude_backend test_grok_backend test_agy_backend test_videos_api test_cli_model
 ```
 
 `test_agentry_race.py` checks concurrent request model/effort isolation,
 unknown-model rejection, and default selection using a stub backend; it
-requires no CLI authentication. Live backend checks require the corresponding
+requires no CLI authentication. `test_session_reset_race.py` checks audit
+A02 with a stub that copies the Copilot backend's locking: concurrent new
+chats each get their own session and a 200, and the chat lock comes back on
+every exit path (stream closed unread or mid-read, failed `new_session`).
+Live backend checks require the corresponding
 CLI login and may consume subscription quota. Run relevant `_bench/` probes
 only for the behavior being changed. Use a separate port for test instances
 when an existing instance is running. Manually check UI changes in the browser.
@@ -169,9 +175,12 @@ Do not describe this as full OpenAI compatibility or client-session isolation.
 
 Model and reasoning effort are per-request values. Apply selection atomically
 with the turn under the backend lock; omitted values use launcher defaults.
-That is the intended contract; the audit records gaps for unpinned Copilot
-defaults and session-reset atomicity. Test the actual backend path, not just
-the HTTP stub. Session creation, selection, streaming, cancellation, and
+That is the intended contract; the audit records a gap for unpinned Copilot
+defaults. Session-reset atomicity (audit A02) is closed for chat completions
+since 2026-11-24: `_chat_lock` in `agentry.py` holds a request's new-chat
+decision and its turn as one critical section. It is taken before the
+backend's `turn_lock`, never inside a backend, and `/cancel` does not take
+it; keep that order. Test the actual backend path, not just the HTTP stub. Session creation, selection, streaming, cancellation, and
 cleanup must agree on which request owns a turn. Filter abandoned-turn events
 and stop backend work when abandoning a response.
 

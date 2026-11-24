@@ -288,10 +288,13 @@ what its request asked for, applied atomically with the turn:
 - `"reasoning_effort"` — same vocabulary as `-ReasoningEffort`, same
   per-turn semantics.
 
-Concurrent clients can safely request different models: turns serialize
-through one lock and each runs its own selection. On copilot they still
-share one *conversation* (single session), so history is common even though
-the model per turn is not. `/health` and the `active` flag in `/v1/models`
+Concurrent clients can safely request different models: requests serialize
+through one lock and each runs its own selection. A new chat's session reset
+and its first turn are one step, so concurrent new chats each get a fresh
+session (before 2026-11-24 they could collide: a 500 "no active session", or
+two chats in one conversation). Follow-up turns go to whatever session is
+current, so on copilot two clients that keep talking still share one
+*conversation*: history is common even though the model per turn is not. `/health` and the `active` flag in `/v1/models`
 report the model a selection-less request runs on, verified against the
 runtime where possible — a pin silently overridden by org policy shows up
 there as the override, not the wish.
@@ -618,8 +621,9 @@ Code 2.1.295 and grok 1.0.50.
   account will not find the Copilot credential, which lives in the
   per-logon credential store.
 - **Single user, single session.** Concurrent clients share one backend
-  session and serialize through one turn lock — personal use, not
-  multi-tenant.
+  session and serialize through one lock — personal use, not
+  multi-tenant. A client that sends several chats should send them one at
+  a time; parallel requests only queue.
 - **Codex carries a fixed ~24.8k-token harness per turn** (its agent system
   prompt + tool schemas). Not reducible, cached server-side, not separately
   billed on a flat subscription. Beyond cost, that prefix is agent
