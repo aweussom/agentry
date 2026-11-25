@@ -236,3 +236,26 @@ not into agentry's scratch cwd, and codex's TUI / `thread/resume` reference
 those paths (`imageView`, `referenced_image_paths` for edits). Reaching into
 `~/.codex` from a wrapper is the same class of thing the copilot-keyring
 entry above declined. Left as a documented limit; it is the user's cache.
+
+## Google's `gemini-api` CLI as a route for agy images/video
+
+Idea: `google-gemini/gemini-api-cli` (Go, beta, v0.5.0 on 2026-11-20) wraps
+the Gemini API as a stateless shell binary: `image`, `video`, `tts`,
+`analyze`, managed agents, `--dry-run`/`--schema`. Looked like a way to drop
+agy's subagent wait, brain-dir polling and PreToolUse hook for image work.
+
+**Verdict:** useless for agentry, and close to useless in general.
+
+**Why not:**
+- API key only [DOCUMENTED, README 2026-11-25]. No OAuth or subscription
+  login. agentry exists to relay subscriptions; an API-key path is just the
+  REST API with a binary in front, and Google already serves that directly.
+- What agentry actually wants from Google is sanctioned programmatic access
+  to the subscription (OAuth, terms that allow third-party use, image/video
+  output without the agy subagent dance). This is not that.
+- Any shell-capable agent with a key writes the `curl`/Python call in
+  seconds, and already writes media to a file instead of into its context.
+  The CLI's selling points (file output, schema, dry-run) solve nothing.
+
+Re-evaluate if: Google ships subscription-backed (OAuth) access through it
+with terms that permit third-party clients. Until then agy stays as is.
